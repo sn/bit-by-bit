@@ -1,0 +1,114 @@
+import std.test
+import std.fs
+import std.os
+import std.proc
+import std.json
+import std.time
+import std.io
+import "../src/state.ecko"
+import "../testkit/fake_s3.ecko"
+
+# End to end: the real CLI, as a child process, against the fake server.
+port = fake_s3.start()
+let MAIN = fs.join(fs.dirname(fs.dirname(os.script())), "main.ecko")
+
+fn write_config(state_dir, root, every) {
+    p = fs.join(fs.temp_dir(), "config.json")
+    creds = fs.join(fs.temp_dir(), "creds.env")
+    fs.write(creds, "ACCESS_KEY_ID={fake_s3.ACCESS_KEY}\nSECRET_ACCESS_KEY={fake_s3.SECRET_KEY}\n")
+    fs.chmod(creds, "600")
+    json.write(p, {
+        state_dir: state_dir,
+        destinations: { fake: {
+            provider: "s3", endpoint: "http://127.0.0.1:{port}", region: "us-east-1",
+            bucket: fake_s3.BUCKET, path_style: true, allow_insecure: true,
+            server_side_encryption: false, credentials_file: creds,
+        } },
+        jobs: [{ name: "home", destination: "fake", prefix: "pc", paths: [root], schedule: { every: every } }],
+        retry: { attempts: 2, base_delay: "1ms", max_delay: "5ms" },
+    })
+    p
+}
+
+fn setup() {
+    fake_s3.reset()
+    root = fs.join(fs.temp_dir(), "src")
+    fs.mkdir(root)
+    fs.write(fs.join(root, "a.txt"), "alpha")
+    state_dir = fs.join(fs.temp_dir(), "state")
+    { root: root, state_dir: state_dir, config: write_config(state_dir, root, "1h") }
+}
+
+fn cli(argv) = proc.run("ecko", [MAIN] + argv, timeout_ms: 60000)
+
+fn wait_for(f, ms) {
+    deadline = time.now() + ms
+    while time.now() < deadline {
+        if f() { return true }
+        sleep(100)
+    }
+    false
+}
+
+test.case("check-config: ok and error exit codes", fn() {
+    env = setup()
+    test.eq(cli(["check-config", "--config", env.config]).code, 0)
+    bad = fs.join(fs.temp_dir(), "bad.json")
+    fs.write(bad, r"""{"jobs": []}""")
+    r = cli(["check-config", "--config", bad])
+    test.eq(r.code, 64)
+    test.ok(contains(r.stdout, "$.destinations"), r.stdout)
+})
+
+test.case("run then status", fn() {
+    env = setup()
+    r = cli(["run", "--config", env.config])
+    test.eq(r.code, 0)
+    test.ok(contains(r.stdout, "home: ok"), r.stdout)
+    s = cli(["status", "--config", env.config, "--json"])
+    test.eq(json.decode(s.stdout)[0].status, "ok")
+})
+
+test.case("daemon runs a due job and stops cleanly on SIGTERM", fn() {
+    env = setup()
+    p = proc.spawn("ecko", [MAIN, "daemon", "--config", env.config])
+    ran = wait_for(fn() fake_s3.object("pc" + env.root + "/a.txt") != null, 20000)
+    test.ok(ran, "the due job ran")
+    test.ok(wait_for(fn() fs.exists(fs.join(env.state_dir, "daemon.lock")), 5000), "lock held")
+    # A second daemon refuses to start while the first holds the lock.
+    second = cli(["daemon", "--config", env.config])
+    test.eq(second.code, 1)
+    # proc.kill reaps the child and frees its handle, which loses the exit
+    # code, so send SIGTERM with kill(1) and then wait.
+    proc.run("kill", ["-TERM", string(proc.pid(p))])
+    res = proc.wait(p, 30000)
+    test.eq(res.code, 0)
+    test.ok(not fs.exists(fs.join(env.state_dir, "daemon.lock")), "lock released")
+    db = state.open(env.state_dir)
+    test.eq(state.last_run(db, "home").status, "ok")
+})
+
+test.case("SIGHUP reloads, and an invalid config is rejected", fn() {
+    env = setup()
+    p = proc.spawn("ecko", [MAIN, "daemon", "--config", env.config])
+    err = io.timeout(proc.stderr(p), 20000)
+    fn wait_line(needle) {
+        while true {
+            line = io.read_line(err)
+            if line == null { return false }
+            if contains(line, needle) { return true }
+        }
+    }
+    test.ok(wait_line("daemon started"), "started")
+    hup = fn() proc.run("kill", ["-HUP", string(proc.pid(p))])
+    hup()
+    test.ok(wait_line("config reloaded"), "valid config reloaded")
+    fs.write(env.config, r"""{"jobs": "nope"}""")
+    hup()
+    test.ok(wait_line("config reload rejected"), "invalid config rejected")
+    test.eq(proc.wait(p), null)
+    proc.run("kill", ["-TERM", string(proc.pid(p))])
+    test.eq(proc.wait(p, 30000).code, 0)
+})
+
+fake_s3.stop()

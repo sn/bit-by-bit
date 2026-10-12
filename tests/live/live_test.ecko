@@ -1,0 +1,62 @@
+# Smoke test against a real provider. Skipped unless BBB_LIVE_TEST=1.
+#
+#   BBB_LIVE_TEST=1 BBB_LIVE_CONFIG=/path/config.json BBB_LIVE_DEST=<name> \
+#       ecko test tests/live/live_test.ecko
+#
+# Uses a unique prefix under "bbb-live-test/" on that destination and deletes
+# everything it wrote afterwards.
+import std.test
+import std.os
+import std.fs
+import std.encoding
+import std.uuid
+import "../../src/config.ecko"
+import "../../src/s3.ecko"
+import "../../src/state.ecko"
+import "../../src/runner.ecko"
+import "../../src/restore.ecko"
+
+if os.env("BBB_LIVE_TEST") != "1" {
+    print("skipped: set BBB_LIVE_TEST=1, BBB_LIVE_CONFIG and BBB_LIVE_DEST to run against a real bucket")
+} else {
+    cfg_base = config.load(os.env("BBB_LIVE_CONFIG"))
+    dest_name = os.env("BBB_LIVE_DEST")
+    root = fs.join(fs.temp_dir(), "live-src")
+    fs.mkdir(fs.join(root, "sub"))
+    blob = encoding.hex_decode("00ff10c3289f0d0a1a7f80fe")
+    fs.write(fs.join(root, "blob.bin"), blob)
+    fs.write(fs.join(root, "sub/we ird #%+?.txt"), "hello")
+    job = {
+        name: "live", destination: dest_name, prefix: "bbb-live-test/" + uuid.v4(), paths: [root],
+        exclude: [], schedule: { kind: "every", ms: 3600000 }, keep_versions_days: 1, follow_symlinks: false,
+    }
+    cfg = merge(cfg_base, { state_dir: fs.join(fs.temp_dir(), "live-state"), jobs: [job] })
+    db = state.open(cfg.state_dir)
+    client = runner.make_client(cfg, job)
+
+    test.case("live: back up, change, restore", fn() {
+        o = runner.run_job(cfg, job, db, { dry_run: false, should_stop: fn() false })
+        test.eq(o.status, "ok")
+        test.eq(o.uploaded, 2)
+        fs.write(fs.join(root, "blob.bin"), blob + blob)
+        o2 = runner.run_job(cfg, job, db, { dry_run: false, should_stop: fn() false })
+        test.eq(o2.replaced, 1)
+        out = fs.join(fs.temp_dir(), "live-out")
+        r = restore.restore(client, job, { path: null, at_ms: null, to: out, overwrite: false, oldest_ms: 0 })
+        test.eq(r.failed, [])
+        test.eq(fs.read_bytes(out + root + "/blob.bin"), blob + blob)
+        test.eq(fs.read(out + root + "/sub/we ird #%+?.txt"), "hello")
+    })
+
+    test.case("live: multipart upload", fn() {
+        big = fs.join(root, "big.bin")
+        fs.write(big, join(map(range(0, 700000), fn(i) "0123456789"), ""))
+        mp = merge(cfg, { multipart_threshold: 5242880, multipart_part_size: 5242880 })
+        o = runner.run_job(mp, job, db, { dry_run: false, should_stop: fn() false })
+        test.eq(o.status, "ok")
+        test.ok(s3.head_object(client, job.prefix + big) != null, "uploaded")
+    })
+
+    # Clean up everything under the test prefix.
+    for obj in s3.list_objects(client, job.prefix + "/") { s3.delete_object(client, obj.key) }
+}

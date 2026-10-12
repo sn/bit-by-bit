@@ -1,0 +1,138 @@
+import std.os
+import std.time
+import std.json
+import std.fs
+import "./src/args.ecko"
+import "./src/config.ecko"
+import "./src/state.ecko"
+import "./src/runner.ecko"
+import "./src/daemon.ecko"
+import "./src/restore.ecko"
+import "./src/status.ecko"
+import "./src/logging.ecko"
+
+fn load_or_exit(path) {
+    try {
+        c = config.load(path)
+        logging.setup(c.log)
+        c
+    } catch (e) {
+        print("config error: " + string(get(e, "message") ?? e))
+        for line in get(e, "errors") ?? [] { print("  " + line) }
+        os.exit(64)
+    }
+}
+
+fn find_job(cfg, name) {
+    j = find(cfg.jobs, fn(j) j.name == name)
+    if j == null {
+        print("no job named '{name}'")
+        os.exit(64)
+    }
+    j
+}
+
+fn parse_at(text) {
+    if text == null { return null }
+    try { time.parse(text) } catch (e) {
+        print("--at must be an RFC 3339 time, e.g. 2026-10-12T14:00:00Z")
+        os.exit(64)
+    }
+}
+
+fn cmd_check_config(a) {
+    path = args.flag(a, "config", args.DEFAULT_CONFIG)
+    cfg = load_or_exit(path)
+    for w in cfg.warnings { print("warning: " + w) }
+    print("{path}: ok")
+    0
+}
+
+fn cmd_run(a) {
+    cfg = load_or_exit(args.flag(a, "config", args.DEFAULT_CONFIG))
+    jobs = if len(a.positional) == 0 { cfg.jobs } else { map(a.positional, fn(n) find_job(cfg, n)) }
+    unless fs.exists(cfg.state_dir) { fs.mkdir(cfg.state_dir) }
+    db = state.open(cfg.state_dir)
+    if args.flag(a, "rebuild-state", false) {
+        for j in jobs {
+            n = runner.rebuild_state(cfg, j, db)
+            print("{j.name}: index rebuilt from the bucket ({n} files)")
+        }
+        return 0
+    }
+    mut worst = 0
+    for j in jobs {
+        o = runner.run_job(cfg, j, db, { dry_run: args.flag(a, "dry-run", false), should_stop: fn() false })
+        print("{j.name}: {o.status}  uploaded {o.uploaded}, replaced {o.replaced}, deleted {o.deleted}, touched {o.touched}, pruned {o.pruned}")
+        for p in o.problems { print("  problem: " + p) }
+        if o.error != null { print("  error: " + o.error) }
+        code = match o.status { "ok" => 0 "partial" => 2 _ => 1 }
+        if code == 1 or (code == 2 and worst == 0) { worst = code }
+    }
+    worst
+}
+
+fn cmd_status(a) {
+    cfg = load_or_exit(args.flag(a, "config", args.DEFAULT_CONFIG))
+    db = state.open(cfg.state_dir)
+    now = time.now()
+    rows = status.collect(cfg, db, now)
+    if args.flag(a, "json", false) { print(json.encode(rows)) } else { print(status.render(rows, now)) }
+    if any(rows, fn(r) r.status == "failed") { 1 } else { 0 }
+}
+
+fn cmd_ls(a) {
+    cfg = load_or_exit(args.flag(a, "config", args.DEFAULT_CONFIG))
+    job = find_job(cfg, a.positional[0])
+    client = runner.make_client(cfg, job)
+    items = restore.select(client, job, { path: args.flag(a, "path", null), at_ms: parse_at(args.flag(a, "at", null)) })
+    for i in items { print(i.path) }
+    0
+}
+
+fn cmd_restore(a) {
+    cfg = load_or_exit(args.flag(a, "config", args.DEFAULT_CONFIG))
+    job = find_job(cfg, a.positional[0])
+    client = runner.make_client(cfg, job)
+    now = time.now()
+    stamp = time.format_local(now, "%Y%m%d-%H%M%S")
+    to = args.flag(a, "to", fs.join(os.cwd(), "restore-{job.name}-{stamp}"))
+    r = restore.restore(client, job, {
+        path: args.flag(a, "path", null),
+        at_ms: parse_at(args.flag(a, "at", null)),
+        to: to,
+        overwrite: args.flag(a, "overwrite", false),
+        oldest_ms: now - job.keep_versions_days * 86400000,
+    })
+    print("restored {r.restored} file(s) to {to}")
+    for s in r.skipped { print("  skipped: " + s) }
+    for f in r.failed { print("  failed: " + f) }
+    if len(r.failed) > 0 { 1 } else { 0 }
+}
+
+fn main() {
+    a = try { args.parse(os.args()) } catch (e) {
+        print("error: " + string(get(e, "message") ?? e))
+        print(args.USAGE)
+        return 64
+    }
+    if a.command == "help" or args.flag(a, "help", false) {
+        print(args.USAGE)
+        return 0
+    }
+    try {
+        match a.command {
+            "daemon" => daemon.run(args.flag(a, "config", args.DEFAULT_CONFIG))
+            "run" => cmd_run(a)
+            "status" => cmd_status(a)
+            "ls" => cmd_ls(a)
+            "restore" => cmd_restore(a)
+            _ => cmd_check_config(a)
+        }
+    } catch (e) {
+        print("error: " + string(get(e, "message") ?? e))
+        if get(e, "kind") == "usage" or get(e, "kind") == "config" { 64 } else { 1 }
+    }
+}
+
+os.exit(main())

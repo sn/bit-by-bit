@@ -1,0 +1,40 @@
+import std.time
+import std.re
+
+let DAY = 86400000
+
+## The machine's UTC offset in milliseconds at `ms` (e.g. +0200 -> 7200000).
+export fn local_offset_ms(ms) {
+    z = time.format_local(ms, "%z")
+    caps = re.captures(r"^([+-])(\d\d)(\d\d)$", z)
+    if caps == null { return 0 }
+    mins = int(caps[2]) * 60 + int(caps[3])
+    if caps[1] == "-" { -mins * 60000 } else { mins * 60000 }
+}
+
+## When a job is next due, in unix ms. A result <= now means "run now".
+##   schedule: { kind: "every", ms } | { kind: "daily_at", hour, minute }
+##   last_ms:  start time of the job's last run, or null if it never ran
+##   offset_ms: local UTC offset (see local_offset_ms)
+## A run missed while the daemon was down is made up once, not once per miss.
+export fn next_due(schedule, last_ms, now_ms, offset_ms) {
+    if last_ms == null { return now_ms }
+    match schedule.kind {
+        "every" => last_ms + schedule.ms
+        _ => {
+            local = last_ms + offset_ms
+            day_start = local - (local % DAY)
+            mut candidate = day_start + (schedule.hour * 60 + schedule.minute) * 60000
+            if candidate <= local { candidate = candidate + DAY }
+            candidate - offset_ms
+        }
+    }
+}
+
+## How long the daemon should sleep: until the earliest due time, clamped to
+## [100ms, 5s] so signals and config reloads are noticed promptly.
+export fn wait_ms(due_times, now_ms) {
+    if len(due_times) == 0 { return 5000 }
+    d = min(due_times) - now_ms
+    if d < 100 { 100 } else if d > 5000 { 5000 } else { d }
+}

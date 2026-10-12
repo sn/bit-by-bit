@@ -1,0 +1,27 @@
+[Unit]
+Description=bit-by-bit incremental backups to S3-compatible storage
+Wants=network-online.target
+After=network-online.target
+# Never stop retrying: a backup service that gives up is worse than one that
+# keeps logging why it cannot start.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bit-by-bit daemon --config /etc/bit-by-bit/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=30
+# The daemon drains for up to 60s on SIGTERM.
+TimeoutStopSec=90
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bit-by-bit /var/log/bit-by-bit
+NoNewPrivileges=true
+PrivateTmp=true
+# Runs as root so it can read every configured path. To back up only your own
+# home directory, uncomment and make /var/lib/bit-by-bit and /var/log/bit-by-bit
+# owned by that user.
+#User=sean
+
+[Install]
+WantedBy=multi-user.target

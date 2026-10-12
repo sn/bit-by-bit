@@ -1,0 +1,208 @@
+# An in-memory, path-style S3 server for tests. It verifies SigV4 signatures
+# and payload hashes with the production sigv4 module, and can be told to
+# fail specific requests.
+import std.http
+import std.hash
+import std.encoding
+import std.re
+import "../src/sigv4.ecko"
+
+export let ACCESS_KEY = "AKIDTEST"
+export let SECRET_KEY = "test-secret-key"
+export let BUCKET = "test-bucket"
+
+let objects = cell({})       # key -> { body: bytes, meta: {name: value} }
+let uploads = cell({})       # upload id -> { key, meta, parts: {n: bytes} }
+let faults = cell([])        # [{ method, key_contains, status, code, times }]
+let log_ = cell([])          # ["METHOD key", ...] for every request that reached the handler
+let page_size = cell(1000)
+let next_id = cell(0)
+let copy_limit = cell(0)     # >0: plain CopyObject of a larger source fails, like S3 over 5 GiB
+
+fn xml_error(status, code) = http.response(status, "<Error><Code>{code}</Code><Message>{code}</Message></Error>", { "content-type": "application/xml" })
+
+fn xml_escape(s) = s |> replace("&", "&amp;") |> replace("<", "&lt;") |> replace(">", "&gt;")
+
+fn etag_of(body) = "\"" + hash.sha256(body)[..32] + "\""
+
+fn take_fault(method, key) {
+    fs_ = cell_get(faults)
+    for (i, f) in enumerate(fs_) {
+        if f.times > 0 and (f.method == "*" or f.method == method) and contains(key, f.key_contains) {
+            cell_set(faults, set(fs_, i, set(f, "times", f.times - 1)))
+            return f
+        }
+    }
+    null
+}
+
+fn signature_ok(req, path) {
+    auth = get(req.headers, "authorization")
+    if auth == null { return false }
+    caps = re.captures(r"Credential=([^/]+)/([^,]+), SignedHeaders=([^,]+), Signature=([0-9a-f]+)", auth)
+    if caps == null or caps[1] != ACCESS_KEY { return false }
+    scope_parts = split(caps[2], "/")
+    names = split(caps[3], ";")
+    headers = reduce(names, fn(acc, n) set(acc, n, get(req.headers, n) ?? ""), {})
+    payload_hash = get(req.headers, "x-amz-content-sha256") ?? ""
+    canonical = sigv4.canonical_request({ method: req.method, path: path, query: req.params, headers: headers, payload_hash: payload_hash })
+    amz_date = get(req.headers, "x-amz-date") ?? ""
+    sts = sigv4.string_to_sign(amz_date, caps[2], canonical)
+    key = sigv4.signing_key(secret(SECRET_KEY), scope_parts[0], scope_parts[1], scope_parts[2])
+    encoding.hex_encode(hash.hmac_sha256_bytes(key, sts)) == caps[4]
+}
+
+fn meta_from(req) = reduce(keys(req.headers), fn(acc, k) if starts_with(k, "x-amz-meta-") { set(acc, k[11..], req.headers[k]) } else { acc }, {})
+
+fn meta_headers(meta) = reduce(keys(meta), fn(acc, k) set(acc, "x-amz-meta-" + k, meta[k]), {})
+
+fn list_bucket(req) {
+    prefix = get(req.params, "prefix") ?? ""
+    offset = int(get(req.params, "continuation-token") ?? "0")
+    all_keys = filter(sort(keys(cell_get(objects))), fn(k) starts_with(k, prefix))
+    size = cell_get(page_size)
+    page = slice(all_keys, offset, offset + size)
+    truncated = offset + size < len(all_keys)
+    store = cell_get(objects)
+    items = join(map(page, fn(k) "<Contents><Key>" + xml_escape(k) + "</Key><Size>" + string(len(store[k].body)) + "</Size></Contents>"), "")
+    next = if truncated { "<NextContinuationToken>" + string(offset + size) + "</NextContinuationToken>" } else { "" }
+    flag = if truncated { "true" } else { "false" }
+    http.response(200, "<ListBucketResult>" + items + "<IsTruncated>" + flag + "</IsTruncated>" + next + "</ListBucketResult>", { "content-type": "application/xml" })
+}
+
+fn handle(req) {
+    path = encoding.url_decode(req.path)
+    segs = split(path[1..], "/")
+    bucket = segs[0]
+    key = join(drop(segs, 1), "/")
+    cell_update(log_, fn(l) push(l, req.method + " " + key))
+    f = take_fault(req.method, key)
+    if f != null { return xml_error(f.status, f.code) }
+    unless signature_ok(req, path) { return xml_error(403, "SignatureDoesNotMatch") }
+    body = req.body_bytes
+    if len(body) > 0 and hash.sha256(body) != get(req.headers, "x-amz-content-sha256") {
+        return xml_error(400, "XAmzContentSHA256Mismatch")
+    }
+    if bucket != BUCKET { return xml_error(404, "NoSuchBucket") }
+    params = req.params
+    if key == "" {
+        if req.method == "GET" { return list_bucket(req) }
+        return xml_error(400, "InvalidRequest")
+    }
+    match req.method {
+        "POST" => {
+            if has(params, "uploads") {
+                id = "up" + string(cell_update(next_id, fn(n) n + 1))
+                cell_update(uploads, fn(u) set(u, id, { key: key, meta: meta_from(req), parts: {} }))
+                return http.response(200, "<InitiateMultipartUploadResult><UploadId>{id}</UploadId></InitiateMultipartUploadResult>", {})
+            }
+            id = get(params, "uploadId") ?? ""
+            up = get(cell_get(uploads), id)
+            if up == null { return xml_error(404, "NoSuchUpload") }
+            ns = map(re.captures_all(r"<PartNumber>(\d+)</PartNumber>", string(body)), fn(m) m[1])
+            joined = reduce(ns, fn(acc, n) acc + up.parts[n], bytes(""))
+            cell_update(objects, fn(o) set(o, key, { body: joined, meta: up.meta }))
+            cell_update(uploads, fn(u) remove(u, id))
+            http.response(200, "<CompleteMultipartUploadResult><Key>{key}</Key></CompleteMultipartUploadResult>", {})
+        }
+        "PUT" => {
+            src = get(req.headers, "x-amz-copy-source")
+            src_key = if src == null { null } else { join(drop(split(encoding.url_decode(src)[1..], "/"), 1), "/") }
+            if has(params, "uploadId") {
+                id = params.uploadId
+                if get(cell_get(uploads), id) == null { return xml_error(404, "NoSuchUpload") }
+                if src_key != null {
+                    # UploadPartCopy: a byte range of an existing object becomes the part.
+                    so = get(cell_get(objects), src_key)
+                    if so == null { return xml_error(404, "NoSuchKey") }
+                    rng = re.captures(r"^bytes=(\d+)-(\d+)$", get(req.headers, "x-amz-copy-source-range") ?? "")
+                    piece = if rng == null { so.body } else { so.body[int(rng[1])..int(rng[2]) + 1] }
+                    cell_update(uploads, fn(u) set(u, id, set(u[id], "parts", set(u[id].parts, params.partNumber, piece))))
+                    return http.response(200, "<CopyPartResult><ETag>" + xml_escape(etag_of(piece)) + "</ETag></CopyPartResult>", {})
+                }
+                cell_update(uploads, fn(u) set(u, id, set(u[id], "parts", set(u[id].parts, params.partNumber, body))))
+                return http.response(200, "", { etag: etag_of(body) })
+            }
+            if src_key != null {
+                o = get(cell_get(objects), src_key)
+                if o == null { return xml_error(404, "NoSuchKey") }
+                lim = cell_get(copy_limit)
+                if lim > 0 and len(o.body) > lim { return xml_error(400, "InvalidRequest") }
+                cell_update(objects, fn(m) set(m, key, o))
+                return http.response(200, "<CopyObjectResult></CopyObjectResult>", {})
+            }
+            cell_update(objects, fn(o) set(o, key, { body: body, meta: meta_from(req) }))
+            http.response(200, "", { etag: etag_of(body) })
+        }
+        "GET" => {
+            o = get(cell_get(objects), key)
+            if o == null { return xml_error(404, "NoSuchKey") }
+            http.response(200, o.body, merge(meta_headers(o.meta), { etag: etag_of(o.body) }))
+        }
+        "HEAD" => {
+            o = get(cell_get(objects), key)
+            if o == null { return http.response(404, "", {}) }
+            http.response(200, "", meta_headers(o.meta))
+        }
+        "DELETE" => {
+            if has(params, "uploadId") {
+                cell_update(uploads, fn(u) remove(u, params.uploadId))
+                return http.response(204, "", {})
+            }
+            cell_update(objects, fn(o) remove(o, key))
+            http.response(204, "", {})
+        }
+        _ => xml_error(405, "MethodNotAllowed")
+    }
+}
+
+async fn serve_() = http.serve(0, handle)
+
+## Start the server (once per test file). Returns the port.
+export fn start() {
+    serve_()
+    mut p = null
+    for i in 0..100 {
+        p = http.port()
+        if p != null { break }
+        sleep(20)
+    }
+    if p == null { error("fake_s3: server did not start") }
+    p
+}
+
+export fn stop() = http.stop()
+
+## A destination + creds pointing at this server.
+export fn dest(port) = {
+    name: "fake", provider: "s3", endpoint: "http://127.0.0.1:{port}", region: "us-east-1",
+    bucket: BUCKET, credentials_file: null, server_side_encryption: false,
+    path_style: true, allow_insecure: true,
+}
+export fn creds() = { access_key: ACCESS_KEY, secret_key: secret(SECRET_KEY) }
+export fn fast_retry() = { attempts: 3, base_delay_ms: 1, max_delay_ms: 5 }
+
+## Reset all state between test cases.
+export fn reset() {
+    cell_set(objects, {})
+    cell_set(uploads, {})
+    cell_set(faults, [])
+    cell_set(log_, [])
+    cell_set(page_size, 1000)
+    cell_set(copy_limit, 0)
+}
+
+## Fail the next `times` requests whose method matches ("*" for any) and whose
+## key contains `key_contains`, answering `status` with S3 error `code`.
+export fn fail_next(method, key_contains, status, code, times) =
+    cell_update(faults, fn(f) push(f, { method: method, key_contains: key_contains, status: status, code: code, times: times }))
+
+export fn set_page_size(n) = cell_set(page_size, n)
+export fn set_copy_limit(n) = cell_set(copy_limit, n)
+export fn objects_() = cell_get(objects)
+export fn object(key) = get(cell_get(objects), key)
+export fn uploads_() = cell_get(uploads)
+export fn requests() = cell_get(log_)
+export fn put_raw(key, body, meta) = cell_update(objects, fn(o) set(o, key, { body: body, meta: meta }))
+export fn reset_log() = cell_set(log_, [])
+export fn reset_faults() = cell_set(faults, [])

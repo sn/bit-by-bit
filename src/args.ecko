@@ -1,0 +1,65 @@
+let COMMANDS = ["daemon", "run", "status", "ls", "restore", "check-config", "help"]
+let VALUE_FLAGS = ["config", "path", "at", "to"]
+let BOOL_FLAGS = ["dry-run", "rebuild-state", "json", "overwrite", "help"]
+
+export let DEFAULT_CONFIG = "/etc/bit-by-bit/config.json"
+
+export let USAGE = """
+    bit-by-bit - incremental backups to S3-compatible storage
+
+    usage:
+      bit-by-bit daemon        [--config P]                  run the scheduler (systemd entry point)
+      bit-by-bit run [job...]  [--config P] [--dry-run] [--rebuild-state]
+      bit-by-bit status        [--config P] [--json]         last run per job, next due, problems
+      bit-by-bit ls <job>      [--path SUB] [--at TS]        list what a restore would produce
+      bit-by-bit restore <job> [--path SUB] [--at TS] [--to DIR] [--overwrite]
+      bit-by-bit check-config  [--config P]
+
+    --config defaults to /etc/bit-by-bit/config.json. --at takes an RFC 3339
+    time such as 2026-10-12T14:00:00Z or 2026-10-12T16:00:00+02:00.
+
+    exit codes: 0 ok, 1 failed, 2 partial, 64 usage or config error
+"""
+
+## Parse argv into { command, positional: [String], flags: {name: String | Bool} }.
+## Raises { kind: "usage", message } on anything it does not understand.
+export fn parse(argv) {
+    if len(argv) == 0 { return { command: "help", positional: [], flags: {} } }
+    command = argv[0]
+    if command == "--help" or command == "-h" { return { command: "help", positional: [], flags: {} } }
+    unless contains(COMMANDS, command) { error({ kind: "usage", message: "unknown command '{command}'" }) }
+    mut positional = []
+    mut flags = { config: DEFAULT_CONFIG }
+    mut i = 1
+    while i < len(argv) {
+        a = argv[i]
+        if starts_with(a, "--") {
+            eq = index_of(a, "=")
+            name = if eq > 0 { a[2..eq] } else { a[2..] }
+            if contains(VALUE_FLAGS, name) {
+                value = if eq > 0 { a[eq + 1..] } else {
+                    if i + 1 >= len(argv) { error({ kind: "usage", message: "--{name} needs a value" }) }
+                    i = i + 1
+                    argv[i]
+                }
+                flags = set(flags, name, value)
+            } else if contains(BOOL_FLAGS, name) {
+                flags = set(flags, name, true)
+            } else {
+                error({ kind: "usage", message: "unknown option '{a}'" })
+            }
+        } else if a == "-h" {
+            flags = set(flags, "help", true)
+        } else {
+            positional = push(positional, a)
+        }
+        i = i + 1
+    }
+    if (command == "ls" or command == "restore") and len(positional) != 1 and not has(flags, "help") {
+        error({ kind: "usage", message: "{command} needs exactly one job name" })
+    }
+    { command: command, positional: positional, flags: flags }
+}
+
+## A flag's value, or `default` when it was not given.
+export fn flag(parsed, name, default) = get(parsed.flags, name) ?? default

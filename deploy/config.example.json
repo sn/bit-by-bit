@@ -1,0 +1,27 @@
+{
+  "state_dir": "/var/lib/bit-by-bit",
+  "log": { "level": "info", "file": "/var/log/bit-by-bit/bit-by-bit.log" },
+
+  "destinations": {
+    "aws-main": {
+      "provider": "s3",
+      "endpoint": "https://s3.eu-west-1.amazonaws.com",
+      "region": "eu-west-1",
+      "bucket": "my-backups",
+      "credentials_file": "/etc/bit-by-bit/aws.env",
+      "server_side_encryption": true
+    }
+  },
+
+  "jobs": [
+    {
+      "name": "home",
+      "destination": "aws-main",
+      "prefix": "laptop/home",
+      "paths": ["/home/me/Documents", "/home/me/Pictures"],
+      "exclude": ["**/node_modules/**", "**/.cache/**", "**/*.tmp"],
+      "schedule": { "every": "6h" },
+      "keep_versions_days": 30
+    }
+  ]
+}

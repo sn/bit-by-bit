@@ -1,0 +1,302 @@
+import std.json
+import std.fs
+import std.os
+import std.re
+import "./duration.ecko"
+
+let TOP_KEYS = ["state_dir", "log", "destinations", "jobs", "retry", "concurrency", "multipart_threshold", "multipart_part_size"]
+let LOG_KEYS = ["level", "file"]
+let DEST_KEYS = ["provider", "endpoint", "region", "bucket", "credentials_file", "server_side_encryption", "path_style", "allow_insecure"]
+let JOB_KEYS = ["name", "destination", "prefix", "paths", "exclude", "schedule", "keep_versions_days", "follow_symlinks"]
+let RETRY_KEYS = ["attempts", "base_delay", "max_delay"]
+let LEVELS = ["debug", "info", "warn", "error"]
+
+## Validate a decoded config map. Never raises: returns
+## { config, errors: [String], warnings: [String] } where every message starts
+## with the JSON path it is about. `config` is only meaningful when errors is empty.
+export fn validate(raw) {
+    mut errors = []
+    mut warnings = []
+    fn err(path, msg) { errors = push(errors, "{path}: {msg}") }
+    fn warn(path, msg) { warnings = push(warnings, "{path}: {msg}") }
+
+    fn unknown_keys(m, allowed, path) {
+        for k in keys(m) {
+            unless contains(allowed, k) { err("{path}.{k}", "unknown key") }
+        }
+    }
+    fn opt(m, k, default) = if has(m, k) { m[k] } else { default }
+    fn want_string(m, k, path, required) {
+        v = get(m, k)
+        if v == null {
+            if required { err("{path}.{k}", "is required") }
+            return null
+        }
+        unless is_string(v) and len(v) > 0 {
+            err("{path}.{k}", "must be a non-empty string")
+            return null
+        }
+        v
+    }
+    fn want_bool(m, k, path, default) {
+        v = opt(m, k, default)
+        unless type_of(v) == "bool" {
+            err("{path}.{k}", "must be true or false")
+            return default
+        }
+        v
+    }
+    fn want_int(m, k, path, default, lo, hi) {
+        v = opt(m, k, default)
+        unless type_of(v) == "int" and v >= lo and v <= hi {
+            err("{path}.{k}", "must be an integer from {lo} to {hi}")
+            return default
+        }
+        v
+    }
+    fn parsed(path, f, fallback) {
+        try { f() } catch (e) {
+            err(path, string(get(e, "message")))
+            fallback
+        }
+    }
+
+    unless is_map(raw) {
+        return { config: null, errors: ["$: config must be a JSON object"], warnings: [] }
+    }
+    unknown_keys(raw, TOP_KEYS, "$")
+
+    # log
+    log_raw = opt(raw, "log", {})
+    mut log_cfg = { level: "info", file: null }
+    if is_map(log_raw) {
+        unknown_keys(log_raw, LOG_KEYS, "$.log")
+        level = opt(log_raw, "level", "info")
+        unless contains(LEVELS, level) { err("$.log.level", "must be one of debug, info, warn, error") }
+        log_cfg = { level: level, file: want_string(log_raw, "file", "$.log", false) }
+    } else {
+        err("$.log", "must be an object")
+    }
+
+    # retry
+    retry_raw = opt(raw, "retry", {})
+    mut retry_cfg = { attempts: 5, base_delay_ms: 2000, max_delay_ms: 300000 }
+    if is_map(retry_raw) {
+        unknown_keys(retry_raw, RETRY_KEYS, "$.retry")
+        retry_cfg = {
+            attempts: want_int(retry_raw, "attempts", "$.retry", 5, 1, 100),
+            base_delay_ms: parsed("$.retry.base_delay", fn() duration.parse_duration(opt(retry_raw, "base_delay", "2s")), 2000),
+            max_delay_ms: parsed("$.retry.max_delay", fn() duration.parse_duration(opt(retry_raw, "max_delay", "5m")), 300000),
+        }
+    } else {
+        err("$.retry", "must be an object")
+    }
+
+    # destinations
+    dests_raw = get(raw, "destinations")
+    mut dests = {}
+    unless is_map(dests_raw) and len(keys(dests_raw)) > 0 {
+        err("$.destinations", "is required and must be a non-empty object")
+    } else {
+        for (name, d) in dests_raw {
+            p = "$.destinations.{name}"
+            unless re.test(r"^[a-z0-9-]+$", name) { err(p, "destination names may only use a-z, 0-9 and -") }
+            unless is_map(d) {
+                err(p, "must be an object")
+                continue
+            }
+            unknown_keys(d, DEST_KEYS, p)
+            provider = want_string(d, "provider", p, true)
+            unless provider == null or provider == "s3" or provider == "gcs" {
+                err("{p}.provider", "must be \"s3\" or \"gcs\"")
+            }
+            is_gcs = provider == "gcs"
+            endpoint = if is_gcs and not has(d, "endpoint") { "https://storage.googleapis.com" } else { want_string(d, "endpoint", p, true) }
+            region = if is_gcs and not has(d, "region") { "auto" } else { want_string(d, "region", p, true) }
+            allow_insecure = want_bool(d, "allow_insecure", p, false)
+            if endpoint != null {
+                if starts_with(endpoint, "http://") {
+                    unless allow_insecure { err("{p}.endpoint", "must use https:// (set allow_insecure: true for a local MinIO)") }
+                } else if not starts_with(endpoint, "https://") {
+                    err("{p}.endpoint", "must start with https://")
+                }
+            }
+            creds_file = want_string(d, "credentials_file", p, false)
+            dests = set(dests, name, {
+                name: name,
+                provider: provider,
+                endpoint: if endpoint == null { null } else { trim_end_slash(endpoint) },
+                region: region,
+                bucket: want_string(d, "bucket", p, true),
+                credentials_file: creds_file,
+                server_side_encryption: want_bool(d, "server_side_encryption", p, true),
+                path_style: want_bool(d, "path_style", p, false),
+                allow_insecure: allow_insecure,
+            })
+        }
+    }
+
+    # jobs
+    jobs_raw = get(raw, "jobs")
+    mut jobs = []
+    unless is_list(jobs_raw) and len(jobs_raw) > 0 {
+        err("$.jobs", "is required and must be a non-empty list")
+    } else {
+        mut seen = []
+        for (i, j) in enumerate(jobs_raw) {
+            p = "$.jobs[{i}]"
+            unless is_map(j) {
+                err(p, "must be an object")
+                continue
+            }
+            unknown_keys(j, JOB_KEYS, p)
+            name = want_string(j, "name", p, true)
+            if name != null {
+                unless re.test(r"^[a-z0-9-]+$", name) { err("{p}.name", "may only use a-z, 0-9 and -") }
+                if contains(seen, name) { err("{p}.name", "duplicate job name '{name}'") }
+                seen = push(seen, name)
+            }
+            dest = want_string(j, "destination", p, true)
+            if dest != null and is_map(dests_raw) and not has(dests_raw, dest) {
+                err("{p}.destination", "no destination named '{dest}'")
+            }
+            prefix = want_string(j, "prefix", p, true)
+            if prefix != null and (starts_with(prefix, "/") or ends_with(prefix, "/")) {
+                err("{p}.prefix", "must not start or end with /")
+            }
+            paths = opt(j, "paths", null)
+            mut clean_paths = []
+            unless is_list(paths) and len(paths) > 0 {
+                err("{p}.paths", "is required and must be a non-empty list")
+            } else {
+                for (k, path) in enumerate(paths) {
+                    pp = "{p}.paths[{k}]"
+                    unless is_string(path) and starts_with(path, "/") {
+                        err(pp, "must be an absolute path")
+                        continue
+                    }
+                    if path == "/_versions" or starts_with(path, "/_versions/") {
+                        err(pp, "paths under /_versions would collide with the version history prefix")
+                    }
+                    unless fs.exists(path) { warn(pp, "does not exist yet") }
+                    clean = trim_end_slash(path)
+                    for (prev_i, prev) in enumerate(clean_paths) {
+                        if clean == prev or starts_with(clean, prev + "/") or starts_with(prev, clean + "/") {
+                            err(pp, "is inside {p}.paths[{prev_i}] (or contains it) - list each tree once")
+                        }
+                    }
+                    clean_paths = push(clean_paths, clean)
+                }
+            }
+            exclude = opt(j, "exclude", [])
+            unless is_list(exclude) and all(exclude, fn(x) is_string(x)) {
+                err("{p}.exclude", "must be a list of glob strings")
+            }
+            sched_raw = get(j, "schedule")
+            mut schedule = null
+            unless is_map(sched_raw) {
+                err("{p}.schedule", "is required: use \{ \"every\": \"6h\" } or \{ \"daily_at\": \"02:30\" }")
+            } else {
+                unknown_keys(sched_raw, ["every", "daily_at"], "{p}.schedule")
+                if has(sched_raw, "every") and has(sched_raw, "daily_at") {
+                    err("{p}.schedule", "use exactly one of every or daily_at")
+                } else if has(sched_raw, "every") {
+                    ms = parsed("{p}.schedule.every", fn() duration.parse_duration(sched_raw.every), null)
+                    if ms != null and ms < 60000 { err("{p}.schedule.every", "must be at least 1m") }
+                    schedule = { kind: "every", ms: ms }
+                } else if has(sched_raw, "daily_at") {
+                    t = parsed("{p}.schedule.daily_at", fn() duration.parse_hhmm(sched_raw.daily_at), { hour: 0, minute: 0 })
+                    schedule = { kind: "daily_at", hour: t.hour, minute: t.minute }
+                } else {
+                    err("{p}.schedule", "use exactly one of every or daily_at")
+                }
+            }
+            jobs = push(jobs, {
+                name: name,
+                destination: dest,
+                prefix: prefix,
+                paths: clean_paths,
+                exclude: if is_list(exclude) { exclude } else { [] },
+                schedule: schedule,
+                keep_versions_days: want_int(j, "keep_versions_days", p, 30, 0, 36500),
+                follow_symlinks: want_bool(j, "follow_symlinks", p, false),
+            })
+        }
+        # Two jobs on the same destination must not share or nest prefixes.
+        for (a_i, a) in enumerate(jobs) {
+            for b in drop(jobs, a_i + 1) {
+                if a.destination == b.destination and a.prefix != null and b.prefix != null {
+                    if a.prefix == b.prefix or starts_with(a.prefix, b.prefix + "/") or starts_with(b.prefix, a.prefix + "/") {
+                        err("$.jobs", "jobs '{a.name}' and '{b.name}' use overlapping prefixes on destination '{a.destination}'")
+                    }
+                }
+            }
+        }
+    }
+
+    part_size = parsed("$.multipart_part_size", fn() duration.parse_size(opt(raw, "multipart_part_size", "16MiB")), 16777216)
+    if part_size < 5242880 { err("$.multipart_part_size", "must be at least 5MiB") }
+
+    config = {
+        state_dir: trim_end_slash(opt(raw, "state_dir", "/var/lib/bit-by-bit")),
+        log: log_cfg,
+        destinations: dests,
+        jobs: jobs,
+        retry: retry_cfg,
+        concurrency: want_int(raw, "concurrency", "$", 4, 1, 32),
+        multipart_threshold: parsed("$.multipart_threshold", fn() duration.parse_size(opt(raw, "multipart_threshold", "64MiB")), 67108864),
+        multipart_part_size: part_size,
+    }
+    { config: config, errors: errors, warnings: warnings }
+}
+
+fn trim_end_slash(s) = if len(s) > 1 and ends_with(s, "/") { s[..len(s) - 1] } else { s }
+
+## Read, decode and validate the config file. Raises
+## { kind: "config", message, errors, warnings } when anything is wrong.
+export fn load(path) {
+    raw = try { json.read(path) } catch (e) {
+        error({ kind: "config", message: "can't read config {path}: " + string(get(e, "message")), errors: [], warnings: [] })
+    }
+    r = validate(raw)
+    if len(r.errors) > 0 {
+        count = len(r.errors)
+        error({ kind: "config", message: "{path} has {count} error(s)", errors: r.errors, warnings: r.warnings })
+    }
+    merge(r.config, { warnings: r.warnings })
+}
+
+## The env var prefix for a destination: "aws-main" -> "BBB_AWS_MAIN_".
+export fn env_prefix(dest_name) = "BBB_" + replace(upper(dest_name), "-", "_") + "_"
+
+## Resolve credentials for a destination. Env vars win over the file.
+## Returns { access_key: String, secret_key: secret, warnings: [String] }.
+export fn load_credentials(dest) {
+    prefix = env_prefix(dest.name)
+    env_id = os.env(prefix + "ACCESS_KEY_ID")
+    env_secret = os.env(prefix + "SECRET_ACCESS_KEY")
+    if env_id != null and env_secret != null {
+        return { access_key: env_id, secret_key: secret(env_secret), warnings: [] }
+    }
+    if dest.credentials_file == null {
+        error({ kind: "config", message: "destination '{dest.name}' has no credentials_file and {prefix}ACCESS_KEY_ID / {prefix}SECRET_ACCESS_KEY are not set" })
+    }
+    path = dest.credentials_file
+    text = try { fs.read(path) } catch (e) {
+        error({ kind: "config", message: "can't read credentials file {path}: " + string(get(e, "message")) })
+    }
+    mut vals = {}
+    for line in lines(text) {
+        t = trim(line)
+        if t == "" or starts_with(t, "#") { continue }
+        parts = split(t, "=")
+        if len(parts) < 2 { continue }
+        vals = set(vals, trim(parts[0]), trim(join(drop(parts, 1), "=")))
+    }
+    unless has(vals, "ACCESS_KEY_ID") and has(vals, "SECRET_ACCESS_KEY") {
+        error({ kind: "config", message: "credentials file {path} must set ACCESS_KEY_ID and SECRET_ACCESS_KEY" })
+    }
+    mode = fs.mode(path)
+    warnings = if mode[-2..] != "00" { ["credentials file {path} has mode {mode}; run chmod 600 on it"] } else { [] }
+    { access_key: vals.ACCESS_KEY_ID, secret_key: secret(vals.SECRET_ACCESS_KEY), warnings: warnings }
+}

@@ -1,0 +1,69 @@
+import std.test
+import "../src/sigv4.ecko"
+
+# Vector 1: AWS sig-v4-test-suite "get-vanilla".
+let SUITE_CREDS = { access_key: "AKIDEXAMPLE", secret_key: secret("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY") }
+let VANILLA = {
+    method: "GET", path: "/", query: {},
+    headers: { host: "example.amazonaws.com", "x-amz-date": "20150830T123600Z" },
+    payload_hash: sigv4.EMPTY_SHA256,
+}
+
+# Vector 2: the S3 "GET Object" example from the S3 SigV4 documentation.
+let S3_CREDS = { access_key: "AKIAIOSFODNN7EXAMPLE", secret_key: secret("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY") }
+let S3_GET = {
+    method: "GET", path: "/test.txt", query: {},
+    headers: {
+        host: "examplebucket.s3.amazonaws.com",
+        range: "bytes=0-9",
+        "x-amz-content-sha256": sigv4.EMPTY_SHA256,
+    },
+    payload_hash: sigv4.EMPTY_SHA256,
+}
+
+test.case("get-vanilla canonical request", fn() {
+    expected = "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\n" + sigv4.EMPTY_SHA256
+    test.eq(sigv4.canonical_request(VANILLA), expected)
+})
+
+test.case("get-vanilla string to sign", fn() {
+    sc = sigv4.scope("20150830T123600Z", "us-east-1", "service")
+    test.eq(sc, "20150830/us-east-1/service/aws4_request")
+    sts = sigv4.string_to_sign("20150830T123600Z", sc, sigv4.canonical_request(VANILLA))
+    test.eq(sts, "AWS4-HMAC-SHA256\n20150830T123600Z\n20150830/us-east-1/service/aws4_request\nbb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63")
+})
+
+test.case("get-vanilla authorization", fn() {
+    req = set(VANILLA, "headers", { host: "example.amazonaws.com" })
+    h = sigv4.sign(req, SUITE_CREDS, "us-east-1", "service", "20150830T123600Z")
+    test.eq(h.authorization, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
+    test.eq(h["x-amz-date"], "20150830T123600Z")
+})
+
+test.case("s3 get object signature", fn() {
+    h = sigv4.sign(S3_GET, S3_CREDS, "us-east-1", "s3", "20130524T000000Z")
+    test.ok(ends_with(h.authorization, "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"), h.authorization)
+    test.ok(contains(h.authorization, "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date"), h.authorization)
+})
+
+test.case("uri_encode", fn() {
+    test.eq(sigv4.uri_encode("a b/c~d_e.f-g", false), "a%20b/c~d_e.f-g")
+    test.eq(sigv4.uri_encode("a/b", true), "a%2Fb")
+    test.eq(sigv4.uri_encode("é+*!", true), "%C3%A9%2B%2A%21")
+})
+
+test.case("canonical query sorts and encodes", fn() {
+    req = { method: "GET", path: "/", query: { prefix: "a b/", "list-type": "2", "continuation-token": "" }, headers: { host: "h" }, payload_hash: sigv4.EMPTY_SHA256 }
+    lines_ = split(sigv4.canonical_request(req), "\n")
+    test.eq(lines_[2], "continuation-token=&list-type=2&prefix=a%20b%2F")
+})
+
+test.case("header values are trimmed and spaces collapsed", fn() {
+    req = { method: "PUT", path: "/k", query: {}, headers: { Host: "h", "X-Amz-Meta-A": "  x   y  " }, payload_hash: "abc" }
+    test.ok(contains(sigv4.canonical_request(req), "x-amz-meta-a:x y\n"), "collapsed")
+})
+
+test.case("secret never appears in the signed headers", fn() {
+    h = sigv4.sign(S3_GET, S3_CREDS, "us-east-1", "s3", "20130524T000000Z")
+    test.ok(not contains(string(h), "wJalrXUtnFEMI"), "no secret")
+})

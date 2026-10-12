@@ -1,0 +1,63 @@
+import "./scanner.ecko"
+import "./util.ecko"
+
+## The index fingerprint of a symlink: its resolved target.
+export fn link_sha(target) = "link:" + target
+
+## Protect roots that scanned to nothing although files were backed up from
+## them: that is what an unmounted drive (whose mountpoint directory remains)
+## looks like, and treating it as "everything deleted" would empty the backup.
+## Returns the scan with those roots added to protected and problems.
+export fn guard_empty_roots(scan, index, roots) {
+    mut protected = scan.protected
+    mut problems = scan.problems
+    for root in roots {
+        if scanner.under_any(root, protected) { continue }
+        found = any(scan.entries, fn(e) scanner.under_any(e.path, [root]))
+        if found { continue }
+        backed_up = len(filter(keys(index), fn(p) scanner.under_any(p, [root])))
+        if backed_up > 0 {
+            protected = push(protected, root)
+            problems = push(problems, "{root}: is empty but {backed_up} file(s) were backed up from it - not deleting them (is a drive unmounted?)")
+        }
+    }
+    merge(scan, { protected: protected, problems: problems })
+}
+
+## Decide what a run must do. Pure: no I/O.
+##   scan:  the result of scanner.scan
+##   index: state.index for the job (util.index_by keyed by path)
+## Returns {
+##   actions:   [{ op: "upload" | "check" | "replace" | "delete", path, entry, prev }]
+##   unchanged: Int
+## }
+## "check" means size or mtime changed: the executor hashes the file and either
+## records a touch (same content) or does a replace.
+export fn plan(scan, index) {
+    mut actions = []
+    mut unchanged = 0
+    present = util.index_by(scan.entries, fn(e) e.path)
+    for e in scan.entries {
+        prev = util.lookup(index, e.path)
+        if prev == null {
+            actions = push(actions, { op: "upload", path: e.path, entry: e, prev: null })
+        } else if prev.kind != e.kind {
+            actions = push(actions, { op: "replace", path: e.path, entry: e, prev: prev })
+        } else if e.kind == "symlink" {
+            if prev.sha256 == link_sha(e.target) {
+                unchanged = unchanged + 1
+            } else {
+                actions = push(actions, { op: "replace", path: e.path, entry: e, prev: prev })
+            }
+        } else if prev.size == e.size and prev.mtime == e.mtime {
+            unchanged = unchanged + 1
+        } else {
+            actions = push(actions, { op: "check", path: e.path, entry: e, prev: prev })
+        }
+    }
+    for path in sort(keys(index)) {
+        if has(present, path) or scanner.under_any(path, scan.protected) { continue }
+        actions = push(actions, { op: "delete", path: path, entry: null, prev: util.lookup(index, path) })
+    }
+    { actions: actions, unchanged: unchanged }
+}

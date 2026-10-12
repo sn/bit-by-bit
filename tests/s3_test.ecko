@@ -1,0 +1,153 @@
+import std.test
+import std.encoding
+import "../src/s3.ecko"
+import "../testkit/fake_s3.ecko"
+
+port = fake_s3.start()
+c = s3.client(fake_s3.dest(port), fake_s3.creds(), fake_s3.fast_retry())
+
+# Every byte value, so a body that is mangled into text cannot pass.
+let BINARY = encoding.hex_decode("00ff10c3289f0d0a1a7f80fe")
+
+test.case("put and get round-trip binary bytes", fn() {
+    fake_s3.reset()
+    s3.put_object(c, "dir/a b.bin", BINARY, { sha256: "x", run: "20261012T000000Z" })
+    test.eq(fake_s3.object("dir/a b.bin").body, BINARY)
+    test.eq(s3.get_object(c, "dir/a b.bin"), BINARY)
+})
+
+test.case("head returns metadata or null", fn() {
+    fake_s3.reset()
+    s3.put_object(c, "k", bytes("hi"), { sha256: "abc", mtime: "123" })
+    test.eq(s3.head_object(c, "k"), { sha256: "abc", mtime: "123" })
+    test.eq(s3.head_object(c, "missing"), null)
+})
+
+test.case("copy keeps metadata, delete is idempotent", fn() {
+    fake_s3.reset()
+    s3.put_object(c, "a", bytes("one"), { run: "r1" })
+    s3.copy_object(c, "a", "_versions/r2/a")
+    test.eq(fake_s3.object("_versions/r2/a"), { body: bytes("one"), meta: { "bbb-run": "r1" } })
+    s3.delete_object(c, "a")
+    s3.delete_object(c, "a")
+    test.eq(fake_s3.object("a"), null)
+})
+
+test.case("list follows continuation tokens", fn() {
+    fake_s3.reset()
+    fake_s3.set_page_size(2)
+    for k in ["p/1", "p/2", "p/3", "p/4", "p/5", "q/1"] { fake_s3.put_raw(k, bytes("x"), {}) }
+    test.eq(map(s3.list_objects(c, "p/"), fn(o) o.key), ["p/1", "p/2", "p/3", "p/4", "p/5"])
+})
+
+test.case("list unescapes xml in keys", fn() {
+    fake_s3.reset()
+    fake_s3.put_raw("a&b<c>.txt", bytes("x"), {})
+    test.eq(s3.list_objects(c, "")[0].key, "a&b<c>.txt")
+})
+
+test.case("5xx and 429 are retried", fn() {
+    fake_s3.reset()
+    fake_s3.fail_next("PUT", "r", 503, "SlowDown", 1)
+    fake_s3.fail_next("PUT", "r", 429, "TooManyRequests", 1)
+    s3.put_object(c, "r", bytes("ok"), {})
+    test.eq(fake_s3.object("r").body, bytes("ok"))
+    test.eq(len(filter(fake_s3.requests(), fn(r) r == "PUT r")), 3)
+})
+
+test.case("retries give up after attempts", fn() {
+    fake_s3.reset()
+    fake_s3.fail_next("PUT", "r", 500, "InternalError", 10)
+    try {
+        s3.put_object(c, "r", bytes("ok"), {})
+        test.fail("expected failure")
+    } catch (e) {
+        test.eq(get(e, "kind"), "s3_retry")
+    }
+    test.eq(len(fake_s3.requests()), 3)
+})
+
+test.case("403 is not retried", fn() {
+    fake_s3.reset()
+    bad = s3.client(fake_s3.dest(port), { access_key: fake_s3.ACCESS_KEY, secret_key: secret("wrong") }, fake_s3.fast_retry())
+    try {
+        s3.put_object(bad, "x", bytes("1"), {})
+        test.fail("expected auth failure")
+    } catch (e) {
+        test.eq(get(e, "kind"), "s3_auth")
+    }
+    test.eq(len(fake_s3.requests()), 1)
+})
+
+test.case("network errors are retried then raised", fn() {
+    dead = s3.client(merge(fake_s3.dest(port), { endpoint: "http://127.0.0.1:1" }), fake_s3.creds(), fake_s3.fast_retry())
+    try {
+        s3.get_object(dead, "x")
+        test.fail("expected net failure")
+    } catch (e) {
+        test.eq(get(e, "kind"), "net")
+    }
+})
+
+test.case("missing bucket is a config error", fn() {
+    other = s3.client(merge(fake_s3.dest(port), { bucket: "nope" }), fake_s3.creds(), fake_s3.fast_retry())
+    try {
+        s3.get_object(other, "x")
+        test.fail("expected failure")
+    } catch (e) {
+        test.eq(get(e, "kind"), "s3_config")
+    }
+})
+
+test.case("multipart upload assembles parts in order", fn() {
+    fake_s3.reset()
+    id = s3.create_multipart(c, "big", { sha256: "s" })
+    e1 = s3.upload_part(c, "big", id, 1, BINARY)
+    e2 = s3.upload_part(c, "big", id, 2, bytes("tail"))
+    s3.complete_multipart(c, "big", id, [{ n: 1, etag: e1 }, { n: 2, etag: e2 }])
+    test.eq(fake_s3.object("big").body, BINARY + bytes("tail"))
+    test.eq(fake_s3.object("big").meta, { "bbb-sha256": "s" })
+})
+
+test.case("abort multipart is idempotent", fn() {
+    fake_s3.reset()
+    id = s3.create_multipart(c, "big", {})
+    s3.abort_multipart(c, "big", id)
+    s3.abort_multipart(c, "big", id)
+    test.eq(fake_s3.uploads_(), {})
+})
+
+test.case("C3: per-object 4xx raises s3_rejected", fn() {
+    fake_s3.reset()
+    fake_s3.fail_next("PUT", "x", 400, "InvalidRequest", 1)
+    try {
+        s3.put_object(c, "x", bytes("1"), {})
+        test.fail("expected rejection")
+    } catch (e) {
+        test.eq(get(e, "kind"), "s3_rejected")
+    }
+})
+
+test.case("classify", fn() {
+    test.eq(s3.classify(200, ""), "ok")
+    test.eq(s3.classify(200, "<Error><Code>InternalError</Code></Error>"), "retry")
+    test.eq(s3.classify(400, "<Error><Code>RequestTimeout</Code></Error>"), "retry")
+    test.eq(s3.classify(403, ""), "auth")
+    test.eq(s3.classify(404, "<Error><Code>NoSuchKey</Code></Error>"), "not_found")
+    test.eq(s3.classify(404, "<Error><Code>NoSuchBucket</Code></Error>"), "fail")
+})
+
+test.case("backoff stays under the cap", fn() {
+    r = { attempts: 10, base_delay_ms: 100, max_delay_ms: 1000 }
+    for a in 1..10 { test.ok(s3.backoff_ms(r, a) <= 1000, "cap") }
+})
+
+test.case("virtual-hosted urls", fn() {
+    v = s3.client({ endpoint: "https://s3.eu-west-1.amazonaws.com", bucket: "bk", path_style: false }, fake_s3.creds(), fake_s3.fast_retry())
+    loc = s3.locate(v, "home/a b.txt")
+    test.eq(loc.url, "https://bk.s3.eu-west-1.amazonaws.com/home/a%20b.txt")
+    test.eq(loc.host, "bk.s3.eu-west-1.amazonaws.com")
+    test.eq(loc.path, "/home/a b.txt")
+})
+
+fake_s3.stop()

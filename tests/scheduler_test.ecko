@@ -1,0 +1,81 @@
+import std.test
+import std.time
+import std.fs
+import std.os
+import "../src/scheduler.ecko"
+import "../src/lock.ecko"
+
+let H = 3600000
+let M = 60000
+# 2026-10-12T00:00:00Z
+let MIDNIGHT = time.parse("2026-10-12T00:00:00Z")
+
+test.case("never run is due now", fn() {
+    test.eq(scheduler.next_due({ kind: "every", ms: 6 * H }, null, 500, 0), 500)
+    test.eq(scheduler.next_due({ kind: "daily_at", hour: 2, minute: 30 }, null, 500, 0), 500)
+})
+
+test.case("every is last + interval, even long after", fn() {
+    s = { kind: "every", ms: 6 * H }
+    test.eq(scheduler.next_due(s, MIDNIGHT, MIDNIGHT + H, 0), MIDNIGHT + 6 * H)
+    # Down for three days: due once, now.
+    test.ok(scheduler.next_due(s, MIDNIGHT, MIDNIGHT + 72 * H, 0) <= MIDNIGHT + 72 * H, "due")
+})
+
+test.case("daily_at later the same day", fn() {
+    s = { kind: "daily_at", hour: 2, minute: 30 }
+    test.eq(scheduler.next_due(s, MIDNIGHT + H, MIDNIGHT + H, 0), MIDNIGHT + 2 * H + 30 * M)
+})
+
+test.case("daily_at rolls to tomorrow after today's run", fn() {
+    s = { kind: "daily_at", hour: 2, minute: 30 }
+    last = MIDNIGHT + 2 * H + 30 * M
+    test.eq(scheduler.next_due(s, last, last + M, 0), last + 24 * H)
+})
+
+test.case("daily_at missed while down is due now", fn() {
+    s = { kind: "daily_at", hour: 2, minute: 30 }
+    last = MIDNIGHT - 22 * H
+    test.ok(scheduler.next_due(s, last, MIDNIGHT + 10 * H, 0) <= MIDNIGHT + 10 * H, "due")
+})
+
+test.case("daily_at respects the local offset", fn() {
+    s = { kind: "daily_at", hour: 2, minute: 30 }
+    # At UTC+2, 02:30 local is 00:30 UTC.
+    test.eq(scheduler.next_due(s, MIDNIGHT - 4 * H, MIDNIGHT - 4 * H, 2 * H), MIDNIGHT + 30 * M)
+    # At UTC-5, 02:30 local is 07:30 UTC.
+    test.eq(scheduler.next_due(s, MIDNIGHT, MIDNIGHT, -5 * H), MIDNIGHT + 7 * H + 30 * M)
+})
+
+test.case("local offset parses", fn() {
+    off = scheduler.local_offset_ms(time.now())
+    test.ok(off % (15 * M) == 0, string(off))
+})
+
+test.case("wait is clamped", fn() {
+    test.eq(scheduler.wait_ms([], 0), 5000)
+    test.eq(scheduler.wait_ms([1000], 0), 1000)
+    test.eq(scheduler.wait_ms([10], 0), 100)
+    test.eq(scheduler.wait_ms([999999], 0), 5000)
+})
+
+test.case("locks: acquire, refuse while held, take over stale", fn() {
+    p = fs.join(fs.temp_dir(), "x.lock")
+    test.ok(lock.acquire(p), "first")
+    test.ok(lock.acquire(p), "re-entrant for the same pid")
+    test.eq(lock.holder(p), os.pid())
+    fs.write(p, "1")
+    test.ok(not lock.acquire(p), "pid 1 is alive")
+    fs.write(p, "999999999")
+    test.ok(lock.acquire(p), "dead holder taken over")
+    lock.release(p)
+    test.ok(not fs.exists(p), "released")
+})
+
+test.case("I4: a lock from a previous boot is stale even if the pid is alive", fn() {
+    p = fs.join(fs.temp_dir(), "boot.lock")
+    fs.write(p, "1 00000000-0000-0000-0000-000000000000")
+    test.ok(lock.acquire(p), "other boot -> stale")
+    test.ok(contains(fs.read(p), " "), "new lock records the boot id")
+    lock.release(p)
+})

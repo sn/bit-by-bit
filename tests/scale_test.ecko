@@ -1,0 +1,31 @@
+import std.test
+import std.time
+import std.fs
+import "../src/planner.ecko"
+import "../src/scanner.ecko"
+import "../src/util.ecko"
+
+# Guards against quadratic list/map building: in Ecko, set() on a map and
+# pop()/take() on a list copy the whole collection.
+let N = 100000
+
+test.case("planning 100k files is fast", fn() {
+    entries = map(range(0, N), fn(i) { path: "/d/{i}", kind: "file", size: i, mtime: 1, target: null })
+    rows = map(range(0, N), fn(i) { path: "/d/{i}", size: i, mtime: if i % 10 == 0 { 2 } else { 1 }, sha256: "h", kind: "file" })
+    t0 = time.monotonic()
+    p = planner.plan({ entries: entries, problems: [], protected: [], skipped: 0 }, util.index_by(rows, fn(r) r.path))
+    ms = time.monotonic() - t0
+    test.eq(len(p.actions), N / 10)
+    test.ok(ms < 10000, "took {ms} ms")
+})
+
+test.case("scanning a 20k-file directory is fast", fn() {
+    root = fs.join(fs.temp_dir(), "wide")
+    fs.mkdir(root)
+    for i in 0..20000 { fs.write(fs.join(root, "f{i}"), "x") }
+    t0 = time.monotonic()
+    r = scanner.scan({ paths: [root], exclude: [], follow_symlinks: false })
+    ms = time.monotonic() - t0
+    test.eq(len(r.entries), 20000)
+    test.ok(ms < 20000, "took {ms} ms")
+})

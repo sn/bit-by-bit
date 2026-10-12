@@ -1,0 +1,76 @@
+import std.test
+import std.fs
+import "../src/state.ecko"
+import "../src/util.ecko"
+
+fn fresh() = state.open(fs.join(fs.temp_dir(), "state"))
+
+fn outcome(status) = {
+    status: status, finished_at: 200, uploaded: 1, replaced: 2, deleted: 3, touched: 4,
+    pruned: 5, bytes: 99, error: null, problems: ["/a: vanished"],
+}
+
+test.case("open creates the directory and is re-openable", fn() {
+    dir = fs.join(fs.temp_dir(), "nested-state")
+    db = state.open(dir)
+    state.put_file(db, "home", { path: "/a", size: 1, mtime: 2, sha256: "h", kind: "file" })
+    state.close(db)
+    db2 = state.open(dir)
+    test.eq(len(keys(state.index(db2, "home"))), 1)
+    state.close(db2)
+})
+
+test.case("index put, touch, remove, per job", fn() {
+    db = fresh()
+    state.put_file(db, "home", { path: "/a", size: 1, mtime: 2, sha256: "h1", kind: "file" })
+    state.put_file(db, "home", { path: "/b", size: 3, mtime: 4, sha256: "h2", kind: "symlink" })
+    state.put_file(db, "other", { path: "/a", size: 9, mtime: 9, sha256: "h9", kind: "file" })
+    state.touch_file(db, "home", "/a", 50)
+    test.eq(util.lookup(state.index(db, "home"), "/a"), { path: "/a", size: 1, mtime: 50, sha256: "h1", kind: "file" })
+    state.remove_file(db, "home", "/b")
+    test.eq(keys(state.index(db, "home")), ["/a"])
+    test.eq(util.lookup(state.index(db, "other"), "/a").sha256, "h9")
+    state.put_file(db, "home", { path: "/a", size: 7, mtime: 8, sha256: "new", kind: "file" })
+    test.eq(util.lookup(state.index(db, "home"), "/a").sha256, "new")
+})
+
+test.case("replace_index swaps a job's rows atomically", fn() {
+    db = fresh()
+    state.put_file(db, "home", { path: "/old", size: 1, mtime: 1, sha256: "o", kind: "file" })
+    state.replace_index(db, "home", [{ path: "/new", size: 2, mtime: 2, sha256: "n", kind: "file" }])
+    test.eq(keys(state.index(db, "home")), ["/new"])
+})
+
+test.case("runs lifecycle", fn() {
+    db = fresh()
+    test.eq(state.last_run(db, "home"), null)
+    state.start_run(db, "home", "r1", 100)
+    test.eq(state.last_run(db, "home").status, "running")
+    state.finish_run(db, "r1", outcome("partial"))
+    r = state.last_run(db, "home")
+    test.eq(r.status, "partial")
+    test.eq(r.problems, 1)
+    test.eq(r.problem_list, ["/a: vanished"])
+    test.eq(r.bytes, 99)
+    state.start_run(db, "home", "r2", 300)
+    test.eq(state.last_run(db, "home").id, "r2")
+    test.eq(map(state.recent_runs(db, "home", 10), fn(x) x.id), ["r2", "r1"])
+})
+
+test.case("mark_interrupted fails stale running rows", fn() {
+    db = fresh()
+    state.start_run(db, "home", "r1", 100)
+    test.eq(state.mark_interrupted(db, 500), 1)
+    r = state.last_run(db, "home")
+    test.eq(r.status, "failed")
+    test.ok(contains(r.error, "interrupted"), r.error)
+})
+
+test.case("multipart bookkeeping", fn() {
+    db = fresh()
+    state.add_multipart(db, "home", "k", "u1")
+    state.add_multipart(db, "home", "k", "u1")
+    test.eq(state.list_multipart(db, "home"), [{ key: "k", upload_id: "u1" }])
+    state.remove_multipart(db, "home", "k", "u1")
+    test.eq(state.list_multipart(db, "home"), [])
+})

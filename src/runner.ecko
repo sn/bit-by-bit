@@ -1,0 +1,96 @@
+import std.fs
+import std.time
+import std.uuid
+import std.encoding
+import "./config.ecko"
+import "./s3.ecko"
+import "./state.ecko"
+import "./sync.ecko"
+import "./planner.ecko"
+import "./logging.ecko"
+import "./lock.ecko"
+
+export fn job_lock_path(cfg, job) = fs.join(cfg.state_dir, "job-" + job.name + ".lock")
+
+## An S3 client for a job's destination, with credentials loaded.
+export fn make_client(cfg, job) {
+    dest = cfg.destinations[job.destination]
+    creds = config.load_credentials(dest)
+    for w in creds.warnings { logging.emit("warn", w, { destination: dest.name }) }
+    s3.client(dest, { access_key: creds.access_key, secret_key: creds.secret_key }, cfg.retry)
+}
+
+fn empty_outcome(status, err) = {
+    status: status, error: err, uploaded: 0, replaced: 0, deleted: 0, touched: 0,
+    pruned: 0, bytes: 0, problems: [], finished_at: time.now(),
+}
+
+## Run one job now and return its outcome. Never raises: anything that escapes
+## (a full disk, a broken state database) is logged and becomes "failed".
+## opts: { dry_run: Bool, should_stop: fn() Bool }
+## status is "ok" | "partial" | "failed" | "skipped" (another run holds the job lock).
+export fn run_job(cfg, job, db, opts) {
+    try { run_job_unguarded(cfg, job, db, opts) } catch (e) {
+        msg = string(get(e, "message") ?? e)
+        logging.emit("error", "job failed outside the run: " + msg, { job: job.name })
+        try { lock.release(job_lock_path(cfg, job)) } catch (e2) { null }
+        empty_outcome("failed", msg)
+    }
+}
+
+fn run_job_unguarded(cfg, job, db, opts) {
+    now = time.now()
+    run_id = uuid.v7()
+    log_ = logging.for_run(job.name, run_id)
+    lp = job_lock_path(cfg, job)
+    unless lock.acquire(lp) {
+        log_("warn", "skipped: another run of this job is still in progress", {})
+        return empty_outcome("skipped", "another run of this job is still in progress")
+    }
+    client = try { make_client(cfg, job) } catch (e) {
+        msg = string(get(e, "message") ?? e)
+        log_("error", "job failed: " + msg, {})
+        unless opts.dry_run {
+            state.start_run(db, job.name, run_id, now)
+            state.finish_run(db, run_id, empty_outcome("failed", msg))
+        }
+        lock.release(lp)
+        return empty_outcome("failed", msg)
+    }
+    log_("info", "run started", { dry_run: opts.dry_run })
+    ctx = {
+        job: job, cfg: cfg, client: client, db: db, run_id: run_id,
+        run_ts: sync.run_ts_of(now), now_ms: now, dry_run: opts.dry_run,
+        should_stop: opts.should_stop, log: log_,
+    }
+    o = sync.run(ctx)
+    lock.release(lp)
+    level = match o.status { "ok" => "info" "partial" => "warn" _ => "error" }
+    log_(level, "run finished", {
+        status: o.status, uploaded: o.uploaded, replaced: o.replaced, deleted: o.deleted,
+        touched: o.touched, pruned: o.pruned, bytes: o.bytes, problems: len(o.problems),
+    })
+    o
+}
+
+## Rebuild a job's index from the bucket: list current objects and read their
+## metadata. Returns the number of rows written.
+export fn rebuild_state(cfg, job, db) {
+    client = make_client(cfg, job)
+    vprefix = job.prefix + "/_versions/"
+    mut rows = []
+    for o in s3.list_objects(client, job.prefix + "/") {
+        if starts_with(o.key, vprefix) { continue }
+        meta = s3.head_object(client, o.key)
+        if meta == null { continue }
+        path = o.key[len(job.prefix)..]
+        row = if has(meta, "symlink") {
+            { path: path, size: 0, mtime: 0, sha256: planner.link_sha(encoding.url_decode(meta.symlink)), kind: "symlink" }
+        } else {
+            { path: path, size: o.size, mtime: int(get(meta, "mtime") ?? "0"), sha256: get(meta, "sha256") ?? "", kind: "file" }
+        }
+        rows = push(rows, row)
+    }
+    state.replace_index(db, job.name, rows)
+    len(rows)
+}

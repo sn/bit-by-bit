@@ -1,0 +1,20 @@
+import std.log
+
+## Configure sinks from the config's log section: always stderr (the journal),
+## plus the log file when one is set. Rotation is left to logrotate.
+export fn setup(log_cfg) {
+    sinks = [{ target: "stderr", level: log_cfg.level }]
+    all_sinks = if log_cfg.file == null { sinks } else { push(sinks, { target: "file", path: log_cfg.file, level: log_cfg.level }) }
+    log.configure({ sinks: all_sinks })
+}
+
+## Write one line at `level` ("debug" | "info" | "warn" | "error").
+export fn emit(level, msg, fields) = match level {
+    "debug" => log.debug(msg, fields)
+    "warn" => log.warn(msg, fields)
+    "error" => log.error(msg, fields)
+    _ => log.info(msg, fields)
+}
+
+## A logger for one job run: every line carries job and run fields.
+export fn for_run(job, run_id) = fn(level, msg, fields) emit(level, msg, merge(fields, { job: job, run: run_id }))

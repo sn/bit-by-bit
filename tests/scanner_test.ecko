@@ -1,0 +1,105 @@
+import std.test
+import std.fs
+import std.proc
+import "../src/scanner.ecko"
+
+# Builds:
+#   root/a.txt  root/skip.tmp  root/sub/b.txt  root/node_modules/x/y.js
+#   root/link -> a.txt  root/dirlink -> sub  root/fifo  root/locked/ (mode 000)
+fn tree() {
+    root = fs.join(fs.temp_dir(), "root")
+    fs.mkdir(fs.join(root, "sub"))
+    fs.mkdir(fs.join(root, "node_modules/x"))
+    fs.mkdir(fs.join(root, "locked"))
+    fs.write(fs.join(root, "a.txt"), "aaa")
+    fs.write(fs.join(root, "skip.tmp"), "t")
+    fs.write(fs.join(root, "sub/b.txt"), "bb")
+    fs.write(fs.join(root, "node_modules/x/y.js"), "y")
+    fs.write(fs.join(root, "locked/secret.txt"), "s")
+    fs.symlink("a.txt", fs.join(root, "link"))
+    fs.symlink("sub", fs.join(root, "dirlink"))
+    proc.run("mkfifo", [fs.join(root, "fifo")])
+    fs.chmod(fs.join(root, "locked"), "000")
+    root
+}
+
+fn job(root, opts) = merge({ paths: [root], exclude: ["**/*.tmp", "**/node_modules/**"], follow_symlinks: false }, opts)
+
+fn rel(root, entries) = map(entries, fn(e) e.path[len(root) + 1..])
+
+test.case("files, excludes, symlinks, specials, unreadable dirs", fn() {
+    root = tree()
+    r = scanner.scan(job(root, {}))
+    fs.chmod(fs.join(root, "locked"), "755")
+    test.eq(rel(root, r.entries), ["a.txt", "dirlink", "link", "sub/b.txt"])
+    a = r.entries[0]
+    test.eq([a.kind, a.size], ["file", 3])
+    test.ok(a.mtime > 0, "mtime")
+    link = r.entries[2]
+    test.eq(link.kind, "symlink")
+    test.eq(link.target, fs.join(root, "a.txt"))
+    test.eq(r.skipped, 1)
+    test.eq(r.protected, [fs.join(root, "locked")])
+    test.ok(any(r.problems, fn(p) contains(p, "unreadable directory")), string(r.problems))
+})
+
+test.case("follow_symlinks descends into linked dirs", fn() {
+    root = tree()
+    fs.chmod(fs.join(root, "locked"), "755")
+    r = scanner.scan(job(root, { follow_symlinks: true }))
+    paths = rel(root, r.entries)
+    test.ok(contains(paths, "link"), "file link followed")
+    test.eq(r.entries[index_of(paths, "link")].kind, "file")
+    # Following a link backs the target up under the link's path too.
+    test.ok(contains(paths, "dirlink/b.txt"), string(paths))
+})
+
+test.case("follow_symlinks stops at a symlink loop", fn() {
+    root = fs.join(fs.temp_dir(), "loop")
+    fs.mkdir(fs.join(root, "x"))
+    fs.write(fs.join(root, "x/f.txt"), "f")
+    fs.symlink(root, fs.join(root, "x/up"))
+    r = scanner.scan(job(root, { follow_symlinks: true }))
+    test.eq(rel(root, r.entries), ["x/f.txt"])
+})
+
+test.case("missing root is protected and a problem", fn() {
+    r = scanner.scan(job("/no/such/root", {}))
+    test.eq(r.entries, [])
+    test.eq(r.protected, ["/no/such/root"])
+    test.eq(len(r.problems), 1)
+})
+
+test.case("a single file as a root", fn() {
+    root = tree()
+    fs.chmod(fs.join(root, "locked"), "755")
+    r = scanner.scan(job(fs.join(root, "a.txt"), {}))
+    test.eq(len(r.entries), 1)
+})
+
+test.case("broken symlink is a protected problem", fn() {
+    root = fs.join(fs.temp_dir(), "broken")
+    fs.mkdir(root)
+    fs.symlink("gone.txt", fs.join(root, "dangling"))
+    r = scanner.scan(job(root, {}))
+    test.eq(r.entries, [])
+    test.eq(r.protected, [fs.join(root, "dangling")])
+    test.ok(contains(r.problems[0], "broken symlink"), r.problems[0])
+})
+
+test.case("C2: a followed root symlink to a missing target is protected", fn() {
+    base = fs.join(fs.temp_dir(), "c2")
+    fs.mkdir(base)
+    root = fs.join(base, "data")
+    fs.symlink(fs.join(base, "gone"), root)
+    r = scanner.scan(job(root, { follow_symlinks: true }))
+    test.eq(r.entries, [])
+    test.eq(r.protected, [root])
+    test.eq(len(r.problems), 1)
+})
+
+test.case("under_any", fn() {
+    test.ok(scanner.under_any("/a/b/c", ["/a/b"]), "inside")
+    test.ok(scanner.under_any("/a/b", ["/a/b"]), "equal")
+    test.ok(not scanner.under_any("/a/bc", ["/a/b"]), "sibling prefix")
+})

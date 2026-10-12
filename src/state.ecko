@@ -1,0 +1,88 @@
+import std.sql
+import std.fs
+import std.json
+import "./util.ecko"
+
+let SCHEMA = [
+    "create table if not exists files (job text not null, path text not null, size integer not null, mtime integer not null, sha256 text not null, kind text not null, primary key (job, path))",
+    "create table if not exists runs (id text primary key, job text not null, started_at integer not null, finished_at integer, status text not null, uploaded integer not null default 0, replaced integer not null default 0, deleted integer not null default 0, touched integer not null default 0, pruned integer not null default 0, problems integer not null default 0, bytes integer not null default 0, error text, problem_list text)",
+    "create index if not exists runs_job_started on runs (job, started_at)",
+    "create table if not exists multipart (job text not null, key text not null, upload_id text not null, primary key (job, key, upload_id))",
+    "create table if not exists targets (job text primary key, fingerprint text not null)",
+]
+
+## Open (creating if needed) the state database in `state_dir`.
+export fn open(state_dir) {
+    unless fs.exists(state_dir) { fs.mkdir(state_dir) }
+    db = sql.open(fs.join(state_dir, "state.db"))
+    sql.query(db, "pragma journal_mode = wal")
+    for stmt in SCHEMA { sql.exec(db, stmt) }
+    db
+}
+
+export fn close(db) = sql.close(db)
+
+# ---- file index ----------------------------------------------------------------
+
+## Every indexed file of a job, as a util.index_by index keyed by path:
+## read rows with util.lookup(idx, path) -> { path, size, mtime, sha256, kind }.
+export fn index(db, job) = util.index_by(sql.query(db, "select path, size, mtime, sha256, kind from files where job = ? order by path", [job]), fn(r) r.path)
+
+## Insert or replace one index row. row: { path, size, mtime, sha256, kind }.
+export fn put_file(db, job, row) =
+    sql.exec(db, "insert or replace into files (job, path, size, mtime, sha256, kind) values (?, ?, ?, ?, ?, ?)",
+        [job, row.path, row.size, row.mtime, row.sha256, row.kind])
+
+export fn remove_file(db, job, path) = sql.exec(db, "delete from files where job = ? and path = ?", [job, path])
+
+## Record a new mtime for a file whose content did not change.
+export fn touch_file(db, job, path, mtime) = sql.exec(db, "update files set mtime = ? where job = ? and path = ?", [mtime, job, path])
+
+## Replace a job's whole index (used by --rebuild-state).
+export fn replace_index(db, job, rows) = sql.transaction(db, fn(tx) {
+    sql.exec(tx, "delete from files where job = ?", [job])
+    for r in rows { put_file(tx, job, r) }
+})
+
+# ---- destination fingerprint ----------------------------------------------------
+
+## Where a job's index rows were uploaded to (endpoint|bucket|prefix), or null.
+export fn target(db, job) {
+    row = sql.query_one(db, "select fingerprint from targets where job = ?", [job])
+    if row == null { null } else { row.fingerprint }
+}
+
+export fn set_target(db, job, fingerprint) =
+    sql.exec(db, "insert or replace into targets (job, fingerprint) values (?, ?)", [job, fingerprint])
+
+# ---- runs ---------------------------------------------------------------------------
+
+export fn start_run(db, job, run_id, started_at) =
+    sql.exec(db, "insert into runs (id, job, started_at, status) values (?, ?, ?, 'running')", [run_id, job, started_at])
+
+## outcome: { status, finished_at, uploaded, replaced, deleted, touched, pruned, bytes, error, problems: [String] }
+export fn finish_run(db, run_id, o) =
+    sql.exec(db, "update runs set status = ?, finished_at = ?, uploaded = ?, replaced = ?, deleted = ?, touched = ?, pruned = ?, problems = ?, bytes = ?, error = ?, problem_list = ? where id = ?",
+        [o.status, o.finished_at, o.uploaded, o.replaced, o.deleted, o.touched, o.pruned, len(o.problems), o.bytes, o.error, json.encode(o.problems), run_id])
+
+fn decode_run(r) = if r == null { null } else { set(r, "problem_list", if r.problem_list == null { [] } else { json.decode(r.problem_list) }) }
+
+## The most recent run of a job (any status), or null.
+export fn last_run(db, job) = decode_run(sql.query_one(db, "select * from runs where job = ? order by started_at desc, id desc limit 1", [job]))
+
+## The most recent runs of a job, newest first.
+export fn recent_runs(db, job, n) = map(sql.query(db, "select * from runs where job = ? order by started_at desc, id desc limit ?", [job, n]), decode_run)
+
+## Mark runs left 'running' by a crash as failed. Returns how many.
+export fn mark_interrupted(db, now) =
+    sql.exec(db, "update runs set status = 'failed', finished_at = ?, error = 'interrupted: the process stopped before the run finished' where status = 'running'", [now])
+
+# ---- multipart bookkeeping -------------------------------------------------------------
+
+export fn add_multipart(db, job, key, upload_id) =
+    sql.exec(db, "insert or ignore into multipart (job, key, upload_id) values (?, ?, ?)", [job, key, upload_id])
+
+export fn remove_multipart(db, job, key, upload_id) =
+    sql.exec(db, "delete from multipart where job = ? and key = ? and upload_id = ?", [job, key, upload_id])
+
+export fn list_multipart(db, job) = sql.query(db, "select key, upload_id from multipart where job = ?", [job])

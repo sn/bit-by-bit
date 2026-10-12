@@ -1,0 +1,34 @@
+import std.test
+import "../src/duration.ecko"
+
+test.case("parse_duration units", fn() {
+    test.eq(duration.parse_duration("500ms"), 500)
+    test.eq(duration.parse_duration("30s"), 30000)
+    test.eq(duration.parse_duration("5m"), 300000)
+    test.eq(duration.parse_duration("6h"), 21600000)
+    test.eq(duration.parse_duration("1d"), 86400000)
+})
+
+test.case("parse_duration rejects junk", fn() {
+    test.err(fn() duration.parse_duration("6"), "invalid duration")
+    test.err(fn() duration.parse_duration("6 h"), "invalid duration")
+    test.err(fn() duration.parse_duration("-5m"), "invalid duration")
+    test.err(fn() duration.parse_duration("0s"), "greater than zero")
+    test.err(fn() duration.parse_duration(5), "invalid duration")
+})
+
+test.case("parse_size", fn() {
+    test.eq(duration.parse_size("64MiB"), 67108864)
+    test.eq(duration.parse_size("512KiB"), 524288)
+    test.eq(duration.parse_size("1GiB"), 1073741824)
+    test.eq(duration.parse_size(1000), 1000)
+    test.err(fn() duration.parse_size("64MB"), "invalid size")
+    test.err(fn() duration.parse_size(0), "invalid size")
+})
+
+test.case("parse_hhmm", fn() {
+    test.eq(duration.parse_hhmm("02:30"), { hour: 2, minute: 30 })
+    test.eq(duration.parse_hhmm("23:59"), { hour: 23, minute: 59 })
+    test.err(fn() duration.parse_hhmm("24:00"), "invalid time")
+    test.err(fn() duration.parse_hhmm("2:30"), "invalid time")
+})

@@ -1,0 +1,87 @@
+import std.fs
+import std.time
+import std.signal
+import std.bg
+import "./config.ecko"
+import "./state.ecko"
+import "./scheduler.ecko"
+import "./runner.ecko"
+import "./logging.ecko"
+import "./lock.ecko"
+
+let DRAIN_MS = 60000
+
+fn errors_text(e) = join(get(e, "errors") ?? [string(get(e, "message") ?? e)], "; ")
+
+## Run the scheduler until SIGTERM/SIGINT. SIGHUP reloads the config.
+## Returns the process exit code.
+export fn run(config_path) {
+    mut cfg = try { config.load(config_path) } catch (e) {
+        logging.emit("error", "invalid config: " + errors_text(e), {})
+        return 64
+    }
+    logging.setup(cfg.log)
+    for w in cfg.warnings { logging.emit("warn", w, {}) }
+    unless fs.exists(cfg.state_dir) { fs.mkdir(cfg.state_dir) }
+    lock_path = fs.join(cfg.state_dir, "daemon.lock")
+    unless lock.acquire(lock_path) {
+        logging.emit("error", "another bit-by-bit daemon is running", { pid: lock.holder(lock_path) })
+        return 1
+    }
+    db = state.open(cfg.state_dir)
+    stale = state.mark_interrupted(db, time.now())
+    if stale > 0 { logging.emit("warn", "marked runs interrupted by the last shutdown as failed", { count: stale }) }
+    sigs = signal.on(["term", "int", "hup"])
+    stopping = cell(false)
+    should_stop = fn() cell_get(stopping)
+    mut tasks = {}
+    logging.emit("info", "daemon started", { jobs: len(cfg.jobs), config: config_path })
+
+    while true {
+        now = time.now()
+        for name in keys(tasks) {
+            if bg.status(tasks[name]) != "running" { tasks = remove(tasks, name) }
+        }
+        mut due_times = []
+        for job in cfg.jobs {
+            if has(tasks, job.name) { continue }
+            last = try { state.last_run(db, job.name) } catch (e) {
+                logging.emit("error", "can't read run history: " + string(get(e, "message") ?? e), { job: job.name })
+                null
+            }
+            last_ms = if last == null { null } else { last.started_at }
+            due = scheduler.next_due(job.schedule, last_ms, now, scheduler.local_offset_ms(now))
+            if due <= now {
+                run_cfg = cfg
+                tasks = set(tasks, job.name, bg.spawn(fn() runner.run_job(run_cfg, job, db, { dry_run: false, should_stop: should_stop })))
+            } else {
+                due_times = push(due_times, due)
+            }
+        }
+        sig = signal.next(sigs, scheduler.wait_ms(due_times, now))
+        if sig == "hup" {
+            try {
+                cfg = config.load(config_path)
+                logging.setup(cfg.log)
+                logging.emit("info", "config reloaded", { jobs: len(cfg.jobs) })
+            } catch (e) {
+                logging.emit("error", "config reload rejected, keeping the old config: " + errors_text(e), {})
+            }
+        } else if sig == "term" or sig == "int" {
+            logging.emit("info", "shutdown requested, letting running jobs reach a safe point", { running: len(tasks) })
+            cell_set(stopping, true)
+            break
+        }
+    }
+
+    deadline = time.now() + DRAIN_MS
+    while time.now() < deadline and any(values(tasks), fn(t) bg.status(t) == "running") { sleep(200) }
+    for t in values(tasks) {
+        if bg.status(t) == "running" { bg.cancel(t) }
+    }
+    signal.close(sigs)
+    state.close(db)
+    lock.release(lock_path)
+    logging.emit("info", "daemon stopped", {})
+    0
+}

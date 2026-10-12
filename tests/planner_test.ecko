@@ -1,0 +1,57 @@
+import std.test
+import "../src/planner.ecko"
+import "../src/util.ecko"
+
+fn file(path, size, mtime) = { path: path, kind: "file", size: size, mtime: mtime, target: null }
+fn link(path, target) = { path: path, kind: "symlink", size: 0, mtime: 0, target: target }
+fn idx(size, mtime, sha, kind) = { size: size, mtime: mtime, sha256: sha, kind: kind }
+
+# Build a state-style index from {path: row} literals.
+fn index(m) = util.index_by(map(keys(m), fn(k) set(m[k], "path", k)), fn(r) r.path)
+fn scan(entries, protected) = { entries: entries, problems: [], protected: protected, skipped: 0 }
+fn ops(p) = map(p.actions, fn(a) [a.op, a.path])
+
+test.case("new file uploads", fn() {
+    p = planner.plan(scan([file("/a", 1, 1)], []), index({}))
+    test.eq(ops(p), [["upload", "/a"]])
+})
+
+test.case("unchanged size and mtime is skipped", fn() {
+    p = planner.plan(scan([file("/a", 1, 1)], []), index({ "/a": idx(1, 1, "h", "file") }))
+    test.eq(ops(p), [])
+    test.eq(p.unchanged, 1)
+})
+
+test.case("size or mtime change needs a hash check", fn() {
+    p = planner.plan(scan([file("/a", 2, 1), file("/b", 1, 9)], []), index({ "/a": idx(1, 1, "h", "file"), "/b": idx(1, 1, "h", "file") }))
+    test.eq(ops(p), [["check", "/a"], ["check", "/b"]])
+    test.eq(p.actions[0].prev.sha256, "h")
+})
+
+test.case("deleted file is deleted", fn() {
+    p = planner.plan(scan([], []), index({ "/gone": idx(1, 1, "h", "file") }))
+    test.eq(ops(p), [["delete", "/gone"]])
+})
+
+test.case("nothing under a protected path is deleted", fn() {
+    raw_index = { "/mnt/disk/a": idx(1, 1, "h", "file"), "/mnt/disk/sub/b": idx(1, 1, "h", "file"), "/mnt/diskette": idx(1, 1, "h", "file") }
+    p = planner.plan(scan([], ["/mnt/disk"]), index(raw_index))
+    test.eq(ops(p), [["delete", "/mnt/diskette"]])
+})
+
+test.case("rename is a delete plus an upload", fn() {
+    p = planner.plan(scan([file("/new", 1, 1)], []), index({ "/old": idx(1, 1, "h", "file") }))
+    test.eq(ops(p), [["upload", "/new"], ["delete", "/old"]])
+})
+
+test.case("symlinks compare by target", fn() {
+    same = planner.plan(scan([link("/l", "/t")], []), index({ "/l": idx(0, 0, planner.link_sha("/t"), "symlink") }))
+    test.eq(ops(same), [])
+    moved = planner.plan(scan([link("/l", "/u")], []), index({ "/l": idx(0, 0, planner.link_sha("/t"), "symlink") }))
+    test.eq(ops(moved), [["replace", "/l"]])
+})
+
+test.case("kind change replaces", fn() {
+    p = planner.plan(scan([file("/x", 1, 1)], []), index({ "/x": idx(0, 0, "link:/t", "symlink") }))
+    test.eq(ops(p), [["replace", "/x"]])
+})

@@ -1,0 +1,287 @@
+import std.test
+import std.fs
+import std.encoding
+import std.hash
+import "../src/s3.ecko"
+import "../src/state.ecko"
+import "../src/sync.ecko"
+import "../src/util.ecko"
+import "../testkit/fake_s3.ecko"
+
+port = fake_s3.start()
+let CLIENT = s3.client(fake_s3.dest(port), fake_s3.creds(), fake_s3.fast_retry())
+let CFG = { concurrency: 2, multipart_threshold: 1000000, multipart_part_size: 5242880 }
+
+mut clock = 1791820438000
+
+# A fresh job over a fresh directory with a.txt and sub/b.txt.
+fn setup() {
+    fake_s3.reset()
+    root = fs.join(fs.temp_dir(), "src")
+    fs.mkdir(fs.join(root, "sub"))
+    fs.write(fs.join(root, "a.txt"), "alpha")
+    fs.write(fs.join(root, "sub/b.txt"), "bravo")
+    job = { name: "t", prefix: "pc", paths: [root], exclude: [], follow_symlinks: false, keep_versions_days: 30 }
+    db = state.open(fs.join(fs.temp_dir(), "state"))
+    { root: root, job: job, db: db }
+}
+
+fn ctx(env, opts) {
+    clock = clock + 60000
+    base = {
+        job: env.job, cfg: CFG, client: CLIENT, db: env.db,
+        run_id: "run-" + string(clock), run_ts: sync.run_ts_of(clock), now_ms: clock,
+        dry_run: false, should_stop: fn() false, log: fn(level, msg, fields) null,
+    }
+    merge(base, opts)
+}
+
+fn run(env) = sync.run(ctx(env, {}))
+fn key(env, rel) = "pc" + env.root + "/" + rel
+fn remote(env, rel) = fake_s3.object(key(env, rel))
+fn versions() = filter(keys(fake_s3.objects_()), fn(k) contains(k, "/_versions/"))
+
+test.case("first run uploads everything with metadata", fn() {
+    env = setup()
+    o = run(env)
+    test.eq([o.status, o.uploaded, o.replaced, o.deleted], ["ok", 2, 0, 0])
+    test.eq(remote(env, "a.txt").body, bytes("alpha"))
+    meta = remote(env, "a.txt").meta
+    test.eq(meta["bbb-sha256"], hash.sha256("alpha"))
+    test.ok(has(meta, "bbb-mtime") and has(meta, "bbb-mode") and has(meta, "bbb-run"), string(meta))
+    test.eq(len(keys(state.index(env.db, "t"))), 2)
+    test.eq(state.last_run(env.db, "t").status, "ok")
+})
+
+test.case("second run with no changes uploads nothing", fn() {
+    env = setup()
+    run(env)
+    fake_s3.reset_log()
+    o = run(env)
+    test.eq([o.uploaded, o.replaced, o.deleted, o.touched], [0, 0, 0, 0])
+    test.eq(filter(fake_s3.requests(), fn(r) not starts_with(r, "GET ")), [])
+})
+
+test.case("changed file is versioned then replaced", fn() {
+    env = setup()
+    run(env)
+    sleep(5)
+    fs.write(fs.join(env.root, "a.txt"), "alpha v2")
+    c2 = ctx(env, {})
+    o = sync.run(c2)
+    test.eq(o.replaced, 1)
+    test.eq(remote(env, "a.txt").body, bytes("alpha v2"))
+    vkey = sync.version_key(env.job, c2.run_ts, env.root + "/a.txt")
+    test.eq(fake_s3.object(vkey).body, bytes("alpha"))
+})
+
+test.case("mtime-only change is a touch", fn() {
+    env = setup()
+    run(env)
+    sleep(5)
+    fs.write(fs.join(env.root, "a.txt"), "alpha")
+    o = run(env)
+    test.eq([o.touched, o.replaced, o.uploaded], [1, 0, 0])
+    test.eq(versions(), [])
+})
+
+test.case("deleted file is versioned then removed", fn() {
+    env = setup()
+    run(env)
+    fs.remove(fs.join(env.root, "sub/b.txt"))
+    o = run(env)
+    test.eq(o.deleted, 1)
+    test.eq(remote(env, "sub/b.txt"), null)
+    test.eq(len(versions()), 1)
+    test.eq(fake_s3.object(versions()[0]).body, bytes("bravo"))
+    test.eq(keys(state.index(env.db, "t")), [env.root + "/a.txt"])
+})
+
+test.case("a missing root deletes nothing", fn() {
+    env = setup()
+    run(env)
+    moved = env.root + "-unmounted"
+    fs.rename(env.root, moved)
+    o = run(env)
+    test.eq([o.status, o.deleted], ["partial", 0])
+    test.eq(remote(env, "a.txt").body, bytes("alpha"))
+    fs.rename(moved, env.root)
+})
+
+test.case("old versions are pruned, recent kept", fn() {
+    env = setup()
+    old_ts = sync.run_ts_of(clock - 40 * 86400000)
+    new_ts = sync.run_ts_of(clock - 1 * 86400000)
+    fake_s3.put_raw("pc/_versions/" + old_ts + "/x", bytes("old"), {})
+    fake_s3.put_raw("pc/_versions/" + new_ts + "/x", bytes("new"), {})
+    o = run(env)
+    test.eq(o.pruned, 1)
+    test.eq(fake_s3.object("pc/_versions/" + old_ts + "/x"), null)
+    test.ok(fake_s3.object("pc/_versions/" + new_ts + "/x") != null, "recent kept")
+})
+
+test.case("bad credentials fail the run and change nothing", fn() {
+    env = setup()
+    bad = s3.client(fake_s3.dest(port), { access_key: fake_s3.ACCESS_KEY, secret_key: secret("nope") }, fake_s3.fast_retry())
+    o = sync.run(ctx(env, { client: bad }))
+    test.eq(o.status, "failed")
+    test.ok(contains(o.error, "403"), o.error)
+    test.eq(state.index(env.db, "t"), {})
+    test.eq(state.last_run(env.db, "t").status, "failed")
+})
+
+test.case("provider outage fails the run; next run recovers", fn() {
+    env = setup()
+    fake_s3.fail_next("PUT", "", 503, "ServiceUnavailable", 100)
+    o = run(env)
+    test.eq(o.status, "failed")
+    fake_s3.reset_faults()
+    o2 = run(env)
+    test.eq([o2.status, o2.uploaded], ["ok", 2])
+})
+
+test.case("crash between version copy and upload is repaired next run", fn() {
+    env = setup()
+    run(env)
+    sleep(5)
+    fs.write(fs.join(env.root, "a.txt"), "alpha v2")
+    # The copy to _versions succeeds, then the PUT of the new content is refused.
+    fake_s3.fail_next("PUT", "pc" + env.root + "/a.txt", 403, "AccessDenied", 1)
+    o = run(env)
+    test.eq(o.status, "failed")
+    test.eq(util.lookup(state.index(env.db, "t"), env.root + "/a.txt").size, 5)
+    o2 = run(env)
+    test.eq(o2.status, "ok")
+    test.eq(remote(env, "a.txt").body, bytes("alpha v2"))
+    test.ok(len(versions()) >= 1, "old content preserved")
+})
+
+test.case("large files use multipart; stale uploads are aborted", fn() {
+    env = setup()
+    big = join(map(range(0, 3000), fn(i) "line {i}\n"), "")
+    fs.write(fs.join(env.root, "big.txt"), big)
+    state.add_multipart(env.db, "t", "pc/stale", "up-stale")
+    small_parts = merge(CFG, { multipart_threshold: 1000, multipart_part_size: 4096 })
+    o = sync.run(ctx(env, { cfg: small_parts }))
+    test.eq(o.status, "ok")
+    test.eq(remote(env, "big.txt").body, bytes(big))
+    test.eq(state.list_multipart(env.db, "t"), [])
+    test.ok(contains(fake_s3.requests(), "DELETE pc/stale"), "stale upload aborted")
+})
+
+test.case("dry run changes nothing", fn() {
+    env = setup()
+    o = sync.run(ctx(env, { dry_run: true }))
+    test.eq(o.status, "ok")
+    test.eq(fake_s3.objects_(), {})
+    test.eq(state.last_run(env.db, "t"), null)
+})
+
+test.case("shutdown request stops between batches", fn() {
+    env = setup()
+    o = sync.run(ctx(env, { should_stop: fn() true }))
+    test.eq(o.status, "failed")
+    test.ok(contains(o.error, "shutdown"), o.error)
+})
+
+test.case("awkward file names round-trip", fn() {
+    env = setup()
+    names = ["sp ace.txt", "hash#pct%plus+q?.txt", "ünïcødé ✓.txt", "semi;colon=eq&amp.txt"]
+    for n in names { fs.write(fs.join(env.root, n), n) }
+    o = run(env)
+    test.eq(o.status, "ok")
+    for n in names { test.eq(remote(env, n).body, bytes(n)) }
+    o2 = run(env)
+    test.eq([o2.uploaded, o2.replaced, o2.deleted], [0, 0, 0])
+})
+
+test.case("empty files upload and stay unchanged", fn() {
+    env = setup()
+    fs.write(fs.join(env.root, "empty"), "")
+    o = run(env)
+    test.eq(o.status, "ok")
+    test.eq(remote(env, "empty").body, bytes(""))
+    test.eq(run(env).uploaded, 0)
+})
+
+test.case("multipart file of an exact multiple of the part size", fn() {
+    env = setup()
+    body = join(map(range(0, 2048), fn(i) "ab"), "")
+    fs.write(fs.join(env.root, "exact.txt"), body)
+    cfg = merge(CFG, { multipart_threshold: 1000, multipart_part_size: 1024 })
+    o = sync.run(ctx(env, { cfg: cfg }))
+    test.eq(o.status, "ok")
+    test.eq(remote(env, "exact.txt").body, bytes(body))
+})
+
+test.case("C1: a changed prefix re-uploads everything", fn() {
+    env = setup()
+    run(env)
+    moved = merge(env, { job: merge(env.job, { prefix: "pc2" }) })
+    o = run(moved)
+    test.eq([o.status, o.uploaded], ["ok", 2])
+    test.eq(fake_s3.object("pc2" + env.root + "/a.txt").body, bytes("alpha"))
+})
+
+test.case("C3: a 4xx on one object is a problem, not a fatal error", fn() {
+    env = setup()
+    run(env)
+    sleep(5)
+    fs.write(fs.join(env.root, "a.txt"), "alpha v2")
+    fs.write(fs.join(env.root, "new.txt"), "new")
+    fake_s3.fail_next("PUT", "/_versions/", 400, "InvalidRequest", 1)
+    o = run(env)
+    test.eq(o.status, "partial")
+    test.eq(o.uploaded, 1)
+    test.ok(any(o.problems, fn(p) contains(p, "a.txt")), string(o.problems))
+    o2 = run(env)
+    test.eq([o2.status, o2.replaced], ["ok", 1])
+    test.eq(remote(env, "a.txt").body, bytes("alpha v2"))
+})
+
+test.case("C3: copies over the copy limit use multipart copy", fn() {
+    env = setup()
+    run(env)
+    sleep(5)
+    fs.write(fs.join(env.root, "a.txt"), "alpha v2")
+    fake_s3.set_copy_limit(3)
+    cfg = merge(CFG, { copy_limit: 3, multipart_part_size: 2 })
+    c2 = ctx(env, { cfg: cfg })
+    o = sync.run(c2)
+    test.eq([o.status, o.replaced], ["ok", 1])
+    vkey = sync.version_key(env.job, c2.run_ts, env.root + "/a.txt")
+    test.eq(fake_s3.object(vkey).body, bytes("alpha"))
+    test.eq(fake_s3.object(vkey).meta["bbb-sha256"], hash.sha256("alpha"))
+    test.eq(state.list_multipart(env.db, "t"), [])
+})
+
+test.case("C3: part size grows so no file needs more than 10,000 parts", fn() {
+    test.eq(sync.part_size_for(100, 16777216), 16777216)
+    big = 200 * 1073741824
+    ps = sync.part_size_for(big, 16777216)
+    test.ok(ps >= 16777216, "never below the configured size")
+    test.ok((big + ps - 1) / ps <= 10000, "parts: {ps}")
+})
+
+test.case("I1: an emptied root (unmounted drive) deletes nothing", fn() {
+    env = setup()
+    run(env)
+    fs.remove(fs.join(env.root, "a.txt"))
+    fs.remove(fs.join(env.root, "sub/b.txt"))
+    fs.remove(fs.join(env.root, "sub"))
+    o = run(env)
+    test.eq([o.status, o.deleted], ["partial", 0])
+    test.ok(any(o.problems, fn(p) contains(p, "unmounted")), string(o.problems))
+    test.eq(remote(env, "a.txt").body, bytes("alpha"))
+})
+
+test.case("binary files survive byte-for-byte", fn() {
+    env = setup()
+    blob = encoding.hex_decode("00ff10c3289f0d0a1a7f80fe")
+    fs.write(fs.join(env.root, "blob.bin"), blob)
+    o = run(env)
+    test.eq(o.status, "ok")
+    test.eq(remote(env, "blob.bin").body, blob)
+})
+
+fake_s3.stop()

@@ -1,0 +1,44 @@
+import std.fs
+import std.os
+
+# The kernel's id for this boot. A pid in a lock file from an earlier boot says
+# nothing about who holds the lock now, even if that pid is alive again.
+fn boot_id() = try { trim(fs.read("/proc/sys/kernel/random/boot_id")) } catch (e) { "" }
+
+# Lock contents: "<pid> <boot id>". A bare "<pid>" (no boot id) is trusted by pid.
+fn alive(content) {
+    parts = split(trim(content), " ")
+    pid = parts[0]
+    if len(parts) > 1 and parts[1] != boot_id() { return false }
+    re_digits(pid) and fs.exists("/proc/" + pid)
+}
+
+fn pid_of(content) = split(trim(content), " ")[0]
+
+fn re_digits(s) = len(s) > 0 and all(chars(s), fn(c) c >= "0" and c <= "9")
+
+## Take a pid lock file. Returns true when acquired, false when a live process
+## holds it. A lock left by a dead process is taken over.
+export fn acquire(path) {
+    me = string(os.pid())
+    if fs.exists(path) {
+        owner = try { fs.read(path) } catch (e) { "" }
+        if pid_of(owner) != me and alive(owner) { return false }
+    }
+    fs.write(path, me + " " + boot_id())
+    true
+}
+
+## Release a lock this process holds. A lock held by someone else is left alone.
+export fn release(path) {
+    if fs.exists(path) and pid_of(try { fs.read(path) } catch (e) { "" }) == string(os.pid()) {
+        fs.remove(path)
+    }
+}
+
+## The pid holding `path`, or null.
+export fn holder(path) {
+    unless fs.exists(path) { return null }
+    h = try { fs.read(path) } catch (e) { "" }
+    if alive(h) { int(pid_of(h)) } else { null }
+}

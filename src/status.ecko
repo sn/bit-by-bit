@@ -1,0 +1,57 @@
+import std.time
+import std.fmt
+import "./state.ecko"
+import "./scheduler.ecko"
+
+fn at_text(ms) = if ms == null { "-" } else { time.format_local(ms, "%Y-%m-%d %H:%M") }
+
+## Human-readable byte count: 1536 -> "1.5 KiB".
+export fn size_text(n) {
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    mut v = float(n)
+    mut u = 0
+    while v >= 1024.0 and u < len(units) - 1 {
+        v = v / 1024.0
+        u = u + 1
+    }
+    if u == 0 { "{n} B" } else { fmt.fixed(v, 1) + " " + units[u] }
+}
+
+## One map per job: { job, status, started_at, finished_at, next_due, counts, error, problems }.
+export fn collect(cfg, db, now) = map(cfg.jobs, fn(job) {
+    last = state.last_run(db, job.name)
+    last_ms = if last == null { null } else { last.started_at }
+    {
+        job: job.name,
+        status: if last == null { "never run" } else { last.status },
+        started_at: last_ms,
+        finished_at: if last == null { null } else { last.finished_at },
+        next_due: scheduler.next_due(job.schedule, last_ms, now, scheduler.local_offset_ms(now)),
+        uploaded: if last == null { 0 } else { last.uploaded },
+        replaced: if last == null { 0 } else { last.replaced },
+        deleted: if last == null { 0 } else { last.deleted },
+        bytes: if last == null { 0 } else { last.bytes },
+        error: if last == null { null } else { last.error },
+        problems: if last == null { [] } else { last.problem_list },
+    }
+})
+
+## Render collect() output as text lines.
+export fn render(rows, now) {
+    mut out = []
+    for r in rows {
+        due = if r.next_due <= now { "now" } else { at_text(r.next_due) }
+        out = push(out, "{r.job}: {r.status}  last {at_text(r.started_at)}  next {due}")
+        if r.started_at != null {
+            size = size_text(r.bytes)
+            out = push(out, "  uploaded {r.uploaded}, replaced {r.replaced}, deleted {r.deleted}, {size}")
+        }
+        if r.error != null { out = push(out, "  error: {r.error}") }
+        for p in take(r.problems, 5) { out = push(out, "  problem: {p}") }
+        if len(r.problems) > 5 {
+            more = len(r.problems) - 5
+            out = push(out, "  ... and {more} more")
+        }
+    }
+    join(out, "\n")
+}

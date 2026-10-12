@@ -1,0 +1,296 @@
+import std.fs
+import std.io
+import std.hash
+import std.time
+import "./s3.ecko"
+import "./state.ecko"
+import "./scanner.ecko"
+import "./planner.ecko"
+import "./sigv4.ecko"
+
+let FATAL_KINDS = ["s3_auth", "s3_config", "s3_retry", "net", "timeout"]
+let MAX_PARTS = 10000
+let MIB = 1048576
+# S3 refuses a single CopyObject from a source over 5 GiB.
+let COPY_LIMIT = 5368709120
+
+## Remote key of the current copy of `path` (an absolute local path).
+export fn current_key(job, path) = job.prefix + path
+
+## Remote key of the copy of `path` moved aside during run `run_ts`.
+export fn version_key(job, run_ts, path) = job.prefix + "/_versions/" + run_ts + path
+
+## "YYYYMMDDTHHMMSS.mmmZ" for a unix-millis timestamp. Milliseconds keep two
+## runs started in the same second from writing to the same version folder.
+export fn run_ts_of(ms) = time.format(ms, "%Y%m%dT%H%M%S%.3fZ")
+
+## Unix millis for a run-ts string.
+export fn run_ts_ms(ts) = time.parse_format(ts, "%Y%m%dT%H%M%S%.3fZ")
+
+fn stat(path) = { size: fs.size(path), mtime: fs.modified(path) }
+
+# Read up to n bytes, looping because io.read may return less than asked.
+fn read_up_to(s, n) {
+    mut buf = bytes("")
+    while len(buf) < n {
+        piece = io.read(s, n - len(buf))
+        if piece == null { break }
+        buf = buf + piece
+    }
+    buf
+}
+
+## The part size for a file of `size` bytes: the configured size, raised (in
+## whole MiB) when the file would otherwise need more than 10,000 parts.
+export fn part_size_for(size, configured) {
+    needed = (size + MAX_PARTS - 1) / MAX_PARTS
+    if needed <= configured { return configured }
+    int((needed + MIB - 1) / MIB) * MIB
+}
+
+# Copy a large object part by part (UploadPartCopy). Metadata is not carried
+# by part copies, so it is read first and set on the new upload.
+fn multipart_copy(ctx, src, dst, size) {
+    c = ctx.client
+    meta = s3.head_object(c, src)
+    if meta == null { return null }
+    id = s3.create_multipart(c, dst, meta)
+    state.add_multipart(ctx.db, ctx.job.name, dst, id)
+    ps = part_size_for(size, ctx.cfg.multipart_part_size)
+    mut parts = []
+    mut first = 0
+    mut n = 1
+    while first < size {
+        last = if first + ps > size { size - 1 } else { first + ps - 1 }
+        parts = push(parts, { n: n, etag: s3.upload_part_copy(c, dst, id, n, src, first, last) })
+        first = last + 1
+        n = n + 1
+    }
+    s3.complete_multipart(c, dst, id, parts)
+    state.remove_multipart(ctx.db, ctx.job.name, dst, id)
+}
+
+# Move the current remote copy aside before it is overwritten or deleted.
+# `size` is the indexed size of the current copy.
+fn version_aside(ctx, path, size) {
+    src = current_key(ctx.job, path)
+    dst = version_key(ctx.job, ctx.run_ts, path)
+    limit = get(ctx.cfg, "copy_limit") ?? COPY_LIMIT
+    try {
+        if size > limit { multipart_copy(ctx, src, dst, size) } else { s3.copy_object(ctx.client, src, dst) }
+    } catch (e) {
+        # Nothing to preserve when the current object is already gone.
+        unless get(e, "kind") == "s3_not_found" { error(e) }
+    }
+}
+
+fn prev_size(action) = if action.prev == null { 0 } else { action.prev.size }
+
+fn upload_multipart(ctx, path, key, meta) {
+    c = ctx.client
+    id = s3.create_multipart(c, key, meta)
+    state.add_multipart(ctx.db, ctx.job.name, key, id)
+    ps = part_size_for(fs.size(path), ctx.cfg.multipart_part_size)
+    s = fs.open(path)
+    mut parts = []
+    mut n = 1
+    while true {
+        chunk_ = read_up_to(s, ps)
+        if len(chunk_) == 0 and n > 1 { break }
+        etag = s3.upload_part(c, key, id, n, chunk_)
+        parts = push(parts, { n: n, etag: etag })
+        if len(chunk_) < ps { break }
+        n = n + 1
+    }
+    io.close(s)
+    s3.complete_multipart(c, key, id, parts)
+    state.remove_multipart(ctx.db, ctx.job.name, key, id)
+}
+
+fn upload_file(ctx, action, replacing) {
+    path = action.path
+    before = stat(path)
+    sha = hash.sha256(fs.open(path))
+    if action.op == "check" and sha == action.prev.sha256 {
+        return { op: "touch", path: path, mtime: before.mtime }
+    }
+    if replacing { version_aside(ctx, path, prev_size(action)) }
+    key = current_key(ctx.job, path)
+    meta = { sha256: sha, mtime: string(before.mtime), mode: fs.mode(path), run: ctx.run_ts }
+    if before.size >= ctx.cfg.multipart_threshold {
+        upload_multipart(ctx, path, key, meta)
+    } else {
+        body = fs.read_bytes(path)
+        if len(body) != before.size or hash.sha256(body) != sha {
+            return { op: "problem", path: path, message: "{path}: changed during upload" }
+        }
+        s3.put_object(ctx.client, key, body, meta)
+    }
+    after = stat(path)
+    if after != before {
+        return { op: "problem", path: path, message: "{path}: changed during upload" }
+    }
+    row = { path: path, size: before.size, mtime: before.mtime, sha256: sha, kind: "file" }
+    { op: if replacing { "replace" } else { "upload" }, path: path, row: row, bytes: before.size }
+}
+
+fn upload_link(ctx, action, replacing) {
+    e = action.entry
+    if replacing { version_aside(ctx, e.path, prev_size(action)) }
+    # Percent-encoded: header values must be ASCII, and Ecko drops non-ASCII
+    # response headers (docs/ecko-notes.md F10).
+    s3.put_object(ctx.client, current_key(ctx.job, e.path), bytes(""), { symlink: sigv4.uri_encode(e.target, false), run: ctx.run_ts })
+    row = { path: e.path, size: 0, mtime: 0, sha256: planner.link_sha(e.target), kind: "symlink" }
+    { op: if replacing { "replace" } else { "upload" }, path: e.path, row: row, bytes: 0 }
+}
+
+## Carry out one planned action against the remote. Never raises: returns
+## { op: "upload" | "replace" | "touch" | "delete" | "problem" | "fatal", path, ... }
+export fn execute(ctx, action) {
+    try {
+        match action.op {
+            "delete" => {
+                version_aside(ctx, action.path, prev_size(action))
+                s3.delete_object(ctx.client, current_key(ctx.job, action.path))
+                { op: "delete", path: action.path }
+            }
+            _ => {
+                kind = if action.entry == null { "file" } else { action.entry.kind }
+                replacing = action.op == "replace" or action.op == "check"
+                if kind == "symlink" { upload_link(ctx, action, replacing) } else { upload_file(ctx, action, replacing) }
+            }
+        }
+    } catch (e) {
+        kind = get(e, "kind")
+        msg = string(get(e, "message") ?? e)
+        if contains(FATAL_KINDS, kind) {
+            { op: "fatal", path: action.path, message: msg }
+        } else {
+            { op: "problem", path: action.path, message: "{action.path}: {msg}" }
+        }
+    }
+}
+
+# Apply one result to the state index and the running totals.
+fn record(ctx, totals, r) {
+    match r.op {
+        "upload" => {
+            state.put_file(ctx.db, ctx.job.name, r.row)
+            merge(totals, { uploaded: totals.uploaded + 1, bytes: totals.bytes + r.bytes })
+        }
+        "replace" => {
+            state.put_file(ctx.db, ctx.job.name, r.row)
+            merge(totals, { replaced: totals.replaced + 1, bytes: totals.bytes + r.bytes })
+        }
+        "touch" => {
+            state.touch_file(ctx.db, ctx.job.name, r.path, r.mtime)
+            set(totals, "touched", totals.touched + 1)
+        }
+        "delete" => {
+            state.remove_file(ctx.db, ctx.job.name, r.path)
+            set(totals, "deleted", totals.deleted + 1)
+        }
+        "problem" => {
+            ctx.log("warn", r.message, {})
+            set(totals, "problems", push(totals.problems, r.message))
+        }
+        _ => totals
+    }
+}
+
+fn abort_stale_multipart(ctx) {
+    for m in state.list_multipart(ctx.db, ctx.job.name) {
+        s3.abort_multipart(ctx.client, m.key, m.upload_id)
+        state.remove_multipart(ctx.db, ctx.job.name, m.key, m.upload_id)
+        ctx.log("info", "aborted an unfinished multipart upload", { key: m.key })
+    }
+}
+
+## Delete version copies older than keep_versions_days. Returns
+## { pruned: Int, problems: [String] }.
+export fn prune(ctx) {
+    vprefix = ctx.job.prefix + "/_versions/"
+    cutoff = ctx.now_ms - ctx.job.keep_versions_days * 86400000
+    mut pruned = 0
+    mut problems = []
+    for o in s3.list_objects(ctx.client, vprefix) {
+        ts = split(o.key[len(vprefix)..], "/")[0]
+        ms = try { run_ts_ms(ts) } catch (e) { null }
+        if ms == null or ms > cutoff { continue }
+        try {
+            s3.delete_object(ctx.client, o.key)
+            pruned = pruned + 1
+        } catch (e) {
+            problems = push(problems, "prune {o.key}: " + string(get(e, "message")))
+        }
+    }
+    { pruned: pruned, problems: problems }
+}
+
+## Run one job end to end and return its outcome (see state.finish_run).
+## Raises only for fatal errors (auth, config, provider unreachable after retries).
+## ctx: { job, cfg, client, db, run_id, run_ts, now_ms, dry_run, should_stop: fn() Bool, log: fn(level, msg, fields) }
+## The destination a job's index describes: endpoint|bucket|prefix.
+export fn fingerprint(ctx) = join([ctx.client.dest.endpoint, ctx.client.dest.bucket, ctx.job.prefix], "|")
+
+# An index records what was uploaded *somewhere*. If the job now points
+# elsewhere, that index is wrong for it: start again with a full upload.
+fn check_target(ctx) {
+    fp = fingerprint(ctx)
+    old = state.target(ctx.db, ctx.job.name)
+    if old != null and old != fp {
+        ctx.log("warn", "destination or prefix changed - uploading everything again", { from: old, to: fp })
+        state.replace_index(ctx.db, ctx.job.name, [])
+    }
+    if old != fp { state.set_target(ctx.db, ctx.job.name, fp) }
+}
+
+export fn run_job(ctx) {
+    unless ctx.dry_run {
+        check_target(ctx)
+        abort_stale_multipart(ctx)
+    }
+    index = state.index(ctx.db, ctx.job.name)
+    sc = planner.guard_empty_roots(scanner.scan(ctx.job), index, ctx.job.paths)
+    for p in sc.problems { ctx.log("warn", p, {}) }
+    p = planner.plan(sc, index)
+    ctx.log("info", "planned", { actions: len(p.actions), unchanged: p.unchanged, skipped: sc.skipped })
+    mut totals = { uploaded: 0, replaced: 0, deleted: 0, touched: 0, pruned: 0, bytes: 0, problems: sc.problems }
+    if ctx.dry_run {
+        for a in p.actions { ctx.log("info", "would " + a.op, { path: a.path }) }
+        return merge(totals, { status: "ok", error: null })
+    }
+    mut stopped = false
+    for batch in chunk(p.actions, ctx.cfg.concurrency) {
+        if ctx.should_stop() {
+            stopped = true
+            break
+        }
+        results = if len(batch) == 1 { [execute(ctx, batch[0])] } else { pmap(batch, fn(a) execute(ctx, a)) }
+        for r in results { totals = record(ctx, totals, r) }
+        fatal = find(results, fn(r) r.op == "fatal")
+        if fatal != null { error({ kind: "job_fatal", message: fatal.message, totals: totals }) }
+    }
+    if stopped {
+        return merge(totals, { status: "failed", error: "stopped before finishing (shutdown requested)" })
+    }
+    pr = try { prune(ctx) } catch (e) { { pruned: 0, problems: ["prune: " + string(get(e, "message"))] } }
+    totals = merge(totals, { pruned: pr.pruned, problems: totals.problems + pr.problems })
+    status = if len(totals.problems) > 0 { "partial" } else { "ok" }
+    merge(totals, { status: status, error: null })
+}
+
+## Run a job, recording it in the runs table. Never raises.
+export fn run(ctx) {
+    started = ctx.now_ms
+    unless ctx.dry_run { state.start_run(ctx.db, ctx.job.name, ctx.run_id, started) }
+    outcome = try { run_job(ctx) } catch (e) {
+        totals = get(e, "totals") ?? { uploaded: 0, replaced: 0, deleted: 0, touched: 0, pruned: 0, bytes: 0, problems: [] }
+        msg = string(get(e, "message") ?? e)
+        ctx.log("error", "job failed: " + msg, {})
+        merge(totals, { status: "failed", error: msg })
+    }
+    final = set(outcome, "finished_at", time.now())
+    unless ctx.dry_run { state.finish_run(ctx.db, ctx.run_id, final) }
+    final
+}

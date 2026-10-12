@@ -1,0 +1,274 @@
+import std.http
+import std.hash
+import std.encoding
+import std.random
+import std.re
+import std.time
+import "./sigv4.ecko"
+
+let REQUEST_TIMEOUT_MS = 300000
+## User metadata travels as x-amz-meta-bbb-<name> headers.
+let META_PREFIX = "x-amz-meta-bbb-"
+# 4xx codes that mean the destination itself is misconfigured. Any other 4xx
+# is about one object (too big to copy, key too long, ...) and must not stop
+# the whole job.
+let CONFIG_CODES = ["NoSuchBucket", "PermanentRedirect", "AuthorizationHeaderMalformed", "InvalidBucketName", "IllegalLocationConstraintException", "InvalidRegion"]
+let RETRY_CODES = ["RequestTimeout", "SlowDown", "InternalError", "ServiceUnavailable", "RequestTimeTooSkewed"]
+
+## Build a client for one destination.
+## dest: a normalized destination from config.validate.
+## creds: { access_key, secret_key: secret }.
+## retry: { attempts, base_delay_ms, max_delay_ms }.
+export fn client(dest, creds, retry) = { dest: dest, creds: creds, retry: retry }
+
+# ---- URLs ----------------------------------------------------------------
+
+fn split_endpoint(endpoint) {
+    caps = re.captures(r"^(https?)://([^/]+)$", endpoint)
+    if caps == null { error({ kind: "s3_config", message: "bad endpoint {endpoint}" }) }
+    { scheme: caps[1], authority: caps[2] }
+}
+
+## { url, host, path } for a key ("" means the bucket itself).
+export fn locate(c, key) {
+    ep = split_endpoint(c.dest.endpoint)
+    if c.dest.path_style {
+        path = "/" + c.dest.bucket + (if key == "" { "" } else { "/" + key })
+        { url: ep.scheme + "://" + ep.authority + sigv4.uri_encode(path, false), host: ep.authority, path: path }
+    } else {
+        host = c.dest.bucket + "." + ep.authority
+        path = "/" + key
+        { url: ep.scheme + "://" + host + sigv4.uri_encode(path, false), host: host, path: path }
+    }
+}
+
+fn query_string(query) {
+    if len(keys(query)) == 0 { return "" }
+    "?" + join(map(keys(query), fn(k) sigv4.uri_encode(k, true) + "=" + sigv4.uri_encode(string(query[k]), true)), "&")
+}
+
+# ---- Errors ----------------------------------------------------------------
+
+fn xml_tag(body, tag) {
+    caps = re.captures("(?s)<" + tag + ">(.*?)</" + tag + ">", body)
+    if caps == null { null } else { xml_unescape(caps[1]) }
+}
+
+export fn xml_unescape(s) = s
+    |> replace("&lt;", "<")
+    |> replace("&gt;", ">")
+    |> replace("&quot;", "\"")
+    |> replace("&apos;", "'")
+    |> replace("&#13;", "\r")
+    |> replace("&amp;", "&")
+
+## Classify a finished response: "ok", "retry", "auth", "not_found" or "fail".
+export fn classify(status, body) {
+    code = xml_tag(body, "Code")
+    if status >= 200 and status < 300 {
+        # CompleteMultipartUpload can answer 200 with an error in the body.
+        if code != null and contains(body, "<Error>") {
+            return if contains(RETRY_CODES, code) { "retry" } else { "fail" }
+        }
+        return "ok"
+    }
+    if status == 429 or status >= 500 { return "retry" }
+    if code != null and contains(RETRY_CODES, code) { return "retry" }
+    if status == 403 or code == "SignatureDoesNotMatch" or code == "InvalidAccessKeyId" { return "auth" }
+    if status == 404 and code != "NoSuchBucket" { return "not_found" }
+    "fail"
+}
+
+fn fail_for(cls, method, key, status, body) {
+    code = string(xml_tag(body, "Code"))
+    msg = string(xml_tag(body, "Message"))
+    text = "{method} {key}: HTTP {status} {code} {msg}"
+    match cls {
+        "retry" => error({ kind: "s3_retry", message: text, status: status })
+        "auth" => error({ kind: "s3_auth", message: text, status: status })
+        "not_found" => error({ kind: "s3_not_found", message: text, status: status })
+        _ => if status >= 400 and status < 500 and not contains(CONFIG_CODES, code) {
+            error({ kind: "s3_rejected", message: text, status: status })
+        } else {
+            error({ kind: "s3_config", message: text, status: status })
+        }
+    }
+}
+
+# ---- Retry -----------------------------------------------------------------
+
+## Delay before retry number `attempt` (1-based): full jitter over
+## min(max, base * 2^(attempt-1)).
+export fn backoff_ms(retry, attempt) {
+    mut cap = retry.base_delay_ms
+    for i in 1..attempt {
+        cap = cap * 2
+        if cap >= retry.max_delay_ms { break }
+    }
+    if cap > retry.max_delay_ms { cap = retry.max_delay_ms }
+    random.int(0, cap)
+}
+
+## Run f(), retrying net errors and s3_retry errors with backoff.
+export fn with_retry(retry, f) {
+    mut attempt = 1
+    while true {
+        try {
+            return f()
+        } catch (e) {
+            kind = get(e, "kind")
+            retryable = kind == "net" or kind == "s3_retry" or kind == "timeout"
+            if not retryable or attempt >= retry.attempts { error(e) }
+            sleep(backoff_ms(retry, attempt))
+            attempt = attempt + 1
+        }
+    }
+}
+
+# ---- The one request primitive ----------------------------------------------
+
+fn amz_now() = time.format(time.now(), "%Y%m%dT%H%M%SZ")
+
+## Send one signed request, with retries. opts:
+##   query: {}            headers: {}             body: bytes or null
+##   stream: bool (stream the response body)
+## Returns the http response map. 404s raise s3_not_found.
+export fn request(c, method, key, opts) {
+    query = get(opts, "query") ?? {}
+    extra = get(opts, "headers") ?? {}
+    body = get(opts, "body")
+    want_stream = get(opts, "stream") ?? false
+    loc = locate(c, key)
+    payload_hash = if body == null { sigv4.EMPTY_SHA256 } else { hash.sha256(body) }
+    with_retry(c.retry, fn() {
+        base_headers = merge(extra, { host: loc.host, "x-amz-content-sha256": payload_hash })
+        req = { method: method, path: loc.path, query: query, headers: base_headers, payload_hash: payload_hash }
+        signed = sigv4.sign(req, c.creds, c.dest.region, "s3", amz_now())
+        send_headers = remove(signed, "host")
+        url = loc.url + query_string(query)
+        resp = match method {
+            "GET" => http.get(url, headers: send_headers, timeout: REQUEST_TIMEOUT_MS, stream: want_stream)
+            "HEAD" => http.head(url, headers: send_headers, timeout: REQUEST_TIMEOUT_MS)
+            "PUT" => http.put(url, headers: send_headers, body: body ?? bytes(""), timeout: REQUEST_TIMEOUT_MS)
+            "POST" => http.post(url, headers: send_headers, body: body ?? bytes(""), timeout: REQUEST_TIMEOUT_MS)
+            "DELETE" => http.delete(url, headers: send_headers, timeout: REQUEST_TIMEOUT_MS)
+            _ => error("s3.request: unsupported method {method}")
+        }
+        text = if want_stream and resp.status < 300 { "" } else { string(get(resp, "body") ?? "") }
+        cls = classify(resp.status, text)
+        if cls != "ok" { fail_for(cls, method, key, resp.status, text) }
+        resp
+    })
+}
+
+# ---- Object operations -------------------------------------------------------
+
+fn meta_headers(meta) = reduce(keys(meta), fn(acc, k) set(acc, META_PREFIX + k, string(meta[k])), {})
+
+fn sse_headers(c) = if c.dest.provider == "s3" and c.dest.server_side_encryption { { "x-amz-server-side-encryption": "AES256" } } else { {} }
+
+## Upload `body` (bytes) to `key` with user metadata `meta` ({name: value}).
+## Returns the ETag.
+export fn put_object(c, key, body, meta) {
+    checksum = if c.dest.provider == "s3" { { "x-amz-checksum-sha256": encoding.base64_encode(hash.sha256_bytes(body)) } } else { {} }
+    headers = merge(merge(merge(meta_headers(meta), sse_headers(c)), checksum), { "content-type": "application/octet-stream" })
+    resp = request(c, "PUT", key, { headers: headers, body: body })
+    get(resp.headers, "etag")
+}
+
+fn meta_of(headers) = reduce(keys(headers), fn(acc, k) if starts_with(k, META_PREFIX) { set(acc, k[len(META_PREFIX)..], headers[k]) } else { acc }, {})
+
+## User metadata for `key` ({name: value}, x-amz-meta-bbb- prefix removed), or
+## null when the object does not exist.
+export fn head_object(c, key) {
+    resp = try { request(c, "HEAD", key, {}) } catch (e) {
+        if get(e, "kind") == "s3_not_found" { return null }
+        error(e)
+    }
+    meta_of(resp.headers)
+}
+
+## Download `key` as { meta, body: byte stream } without buffering it.
+export fn get_stream(c, key) {
+    resp = request(c, "GET", key, { stream: true })
+    { meta: meta_of(resp.headers), body: resp.body }
+}
+
+## Download `key` into memory as bytes.
+export fn get_object(c, key) = request(c, "GET", key, {}).body_bytes
+
+## Server-side copy, keeping metadata.
+export fn copy_object(c, src_key, dst_key) {
+    source = "/" + c.dest.bucket + "/" + sigv4.uri_encode(src_key, false)
+    headers = merge({ "x-amz-copy-source": source, "x-amz-metadata-directive": "COPY" }, sse_headers(c))
+    request(c, "PUT", dst_key, { headers: headers })
+    null
+}
+
+## Delete `key`. Deleting something that is already gone succeeds.
+export fn delete_object(c, key) {
+    try { request(c, "DELETE", key, {}) } catch (e) {
+        unless get(e, "kind") == "s3_not_found" { error(e) }
+    }
+    null
+}
+
+## Every object under `prefix`: [{ key, size }], following continuation tokens.
+export fn list_objects(c, prefix) {
+    mut out = []
+    mut token = null
+    while true {
+        mut query = { "list-type": "2", prefix: prefix }
+        if token != null { query = set(query, "continuation-token", token) }
+        body = request(c, "GET", "", { query: query }).body
+        for m in re.captures_all(r"(?s)<Contents>(.*?)</Contents>", body) {
+            out = push(out, { key: xml_tag(m[1], "Key"), size: int(xml_tag(m[1], "Size") ?? "0") })
+        }
+        if xml_tag(body, "IsTruncated") != "true" { break }
+        token = xml_tag(body, "NextContinuationToken")
+        if token == null { break }
+    }
+    out
+}
+
+# ---- Multipart ----------------------------------------------------------------
+
+export fn create_multipart(c, key, meta) {
+    headers = merge(merge(meta_headers(meta), sse_headers(c)), { "content-type": "application/octet-stream" })
+    body = request(c, "POST", key, { query: { uploads: "" }, headers: headers }).body
+    id = xml_tag(body, "UploadId")
+    if id == null { error({ kind: "s3_config", message: "CreateMultipartUpload for {key} returned no UploadId" }) }
+    id
+}
+
+## Upload part `n` (1-based) and return its ETag.
+export fn upload_part(c, key, upload_id, n, body) {
+    resp = request(c, "PUT", key, { query: { partNumber: string(n), uploadId: upload_id }, body: body })
+    get(resp.headers, "etag")
+}
+
+## Copy bytes [first, last] of `src_key` into part `n` of a multipart upload
+## (UploadPartCopy). Returns the part's ETag.
+export fn upload_part_copy(c, key, upload_id, n, src_key, first, last) {
+    source = "/" + c.dest.bucket + "/" + sigv4.uri_encode(src_key, false)
+    headers = { "x-amz-copy-source": source, "x-amz-copy-source-range": "bytes={first}-{last}" }
+    body = request(c, "PUT", key, { query: { partNumber: string(n), uploadId: upload_id }, headers: headers }).body
+    etag = xml_tag(body, "ETag")
+    if etag == null { error({ kind: "s3_rejected", message: "UploadPartCopy for {key} returned no ETag" }) }
+    etag
+}
+
+## parts: [{ n, etag }] in order.
+export fn complete_multipart(c, key, upload_id, parts) {
+    items = join(map(parts, fn(p) "<Part><PartNumber>{p.n}</PartNumber><ETag>{p.etag}</ETag></Part>"), "")
+    xml = "<CompleteMultipartUpload>" + items + "</CompleteMultipartUpload>"
+    request(c, "POST", key, { query: { uploadId: upload_id }, body: bytes(xml), headers: { "content-type": "application/xml" } })
+    null
+}
+
+export fn abort_multipart(c, key, upload_id) {
+    try { request(c, "DELETE", key, { query: { uploadId: upload_id } }) } catch (e) {
+        unless get(e, "kind") == "s3_not_found" { error(e) }
+    }
+    null
+}

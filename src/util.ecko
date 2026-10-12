@@ -1,0 +1,7 @@
+## Build an index {key: [item]} in linear time. Growing a map with
+## `m = set(m, k, v)` in a loop copies the map on every call (quadratic), so
+## large indexes are built with group_by instead. Read entries with lookup().
+export fn index_by(xs, key_fn) = group_by(xs, key_fn)
+
+## The item stored under `key` in an index_by() result, or null.
+export fn lookup(index, key) = first(get(index, key) ?? [])

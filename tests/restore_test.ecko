@@ -1,0 +1,158 @@
+import std.test
+import std.fs
+import std.encoding
+import "../src/s3.ecko"
+import "../src/state.ecko"
+import "../src/sync.ecko"
+import "../src/restore.ecko"
+import "../testkit/fake_s3.ecko"
+
+port = fake_s3.start()
+let CLIENT = s3.client(fake_s3.dest(port), fake_s3.creds(), fake_s3.fast_retry())
+let CFG = { concurrency: 2, multipart_threshold: 1000000, multipart_part_size: 5242880 }
+let T0 = 1791820438000
+let HOUR = 3600000
+
+fn setup() {
+    fake_s3.reset()
+    root = fs.join(fs.temp_dir(), "src")
+    fs.mkdir(root)
+    job = { name: "t", prefix: "pc", paths: [root], exclude: [], follow_symlinks: false, keep_versions_days: 30 }
+    { root: root, job: job, db: state.open(fs.join(fs.temp_dir(), "state")) }
+}
+
+fn run_at(env, ms) = sync.run({
+    job: env.job, cfg: CFG, client: CLIENT, db: env.db, run_id: "r" + string(ms),
+    run_ts: sync.run_ts_of(ms), now_ms: ms, dry_run: false,
+    should_stop: fn() false, log: fn(l, m, f) null,
+})
+
+fn opts(extra) = merge({ path: null, at_ms: null, to: fs.join(fs.temp_dir(), "out"), overwrite: false, oldest_ms: 0 }, extra)
+
+# History: T0 a=v1 b=b1 | T0+1h a=v2 | T0+2h b deleted, c created
+fn history(env) {
+    fs.write(fs.join(env.root, "a.txt"), "v1")
+    fs.write(fs.join(env.root, "b.txt"), "b1")
+    run_at(env, T0)
+    sleep(5)
+    fs.write(fs.join(env.root, "a.txt"), "v2")
+    run_at(env, T0 + HOUR)
+    fs.remove(fs.join(env.root, "b.txt"))
+    fs.write(fs.join(env.root, "c.txt"), "c1")
+    run_at(env, T0 + 2 * HOUR)
+}
+
+fn read_out(o, env, name) = fs.read(o.to + env.root + "/" + name)
+
+test.case("restore latest", fn() {
+    env = setup()
+    history(env)
+    o = opts({})
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, r.skipped, r.failed], [2, [], []])
+    test.eq(read_out(o, env, "a.txt"), "v2")
+    test.eq(read_out(o, env, "c.txt"), "c1")
+    test.ok(not fs.exists(o.to + env.root + "/b.txt"), "b was deleted")
+})
+
+test.case("restore at a point in time", fn() {
+    env = setup()
+    history(env)
+    o = opts({ at_ms: T0 + 30 * 60000 })
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq(r.restored, 2)
+    test.eq(read_out(o, env, "a.txt"), "v1")
+    test.eq(read_out(o, env, "b.txt"), "b1")
+    test.ok(not fs.exists(o.to + env.root + "/c.txt"), "c did not exist yet")
+})
+
+test.case("select lists without downloading", fn() {
+    env = setup()
+    history(env)
+    items = restore.select(CLIENT, env.job, { path: null, at_ms: T0 + 90 * 60000 })
+    test.eq(map(items, fn(i) i.path), [env.root + "/a.txt", env.root + "/b.txt"])
+})
+
+test.case("--path limits the restore", fn() {
+    env = setup()
+    history(env)
+    items = restore.select(CLIENT, env.job, { path: env.root + "/a.txt", at_ms: null })
+    test.eq(len(items), 1)
+})
+
+test.case("existing files are skipped unless overwrite", fn() {
+    env = setup()
+    history(env)
+    o = opts({})
+    restore.restore(CLIENT, env.job, o)
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, len(r.skipped)], [0, 2])
+    r2 = restore.restore(CLIENT, env.job, merge(o, { overwrite: true }))
+    test.eq(r2.restored, 2)
+})
+
+test.case("checksum mismatch discards the download", fn() {
+    env = setup()
+    history(env)
+    k = "pc" + env.root + "/a.txt"
+    fake_s3.put_raw(k, bytes("tampered"), fake_s3.object(k).meta)
+    o = opts({ path: env.root + "/a.txt" })
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq(r.restored, 0)
+    test.ok(contains(r.failed[0], "checksum mismatch"), r.failed[0])
+    test.ok(not fs.exists(o.to + env.root + "/a.txt"), "nothing left behind")
+    test.ok(not fs.exists(o.to + env.root + "/a.txt.bbb-partial"), "no partial")
+})
+
+test.case("mode and mtime are restored", fn() {
+    env = setup()
+    p = fs.join(env.root, "a.txt")
+    fs.write(p, "v1")
+    fs.chmod(p, "640")
+    run_at(env, T0)
+    o = opts({})
+    restore.restore(CLIENT, env.job, o)
+    out = o.to + p
+    test.eq(fs.mode(out), "640")
+    test.eq(int(fs.modified(out) / 1000), int(fs.modified(p) / 1000))
+})
+
+test.case("--at older than history is refused", fn() {
+    env = setup()
+    test.err(fn() restore.restore(CLIENT, env.job, opts({ at_ms: 5, oldest_ms: 1000 })), "older than")
+})
+
+test.case("I2: symlink with a non-ASCII target restores", fn() {
+    env = setup()
+    target = fs.join(env.root, "Música")
+    fs.mkdir(target)
+    fs.write(fs.join(target, "song.txt"), "la")
+    fs.symlink(target, fs.join(env.root, "music-link"))
+    run_at(env, T0)
+    o = opts({ path: env.root + "/music-link" })
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, r.failed], [1, []])
+    test.eq(fs.canonical(o.to + env.root + "/music-link"), target)
+})
+
+test.case("M5: keys that climb out of --to are refused", fn() {
+    env = setup()
+    fake_s3.put_raw("pc/../../escape.txt", bytes("x"), {})
+    o = opts({})
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq(r.restored, 0)
+    test.ok(any(r.failed, fn(f) contains(f, "unsafe path")), string(r.failed))
+    test.ok(not fs.exists(fs.join(fs.dirname(o.to), "escape.txt")), "nothing written outside")
+})
+
+test.case("binary content restores byte-for-byte", fn() {
+    env = setup()
+    blob = encoding.hex_decode("00ff10c3289f0d0a1a7f80fe")
+    fs.write(fs.join(env.root, "blob.bin"), blob)
+    run_at(env, T0)
+    o = opts({})
+    restore.restore(CLIENT, env.job, o)
+    test.eq(fs.read_bytes(o.to + env.root + "/blob.bin"), blob)
+})
+
+fake_s3.stop()

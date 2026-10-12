@@ -1,0 +1,86 @@
+import std.test
+import std.fs
+import std.os
+import "../src/config.ecko"
+import "../src/state.ecko"
+import "../src/runner.ecko"
+import "../testkit/fake_s3.ecko"
+
+port = fake_s3.start()
+
+# Credentials for the "fake" destination come from the environment.
+os.set_env("BBB_FAKE_ACCESS_KEY_ID", fake_s3.ACCESS_KEY)
+os.set_env("BBB_FAKE_SECRET_ACCESS_KEY", fake_s3.SECRET_KEY)
+
+fn setup() {
+    fake_s3.reset()
+    root = fs.join(fs.temp_dir(), "src")
+    fs.mkdir(root)
+    fs.write(fs.join(root, "a.txt"), "alpha")
+    state_dir = fs.join(fs.temp_dir(), "state")
+    raw = {
+        state_dir: state_dir,
+        destinations: { fake: {
+            provider: "s3", endpoint: "http://127.0.0.1:{port}", region: "us-east-1",
+            bucket: fake_s3.BUCKET, path_style: true, allow_insecure: true, server_side_encryption: false,
+        } },
+        jobs: [{ name: "home", destination: "fake", prefix: "pc", paths: [root], schedule: { every: "1h" } }],
+        retry: { attempts: 2, base_delay: "1ms", max_delay: "5ms" },
+    }
+    r = config.validate(raw)
+    test.eq(r.errors, [])
+    cfg = r.config
+    { cfg: cfg, job: cfg.jobs[0], db: state.open(state_dir), root: root }
+}
+
+fn go(env) = runner.run_job(env.cfg, env.job, env.db, { dry_run: false, should_stop: fn() false })
+
+test.case("run_job runs and records", fn() {
+    env = setup()
+    o = go(env)
+    test.eq([o.status, o.uploaded], ["ok", 1])
+    test.eq(state.last_run(env.db, "home").status, "ok")
+    test.ok(not fs.exists(runner.job_lock_path(env.cfg, env.job)), "lock released")
+})
+
+test.case("a held job lock skips the run", fn() {
+    env = setup()
+    fs.write(runner.job_lock_path(env.cfg, env.job), "1")
+    o = go(env)
+    test.eq(o.status, "skipped")
+    test.eq(fake_s3.objects_(), {})
+    fs.remove(runner.job_lock_path(env.cfg, env.job))
+})
+
+test.case("missing credentials record a failed run", fn() {
+    env = setup()
+    os.unset_env("BBB_FAKE_ACCESS_KEY_ID")
+    o = go(env)
+    os.set_env("BBB_FAKE_ACCESS_KEY_ID", fake_s3.ACCESS_KEY)
+    test.eq(o.status, "failed")
+    test.ok(contains(o.error, "credentials"), o.error)
+    test.eq(state.last_run(env.db, "home").status, "failed")
+})
+
+test.case("I3: a state error is a failed outcome, never a raise", fn() {
+    env = setup()
+    state.close(env.db)
+    o = runner.run_job(env.cfg, env.job, env.db, { dry_run: false, should_stop: fn() false })
+    test.eq(o.status, "failed")
+    test.ok(not fs.exists(runner.job_lock_path(env.cfg, env.job)), "lock released")
+})
+
+test.case("rebuild_state recreates the index from the bucket", fn() {
+    env = setup()
+    go(env)
+    before = state.index(env.db, "home")
+    state.replace_index(env.db, "home", [])
+    n = runner.rebuild_state(env.cfg, env.job, env.db)
+    test.eq(n, 1)
+    test.eq(state.index(env.db, "home"), before)
+    # With the index rebuilt, the next run has nothing to do.
+    o = go(env)
+    test.eq([o.uploaded, o.replaced, o.touched], [0, 0, 0])
+})
+
+fake_s3.stop()

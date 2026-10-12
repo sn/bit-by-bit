@@ -1,0 +1,148 @@
+import std.test
+import std.fs
+import std.os
+import "../src/config.ecko"
+
+fn base() = {
+    destinations: {
+        "aws-main": {
+            provider: "s3", endpoint: "https://s3.eu-west-1.amazonaws.com", region: "eu-west-1",
+            bucket: "b", credentials_file: "/etc/bit-by-bit/aws.env",
+        },
+        gcs: { provider: "gcs", bucket: "g", credentials_file: "/x" },
+    },
+    jobs: [
+        { name: "home", destination: "aws-main", prefix: "laptop/home", paths: ["/tmp"], schedule: { every: "6h" } },
+    ],
+}
+
+fn has_error(r, needle) = any(r.errors, fn(e) contains(e, needle))
+
+test.case("valid config gets defaults", fn() {
+    r = config.validate(base())
+    test.eq(r.errors, [])
+    c = r.config
+    test.eq(c.state_dir, "/var/lib/bit-by-bit")
+    test.eq(c.concurrency, 4)
+    test.eq(c.retry, { attempts: 5, base_delay_ms: 2000, max_delay_ms: 300000 })
+    test.eq(c.multipart_threshold, 67108864)
+    test.eq(c.jobs[0].schedule, { kind: "every", ms: 21600000 })
+    test.eq(c.jobs[0].keep_versions_days, 30)
+    test.eq(c.jobs[0].follow_symlinks, false)
+    test.eq(c.destinations["aws-main"].server_side_encryption, true)
+})
+
+test.case("gcs fills endpoint and region", fn() {
+    d = config.validate(base()).config.destinations.gcs
+    test.eq(d.endpoint, "https://storage.googleapis.com")
+    test.eq(d.region, "auto")
+})
+
+test.case("unknown keys are errors with paths", fn() {
+    raw = merge(base(), { concurency: 4 })
+    r = config.validate(raw)
+    test.ok(has_error(r, "$.concurency: unknown key"), string(r.errors))
+    j = merge(base().jobs[0], { exlude: [] })
+    r2 = config.validate(merge(base(), { jobs: [j] }))
+    test.ok(has_error(r2, "$.jobs[0].exlude: unknown key"), string(r2.errors))
+})
+
+test.case("all errors are reported together", fn() {
+    j = { name: "Bad Name", destination: "nope", prefix: "/x/", paths: ["rel"], schedule: { every: "10s" } }
+    r = config.validate(merge(base(), { jobs: [j] }))
+    test.ok(has_error(r, "$.jobs[0].name"), "name")
+    test.ok(has_error(r, "$.jobs[0].destination: no destination named 'nope'"), "dest")
+    test.ok(has_error(r, "$.jobs[0].prefix"), "prefix")
+    test.ok(has_error(r, "$.jobs[0].paths[0]: must be an absolute path"), "path")
+    test.ok(has_error(r, "$.jobs[0].schedule.every: must be at least 1m"), "every")
+})
+
+test.case("schedule needs exactly one kind", fn() {
+    j = merge(base().jobs[0], { schedule: { every: "1h", daily_at: "02:00" } })
+    r = config.validate(merge(base(), { jobs: [j] }))
+    test.ok(has_error(r, "use exactly one of every or daily_at"), string(r.errors))
+    j2 = merge(base().jobs[0], { schedule: { daily_at: "02:30" } })
+    test.eq(config.validate(merge(base(), { jobs: [j2] })).config.jobs[0].schedule, { kind: "daily_at", hour: 2, minute: 30 })
+})
+
+test.case("http endpoint needs allow_insecure", fn() {
+    d = { provider: "s3", endpoint: "http://localhost:9000", region: "us-east-1", bucket: "b" }
+    r = config.validate(merge(base(), { destinations: { "aws-main": d } }))
+    test.ok(has_error(r, "allow_insecure"), string(r.errors))
+    d2 = merge(d, { allow_insecure: true })
+    test.eq(config.validate(merge(base(), { destinations: { "aws-main": d2 } })).errors, [])
+})
+
+test.case("overlapping prefixes on one destination", fn() {
+    j1 = base().jobs[0]
+    j2 = merge(j1, { name: "nested", prefix: "laptop/home/sub" })
+    r = config.validate(merge(base(), { jobs: [j1, j2] }))
+    test.ok(has_error(r, "overlapping prefixes"), string(r.errors))
+})
+
+test.case("duplicate job names and /_versions paths", fn() {
+    j1 = base().jobs[0]
+    j2 = merge(j1, { prefix: "other", paths: ["/_versions/x"] })
+    r = config.validate(merge(base(), { jobs: [j1, j2] }))
+    test.ok(has_error(r, "duplicate job name 'home'"), "dup")
+    test.ok(has_error(r, "collide with the version history prefix"), "versions")
+})
+
+test.case("missing path is a warning, not an error", fn() {
+    j = merge(base().jobs[0], { paths: ["/definitely/not/here"] })
+    r = config.validate(merge(base(), { jobs: [j] }))
+    test.eq(r.errors, [])
+    test.ok(any(r.warnings, fn(w) contains(w, "does not exist yet")), string(r.warnings))
+})
+
+test.case("nested paths within one job are rejected", fn() {
+    j = merge(base().jobs[0], { paths: ["/tmp", "/tmp/sub", "/var"] })
+    r = config.validate(merge(base(), { jobs: [j] }))
+    test.ok(has_error(r, "$.jobs[0].paths[1]: is inside $.jobs[0].paths[0]"), string(r.errors))
+})
+
+test.case("credentials file with CRLF line endings", fn() {
+    p = fs.join(fs.temp_dir(), "crlf.env")
+    fs.write(p, "ACCESS_KEY_ID=AKID\r\nSECRET_ACCESS_KEY=s3cr3t\r\n")
+    fs.chmod(p, "600")
+    c = config.load_credentials({ name: "crlf", credentials_file: p })
+    test.eq(c.access_key, "AKID")
+    test.eq(reveal(c.secret_key), "s3cr3t")
+})
+
+test.case("not an object", fn() {
+    test.eq(config.validate([1]).errors, ["$: config must be a JSON object"])
+})
+
+test.case("load raises with every error", fn() {
+    dir = fs.temp_dir()
+    p = fs.join(dir, "c.json")
+    fs.write(p, r"""{"jobs": []}""")
+    try {
+        config.load(p)
+        test.fail("expected a config error")
+    } catch (e) {
+        test.eq(get(e, "kind"), "config")
+        test.ok(len(e.errors) >= 2, string(e.errors))
+    }
+})
+
+test.case("credentials from file, env wins", fn() {
+    dir = fs.temp_dir()
+    p = fs.join(dir, "creds.env")
+    fs.write(p, "# comment\nACCESS_KEY_ID=AKID\nSECRET_ACCESS_KEY=abc=def\n")
+    fs.chmod(p, "600")
+    d = { name: "my-dest", credentials_file: p }
+    c = config.load_credentials(d)
+    test.eq(c.access_key, "AKID")
+    test.eq(reveal(c.secret_key), "abc=def")
+    test.eq(c.warnings, [])
+    test.eq(string(c.secret_key), "[secret]")
+    fs.chmod(p, "644")
+    test.eq(len(config.load_credentials(d).warnings), 1)
+    os.set_env("BBB_MY_DEST_ACCESS_KEY_ID", "ENVID")
+    os.set_env("BBB_MY_DEST_SECRET_ACCESS_KEY", "envsecret")
+    test.eq(config.load_credentials(d).access_key, "ENVID")
+    os.unset_env("BBB_MY_DEST_ACCESS_KEY_ID")
+    os.unset_env("BBB_MY_DEST_SECRET_ACCESS_KEY")
+})

@@ -1,0 +1,36 @@
+import std.test
+import "../src/args.ecko"
+import "../src/status.ecko"
+
+test.case("no args is help", fn() {
+    test.eq(args.parse([]).command, "help")
+    test.eq(args.parse(["--help"]).command, "help")
+})
+
+test.case("run with jobs and flags", fn() {
+    a = args.parse(["run", "home", "dev", "--dry-run", "--config", "/x.json"])
+    test.eq(a.command, "run")
+    test.eq(a.positional, ["home", "dev"])
+    test.eq(args.flag(a, "dry-run", false), true)
+    test.eq(args.flag(a, "config", null), "/x.json")
+})
+
+test.case("--flag=value form and default config", fn() {
+    a = args.parse(["restore", "home", "--at=2026-10-12T14:00:00Z", "--to", "/r"])
+    test.eq(args.flag(a, "at", null), "2026-10-12T14:00:00Z")
+    test.eq(args.flag(a, "config", null), args.DEFAULT_CONFIG)
+    test.eq(args.flag(a, "overwrite", false), false)
+})
+
+test.case("usage errors", fn() {
+    test.err(fn() args.parse(["frobnicate"]), "unknown command")
+    test.err(fn() args.parse(["run", "--bogus"]), "unknown option")
+    test.err(fn() args.parse(["run", "--config"]), "needs a value")
+    test.err(fn() args.parse(["restore"]), "exactly one job")
+})
+
+test.case("size_text", fn() {
+    test.eq(status.size_text(0), "0 B")
+    test.eq(status.size_text(1536), "1.5 KiB")
+    test.eq(status.size_text(5 * 1048576), "5.0 MiB")
+})
