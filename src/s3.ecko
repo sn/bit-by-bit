@@ -86,10 +86,23 @@ export fn classify(status, body) {
     "fail"
 }
 
+# What to change when the destination itself is wrong. S3's own message
+# rarely says (a wrong region reads "must be addressed using the specified
+# endpoint" and names none).
+let FIX_HINTS = {
+    PermanentRedirect: "the bucket is in another region: set endpoint and region to the bucket's region",
+    AuthorizationHeaderMalformed: "set region to the bucket's region",
+    InvalidRegion: "set region to the bucket's region",
+    IllegalLocationConstraintException: "set endpoint and region to the bucket's region",
+    NoSuchBucket: "check the bucket name, and that endpoint points at the account that owns it",
+    InvalidBucketName: "check the bucket name",
+}
+
 fn fail_for(cls, method, key, status, body) {
     code = string(error_field(body, "Code"))
     msg = string(error_field(body, "Message"))
-    text = "{method} {key}: HTTP {status} {code} {msg}"
+    hint = get(FIX_HINTS, code) ?? (if cls == "auth" { "check the credentials file and the key's IAM policy" } else { null })
+    text = "{method} {key}: HTTP {status} {code} {msg}" + (if hint == null { "" } else { " - fix: " + hint })
     match cls {
         "retry" => error({ kind: "s3_retry", message: text, status: status })
         "auth" => error({ kind: "s3_auth", message: text, status: status })

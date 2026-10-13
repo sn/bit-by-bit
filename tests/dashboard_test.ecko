@@ -41,15 +41,43 @@ test.case("binds to the configured host", fn() {
     test.ok(port > 0, "port {port}")
 })
 
-test.case("GET / renders an auto-refreshing page with every job", fn() {
+test.case("GET / renders every job and updates in place, with a pause control", fn() {
     reset()
     record("home", "r1", time.now() - H, "ok", [], null)
     r = http.get(url("/"))
     test.eq(r.status, 200)
     test.ok(starts_with(get(r.headers, "content-type") ?? "", "text/html"), string(r.headers))
-    test.ok(contains(r.body, "http-equiv=\"refresh\" content=\"30\""), "auto refresh")
+    # A meta refresh reloads the page and throws away the reader's place (WCAG F41).
+    test.ok(not contains(r.body, "http-equiv=\"refresh\""), "no page reload")
+    test.ok(contains(r.body, "<button type=\"button\" id=\"pause\">Pause updates</button>"), "pause control")
+    test.ok(contains(r.body, "<main id=\"main\">"), "main landmark")
     test.ok(contains(r.body, "home") and contains(r.body, "dev"), "both jobs")
     test.ok(contains(r.body, "never run"), "dev has not run")
+    test.ok(contains(r.body, "<dt>last run</dt><dd>never</dd>"), "a missing time is a word, not a dash")
+})
+
+test.case("the tab title carries the overall health", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    test.ok(contains(http.get(url("/")).body, "<title>bit-by-bit: ok</title>"), "healthy title")
+    record("home", "r2", time.now() - 60000, "failed", [], "boom")
+    test.ok(contains(http.get(url("/")).body, "<title>bit-by-bit: needs attention</title>"), "unhealthy title")
+})
+
+test.case("every problem is reachable, past the first five behind a disclosure", fn() {
+    reset()
+    probs = map(0..8, fn(i) "/tmp/file-{i}: vanished")
+    record("home", "r1", time.now() - H, "partial", probs, null)
+    body = http.get(url("/")).body
+    test.ok(all(probs, fn(p) contains(body, p)), "all eight problems")
+    test.ok(contains(body, "<summary id=\"problems-home-more\">Show 3 more problems</summary>"), "disclosure")
+})
+
+test.case("the runs table scrolls inside its own keyboard-reachable region", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    body = http.get(url("/")).body
+    test.ok(contains(body, "<div class=\"table-wrap\" id=\"runs-home\" role=\"region\" aria-label=\"recent runs of home\" tabindex=\"0\"><table>"), body)
 })
 
 test.case("GET /api/status returns the snapshot as JSON", fn() {

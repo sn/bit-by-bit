@@ -24,6 +24,14 @@ test.case("an empty body still sends content-length", fn() {
     test.eq(fake_s3.object("_versions/r2/empty").body, bytes(""))
 })
 
+test.case("a misconfigured destination says how to fix it", fn() {
+    fake_s3.reset()
+    fake_s3.fail_next("PUT", "k", 301, "PermanentRedirect", 1)
+    msg = try { s3.put_object(c, "k", bytes("x"), {}) null } catch (e) { e.message }
+    fake_s3.reset_faults()
+    test.ok(contains(msg, "PermanentRedirect") and contains(msg, "set endpoint and region to the bucket's region"), msg)
+})
+
 test.case("head returns metadata or null", fn() {
     fake_s3.reset()
     s3.put_object(c, "k", bytes("hi"), { sha256: "abc", mtime: "123" })

@@ -76,10 +76,10 @@ export fn snapshot(cfg, db, now, started_at) {
 
 fn esc(v) = escape_html(string(v ?? ""))
 
-fn at_text(ms) = if ms == null { "-" } else { time.format_local(ms, "%Y-%m-%d %H:%M") }
+fn at_text(ms) = if ms == null { "never" } else { time.format_local(ms, "%Y-%m-%d %H:%M") }
 
 fn dur_text(ms) {
-    if ms == null { return "-" }
+    if ms == null { return "in progress" }
     secs = int(ms / 1000)
     if secs < 60 { "{secs}s" } else if secs < 3600 { string(int(secs / 60)) + "m " + string(secs % 60) + "s" } else { string(int(secs / 3600)) + "h " + string(int(secs % 3600 / 60)) + "m" }
 }
@@ -89,57 +89,128 @@ fn badge(s) {
     "<span class=\"badge " + cls + "\">" + esc(s) + "</span>"
 }
 
+fn stat(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(value) + "</dd></div>"
+
+fn li(p) = "<li>" + esc(p) + "</li>"
+
+let SHOWN_PROBLEMS = 5
+
+# The first few problems, and the rest behind a disclosure: never cut off.
+fn problems_html(j) {
+    n = len(j.problems)
+    if n == 0 { return "" }
+    rest = n - SHOWN_PROBLEMS
+    more = if rest <= 0 { "" } else {
+        word = if rest == 1 { "problem" } else { "problems" }
+        "<details id=\"problems-" + j.job + "\"><summary id=\"problems-" + j.job + "-more\">Show " + string(rest) + " more " + word + "</summary><ul class=\"problems\">" +
+            join(map(drop(j.problems, SHOWN_PROBLEMS), li), "") + "</ul></details>"
+    }
+    "<h3>problems (" + string(n) + ")</h3><ul class=\"problems\">" + join(map(take(j.problems, SHOWN_PROBLEMS), li), "") + "</ul>" + more
+}
+
+fn run_row(r) = "<tr><td>" + esc(at_text(r.started_at)) + "</td><td>" + badge(r.status) + "</td><td>" + esc(dur_text(r.duration_ms)) +
+    "</td><td class=\"num\">" + esc(r.uploaded) + "</td><td class=\"num\">" + esc(r.replaced) + "</td><td class=\"num\">" + esc(r.deleted) +
+    "</td><td class=\"num\">" + esc(status.size_text(r.bytes)) + "</td><td class=\"num\">" + esc(r.problem_count) + "</td></tr>"
+
 fn job_card(j, now) {
-    due = if j.next_due <= now { "now" } else { at_text(j.next_due) }
+    due = if j.next_due <= now { "due now" } else { at_text(j.next_due) }
     overdue = if j.overdue { " <span class=\"badge bad\">overdue</span>" } else { "" }
-    err = if j.error == null { "" } else { "<p class=\"error\">" + esc(j.error) + "</p>" }
-    probs = if len(j.problems) == 0 { "" } else {
-        items = join(map(take(j.problems, 5), fn(p) "<li>" + esc(p) + "</li>"), "")
-        more = if len(j.problems) > 5 { "<li>... and " + string(len(j.problems) - 5) + " more</li>" } else { "" }
-        "<ul class=\"problems\">" + items + more + "</ul>"
-    }
-    rows = join(map(j.runs, fn(r) "<tr><td>" + esc(at_text(r.started_at)) + "</td><td>" + badge(r.status) +
-        "</td><td>" + esc(dur_text(r.duration_ms)) + "</td><td>" + esc(r.uploaded) + " / " + esc(r.replaced) + " / " +
-        esc(r.deleted) + "</td><td>" + esc(status.size_text(r.bytes)) + "</td><td>" + esc(r.problem_count) + "</td></tr>"), "")
+    stats = "<dl class=\"stats\">" + stat("last run", at_text(j.started_at)) + stat("next run", due) +
+        stat("uploaded", j.uploaded) + stat("replaced", j.replaced) + stat("deleted", j.deleted) + stat("pruned", j.pruned) +
+        stat("data", status.size_text(j.bytes)) + "</dl>"
+    err = if j.error == null { "" } else { "<p class=\"error\"><strong>error:</strong> " + esc(j.error) + "</p>" }
     table = if len(j.runs) == 0 { "" } else {
-        "<table><thead><tr><th>started</th><th>status</th><th>took</th><th>up / repl / del</th><th>data</th><th>problems</th></tr></thead><tbody>" + rows + "</tbody></table>"
+        "<h3>recent runs</h3><div class=\"table-wrap\" id=\"runs-" + j.job + "\" role=\"region\" aria-label=\"recent runs of " + esc(j.job) + "\" tabindex=\"0\"><table>" +
+            "<thead><tr><th>started</th><th>status</th><th>took</th><th class=\"num\">uploaded</th><th class=\"num\">replaced</th>" +
+            "<th class=\"num\">deleted</th><th class=\"num\">data</th><th class=\"num\">problems</th></tr></thead><tbody>" +
+            join(map(j.runs, run_row), "") + "</tbody></table></div>"
     }
-    "<section class=\"card\"><h2>" + esc(j.job) + " " + badge(j.status) + overdue + "</h2>" +
-        "<p class=\"meta\">last run " + esc(at_text(j.started_at)) + " &middot; next " + esc(due) +
-        " &middot; uploaded " + esc(j.uploaded) + ", replaced " + esc(j.replaced) + ", deleted " + esc(j.deleted) +
-        ", pruned " + esc(j.pruned) + ", " + esc(status.size_text(j.bytes)) + "</p>" + err + probs + table + "</section>"
+    "<section class=\"card\" aria-labelledby=\"job-" + j.job + "\"><h2 id=\"job-" + j.job + "\">" + esc(j.job) + " " + badge(j.status) + overdue + "</h2>" +
+        stats + err + problems_html(j) + table + "</section>"
 }
 
 let CSS = r"""
-    body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 960px; padding: 24px; color: #1f2328; background: #f6f8fa; }
-    h1 { font-size: 22px; margin: 0 0 4px; }
-    .sub { color: #59636e; margin: 0 0 20px; }
-    .card { background: #fff; border: 1px solid #d1d9e0; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
-    .card h2 { font-size: 18px; margin: 0 0 4px; }
-    .meta { color: #59636e; margin: 0 0 8px; }
-    .badge { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 10px; vertical-align: middle; }
+    :root { color-scheme: light; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+    body { font: 0.9375rem/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 60rem; padding: 1.5rem 1rem; color: #1f2328; background: #f6f8fa; }
+    header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; margin-bottom: 1.25rem; }
+    h1 { font-size: 1.375rem; line-height: 1.25; margin: 0 0 0.25rem; }
+    h2 { font-size: 1.125rem; line-height: 1.3; margin: 0 0 0.75rem; }
+    h3 { font-size: 0.8125rem; line-height: 1.3; font-weight: 600; color: #59636e; margin: 1rem 0 0.25rem; }
+    .sub { color: #59636e; margin: 0; }
+    button { font: inherit; font-size: 0.875rem; padding: 0.25rem 0.75rem; border: 1px solid #d1d9e0; border-radius: 6px; background: #fff; color: #1f2328; cursor: pointer; }
+    .card, .alert { background: #fff; border: 1px solid #d1d9e0; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
+    .alert { border-color: #ff8182; border-inline-start-width: 4px; }
+    .alert h2 { color: #cf222e; font-size: 1rem; margin-bottom: 0.25rem; }
+    .alert ul { margin: 0; padding-inline-start: 1.25rem; }
+    .badge { display: inline-block; font-size: 0.75rem; font-weight: 600; line-height: 1.5; padding: 0 0.5rem; border-radius: 10px; vertical-align: middle; white-space: nowrap; }
     .ok { background: #dafbe1; color: #1a7f37; } .warn { background: #fff8c5; color: #9a6700; }
     .bad { background: #ffebe9; color: #cf222e; } .info { background: #ddf4ff; color: #0969da; } .muted { background: #eff2f5; color: #59636e; }
-    .error { color: #cf222e; margin: 4px 0; word-break: break-word; }
-    .problems { margin: 4px 0 8px; padding-left: 20px; color: #9a6700; word-break: break-word; }
-    table { border-collapse: collapse; width: 100%; font-size: 13px; }
-    th, td { text-align: left; padding: 4px 8px; border-top: 1px solid #eff2f5; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 7rem), 1fr)); gap: 0.5rem 1rem; margin: 0; }
+    .stats dt { font-size: 0.8125rem; color: #59636e; }
+    .stats dd { margin: 0; font-variant-numeric: tabular-nums; }
+    .error { color: #cf222e; margin: 1rem 0 0; overflow-wrap: anywhere; }
+    .problems { margin: 0; padding-inline-start: 1.25rem; color: #9a6700; overflow-wrap: anywhere; }
+    details { margin-top: 0.25rem; }
+    summary { cursor: pointer; color: #0969da; width: fit-content; }
+    .table-wrap { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.8125rem; }
+    th, td { text-align: start; padding: 0.25rem 0.5rem; border-top: 1px solid #eff2f5; white-space: nowrap; }
+    th:first-child, td:first-child { padding-inline-start: 0; }
     th { color: #59636e; font-weight: 600; }
+    .num { text-align: end; font-variant-numeric: tabular-nums; }
+"""
+
+# Updates the page in place every REFRESH_SECONDS, keeping the reader's
+# place, open disclosures and focus. Pausable, and idle while the tab is hidden.
+let SCRIPT = r"""
+(function () {
+  var paused = false, btn = document.getElementById('pause'), conn = document.getElementById('conn');
+  btn.addEventListener('click', function () {
+    paused = !paused;
+    btn.textContent = paused ? 'Resume updates' : 'Pause updates';
+  });
+  function update() {
+    if (paused || document.hidden) return;
+    fetch(location.pathname, { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error(r.status);
+      return r.text();
+    }).then(function (text) {
+      var next = new DOMParser().parseFromString(text, 'text/html');
+      var main = document.getElementById('main');
+      var open = Array.prototype.map.call(main.querySelectorAll('details[open]'), function (d) { return d.id; });
+      var focused = main.contains(document.activeElement) ? document.activeElement.id : '';
+      main.innerHTML = next.getElementById('main').innerHTML;
+      open.forEach(function (id) { var d = document.getElementById(id); if (d) d.open = true; });
+      if (focused) { var f = document.getElementById(focused); if (f) f.focus({ preventScroll: true }); }
+      document.title = next.title;
+      document.getElementById('updated').textContent = next.getElementById('updated').textContent;
+      conn.textContent = '';
+    }).catch(function () {
+      conn.textContent = " · can't reach the daemon, showing the last data it sent. Check: systemctl status bit-by-bit";
+    });
+  }
+  setInterval(update, REFRESH_MS);
+})();
 """
 
 ## The dashboard page for a snapshot.
 export fn render_html(snap) {
     now = snap.daemon.now
-    overall = if snap.healthy { badge("ok") } else { "<span class=\"badge bad\">attention</span>" }
-    reasons = if snap.healthy { "" } else { "<ul class=\"problems\">" + join(map(snap.reasons, fn(r) "<li>" + esc(r) + "</li>"), "") + "</ul>" }
+    health_text = if snap.healthy { "ok" } else { "needs attention" }
+    overall = if snap.healthy { badge("ok") } else { "<span class=\"badge bad\">needs attention</span>" }
+    alert = if snap.healthy { "" } else {
+        "<section class=\"alert\" aria-labelledby=\"attention\"><h2 id=\"attention\">needs attention</h2><ul>" + join(map(snap.reasons, li), "") + "</ul></section>"
+    }
     cards = join(map(snap.jobs, fn(j) job_card(j, now)), "")
+    script = replace(SCRIPT, "REFRESH_MS", string(REFRESH_SECONDS * 1000))
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
-        "<meta http-equiv=\"refresh\" content=\"{REFRESH_SECONDS}\">" +
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
-        "<title>bit-by-bit</title><style>" + CSS + "</style></head><body>" +
-        "<h1>bit-by-bit " + overall + "</h1>" +
-        "<p class=\"sub\">daemon up " + esc(dur_text(snap.daemon.uptime_ms)) + " (since " + esc(at_text(snap.daemon.started_at)) +
-        ") &middot; updated " + esc(at_text(now)) + "</p>" + reasons + cards + "</body></html>"
+        "<title>bit-by-bit: " + health_text + "</title><style>" + CSS + "</style></head><body>" +
+        "<header><div><h1>bit-by-bit " + overall + "</h1>" +
+        "<p class=\"sub\"><span id=\"updated\">daemon up " + esc(dur_text(snap.daemon.uptime_ms)) + " (since " + esc(at_text(snap.daemon.started_at)) +
+        ") &middot; updated " + esc(at_text(now)) + "</span><span id=\"conn\" role=\"status\"></span></p></div>" +
+        "<button type=\"button\" id=\"pause\">Pause updates</button></header>" +
+        "<main id=\"main\">" + alert + cards + "</main><script>" + script + "</script></body></html>"
 }
 
 # ---- HTTP ------------------------------------------------------------------------

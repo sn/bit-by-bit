@@ -37,8 +37,28 @@ enable the service. Then:
 sudoedit /etc/bit-by-bit/config.json
 sudo bit-by-bit check-config
 sudo bit-by-bit run --dry-run
+sudo bit-by-bit run                    # first full upload, in the foreground
 sudo systemctl enable --now bit-by-bit
 ```
+
+`check-config` only reads the file. The first real `run` is what proves the
+credentials, bucket and region.
+
+## Run as a service
+
+`sudo systemctl enable --now bit-by-bit` starts the daemon now and at every
+boot. It runs as root, can write only to `/var/lib/bit-by-bit` and
+`/var/log/bit-by-bit`, and restarts every 30 seconds if it exits, so a broken
+config shows up as repeated errors in the journal, not as a stopped service.
+
+| To | Run |
+|---|---|
+| Check it | `systemctl status bit-by-bit`, `sudo bit-by-bit status` |
+| Follow the log | `journalctl -u bit-by-bit -f` (also written to `/var/log/bit-by-bit/bit-by-bit.log`) |
+| Apply config changes | `sudo systemctl reload bit-by-bit` |
+| Back up now | `sudo bit-by-bit run home`. A run holds `job-<name>.lock` in `state_dir`, so it never overlaps the daemon's run of the same job. |
+| Stop it | `sudo systemctl stop bit-by-bit`. It finishes the current batch, waiting up to 60 seconds. |
+| Turn it off | `sudo systemctl disable --now bit-by-bit` |
 
 ## Configure
 
@@ -60,6 +80,62 @@ See `deploy/config.example.json`. The full field reference is in
   destination name upper-cased with `-` replaced by `_`.
 - **Reload:** `systemctl reload bit-by-bit` sends SIGHUP. An invalid config is
   rejected and the old one stays active.
+- **Excludes remove files from the backup.** A file that newly matches
+  `exclude` is treated like a deleted file: its remote copy moves to
+  `_versions/` and is pruned after `keep_versions_days`.
+- **Changing `prefix` or the destination** uploads everything to the new place.
+  Objects under the old prefix are left alone; delete them yourself if you no
+  longer want them.
+- **Concurrency:** uploads run in batches of `concurrency` files (default 4,
+  up to 32), and each batch waits for its slowest file. Raise it for trees of
+  many small files.
+
+### AWS S3 setup
+
+Give the daemon its own IAM user whose policy covers only the backup bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET" },
+    { "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::BUCKET/*" }
+  ]
+}
+```
+
+```bash
+aws iam create-user --user-name bit-by-bit
+aws iam put-user-policy --user-name bit-by-bit --policy-name bit-by-bit-s3 \
+  --policy-document file://policy.json
+aws iam create-access-key --user-name bit-by-bit \
+  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text |
+  awk '{print "ACCESS_KEY_ID=" $1 "\nSECRET_ACCESS_KEY=" $2}' |
+  sudo install -D -m 0600 /dev/stdin /etc/bit-by-bit/aws.env
+```
+
+The secret goes straight into the credentials file without being printed.
+
+- **The region must be the bucket's region**, in both `endpoint` and
+  `region`. A mismatch fails the run with `301 PermanentRedirect`.
+- **Bucket versioning is optional.** If it's on, keep it: the policy has no
+  `s3:DeleteObjectVersion`, so a leaked key can hide objects but not destroy
+  them. Add a lifecycle rule, or every copy bit-by-bit prunes stays stored
+  (and billed) forever:
+
+  ```bash
+  aws s3api put-bucket-lifecycle-configuration --bucket BUCKET --lifecycle-configuration \
+    '{"Rules":[{"ID":"bit-by-bit-cleanup","Status":"Enabled","Filter":{},
+      "NoncurrentVersionExpiration":{"NoncurrentDays":90},
+      "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7},
+      "Expiration":{"ExpiredObjectDeleteMarker":true}}]}'
+  ```
+
+- To rotate the key, create a second one, rewrite the credentials file,
+  `systemctl reload bit-by-bit`, then delete the old key.
 
 ### Providers
 
@@ -86,8 +162,22 @@ Restore never overwrites existing files unless you pass `--overwrite`. It
 checks every file against its stored SHA-256, and puts back each file's mode
 and modification time.
 
-If the state database is lost, `bit-by-bit run home --rebuild-state` rebuilds
-it from the bucket.
+## State
+
+bit-by-bit remembers what it has uploaded in the SQLite file
+`<state_dir>/state.db` (`/var/lib/bit-by-bit/state.db` by default). A file
+whose size and mtime match its row there is not uploaded again, and the bucket
+is not checked for it.
+
+**So don't delete or change objects in the bucket by hand.** Anything removed
+behind bit-by-bit's back stays missing until the local file changes. If the
+bucket and the database disagree, or the database is lost, rebuild it from
+the bucket:
+
+```bash
+sudo bit-by-bit run home --rebuild-state   # only rebuilds the database, uploads nothing
+sudo bit-by-bit run home                   # uploads whatever the bucket is missing
+```
 
 ## Dashboard
 
@@ -99,14 +189,14 @@ The daemon can serve a read-only status page. It's off unless the config has:
 
 | URL | What |
 |---|---|
-| `http://127.0.0.1:8484/` | Each job's status, last and next run, counts, errors, problems and recent runs. Refreshes every 30 seconds. |
+| `http://127.0.0.1:8484/` | Each job's status, last and next run, counts, errors, problems and recent runs. Updates in place every 30 seconds (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
 | `/api/status` | The same data as JSON. |
 | `/healthz` | `200 ok`, or `503` listing why: a job's last run failed, or it hasn't run for more than twice its interval. Point an uptime monitor at it. |
 
 The page has no login, so it only binds to loopback addresses (`127.0.0.1`,
 `localhost`, `::1`). To reach it from elsewhere, use an SSH tunnel
 (`ssh -L 8484:127.0.0.1:8484 host`), or set `"allow_remote": true` deliberately.
-The page has no buttons and can't change anything. If the port is taken, the
+The page's only control pauses its updates; it can't change anything. If the port is taken, the
 daemon logs an error and keeps backing up. Changing `listen` needs a service
 restart.
 
@@ -129,4 +219,5 @@ ecko check --strict main.ecko src/*.ecko tests/*.ecko testkit/*.ecko
 ```
 
 Tests run offline against `testkit/fake_s3.ecko`, an in-memory S3 server that
-checks signatures and payload hashes and can be told to fail requests.
+checks signatures, payload hashes and `content-length` (S3 refuses a PUT or
+POST without one, even an empty one) and can be told to fail requests.
