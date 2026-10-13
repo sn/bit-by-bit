@@ -50,7 +50,7 @@ test.case("GET / renders every job and updates in place, with a pause control", 
     # A meta refresh reloads the page and throws away the reader's place (WCAG F41).
     test.ok(not contains(r.body, "http-equiv=\"refresh\""), "no page reload")
     test.ok(contains(r.body, "<button type=\"button\" id=\"pause\">Pause updates</button>"), "pause control")
-    test.ok(contains(r.body, "<main id=\"main\">"), "main landmark")
+    test.ok(contains(r.body, "<main id=\"main\""), "main landmark")
     test.ok(contains(r.body, "home") and contains(r.body, "dev"), "both jobs")
     test.ok(contains(r.body, "never run"), "dev has not run")
     test.ok(contains(r.body, "No runs yet"), "a job that never ran says so")
@@ -82,15 +82,59 @@ test.case("the page uses the full width", fn() {
     test.ok(not contains(http.get(url("/")).body, "max-width: 60rem"), "no narrow column")
 })
 
+fn running(job, id, started, planned, done, uploaded) {
+    state.start_run(DB, job, id, started)
+    if planned != null { state.set_planned(DB, id, planned) }
+    state.save_progress(DB, id, done, { uploaded: uploaded, replaced: 0, deleted: 0, touched: 0, bytes: 75000000, problems: [] })
+}
+
+test.case("a running job shows live progress", fn() {
+    reset()
+    running("home", "r1", time.now() - 10 * 60000, 300897, 1285, 1280)
+    body = http.get(url("/")).body
+    test.ok(contains(body, "<progress id=\"progress-home\" max=\"300897\" value=\"1285\" aria-label=\"backup progress of home\">"), "native progress bar")
+    test.ok(contains(body, "1,285 of 300,897"), "count in words")
+    test.ok(contains(body, "<dt>uploaded</dt><dd>1,280</dd>"), "live counts")
+    test.ok(contains(body, "71.5 MiB"), "data so far")
+    test.ok(contains(body, "files/s"), "rate")
+    test.ok(contains(body, "left"), "time remaining")
+    s = json.decode(http.get(url("/api/status")).body)
+    test.eq([s.jobs[0].runs[0].planned, s.jobs[0].runs[0].done], [300897, 1285])
+})
+
+test.case("a run that is still scanning says so", fn() {
+    reset()
+    running("home", "r1", time.now() - 5000, null, 0, 0)
+    body = http.get(url("/")).body
+    test.ok(contains(body, "<progress id=\"progress-home\" aria-label=\"backup progress of home\"></progress>"), "indeterminate bar")
+    test.ok(contains(body, "scanning files"), "scanning text")
+})
+
+test.case("the page updates faster while a run is going", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    test.ok(contains(http.get(url("/")).body, "<main id=\"main\" data-refresh=\"30000\">"), "idle: 30s")
+    running("home", "r2", time.now() - 5000, 10, 1, 1)
+    test.ok(contains(http.get(url("/")).body, "<main id=\"main\" data-refresh=\"3000\">"), "running: 3s")
+})
+
 test.case("the favicon carries the overall health", fn() {
     reset()
     record("home", "r1", time.now() - H, "ok", [], null)
     ok = http.get(url("/")).body
     test.ok(contains(ok, "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,"), "inline svg icon")
-    test.ok(contains(ok, "%233fb950"), "green newest bit when healthy")
+    test.ok(contains(ok, "%2322d3ee") and not contains(ok, "%23f43f5e"), "cyan-violet arrow when healthy")
     record("home", "r2", time.now() - 60000, "failed", [], "boom")
     bad = http.get(url("/")).body
-    test.ok(contains(bad, "%23f85149") and not contains(bad, "%233fb950"), "red newest bit when not")
+    test.ok(contains(bad, "%23f43f5e") and not contains(bad, "%2322d3ee"), "orange-red arrow when not")
+})
+
+test.case("the header shows the icon beside the name", fn() {
+    reset()
+    body = http.get(url("/")).body
+    # Decorative: the heading beside it already says "bit-by-bit".
+    test.ok(contains(body, "<img class=\"logo\" id=\"logo\" src=\"data:image/svg+xml,"), "logo")
+    test.ok(contains(body, "width=\"28\" height=\"28\" alt=\"\"><h1>bit-by-bit</h1>"), "sized, decorative, before the name")
 })
 
 test.case("the tab title carries the overall health", fn() {

@@ -1,5 +1,6 @@
 import std.test
 import std.fs
+import std.sql
 import "../src/state.ecko"
 
 fn fresh() = state.open(fs.join(fs.temp_dir(), "state"))
@@ -72,4 +73,33 @@ test.case("multipart bookkeeping", fn() {
     test.eq(state.list_multipart(db, "home"), [{ key: "k", upload_id: "u1" }])
     state.remove_multipart(db, "home", "k", "u1")
     test.eq(state.list_multipart(db, "home"), [])
+})
+
+# Databases made before progress tracking have no planned/done columns.
+# Opening one must add them, keeping every existing row.
+test.case("open migrates an older runs table", fn() {
+    dir = fs.join(fs.temp_dir(), "old-state")
+    fs.mkdir(dir)
+    old = sql.open(fs.join(dir, "state.db"))
+    sql.exec(old, "create table runs (id text primary key, job text not null, started_at integer not null, finished_at integer, status text not null, uploaded integer not null default 0, replaced integer not null default 0, deleted integer not null default 0, touched integer not null default 0, pruned integer not null default 0, problems integer not null default 0, bytes integer not null default 0, error text, problem_list text)")
+    sql.exec(old, "insert into runs (id, job, started_at, status) values ('r0', 'home', 1, 'ok')")
+    sql.close(old)
+    db = state.open(dir)
+    test.eq(state.last_run(db, "home").id, "r0")
+    state.start_run(db, "home", "r1", 2)
+    state.set_planned(db, "r1", 10)
+    r = state.last_run(db, "home")
+    test.eq([r.id, r.planned, r.done], ["r1", 10, 0])
+    state.close(db)
+    state.close(state.open(dir))   # a second open must not try to add the columns again
+})
+
+test.case("a running run's progress is visible before it finishes", fn() {
+    db = fresh()
+    state.start_run(db, "home", "r1", 100)
+    state.set_planned(db, "r1", 50)
+    state.save_progress(db, "r1", 7, { uploaded: 5, replaced: 1, deleted: 0, touched: 1, bytes: 4096, problems: ["/x: vanished"] })
+    r = state.last_run(db, "home")
+    test.eq([r.status, r.planned, r.done, r.uploaded, r.replaced, r.touched, r.bytes, r.problems, r.problem_list],
+        ["running", 50, 7, 5, 1, 1, 4096, 1, ["/x: vanished"]])
 })

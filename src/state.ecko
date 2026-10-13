@@ -17,7 +17,19 @@ export fn open(state_dir) {
     db = sql.open(fs.join(state_dir, "state.db"))
     sql.query(db, "pragma journal_mode = wal")
     for stmt in SCHEMA { sql.exec(db, stmt) }
+    migrate(db)
     db
+}
+
+# Columns added after the first release. `create table if not exists` leaves
+# an existing table alone, so older databases get them here.
+let ADDED_RUN_COLUMNS = [["planned", "integer"], ["done", "integer not null default 0"]]
+
+fn migrate(db) {
+    have = map(sql.query(db, "pragma table_info(runs)"), fn(c) c.name)
+    for (name, decl) in ADDED_RUN_COLUMNS {
+        unless contains(have, name) { sql.exec(db, "alter table runs add column {name} {decl}") }
+    }
 }
 
 export fn close(db) = sql.close(db)
@@ -59,6 +71,15 @@ export fn set_target(db, job, fingerprint) =
 
 export fn start_run(db, job, run_id, started_at) =
     sql.exec(db, "insert into runs (id, job, started_at, status) values (?, ?, ?, 'running')", [run_id, job, started_at])
+
+## How many actions the run will carry out, known once it has planned.
+export fn set_planned(db, run_id, n) = sql.exec(db, "update runs set planned = ? where id = ?", [n, run_id])
+
+## Save a running run's counts so far: `done` actions finished, and the
+## running totals { uploaded, replaced, deleted, touched, bytes, problems: [String] }.
+export fn save_progress(db, run_id, done, t) =
+    sql.exec(db, "update runs set done = ?, uploaded = ?, replaced = ?, deleted = ?, touched = ?, bytes = ?, problems = ?, problem_list = ? where id = ? and status = 'running'",
+        [done, t.uploaded, t.replaced, t.deleted, t.touched, t.bytes, len(t.problems), json.encode(t.problems), run_id])
 
 ## outcome: { status, finished_at, uploaded, replaced, deleted, touched, pruned, bytes, error, problems: [String] }
 export fn finish_run(db, run_id, o) =

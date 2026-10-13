@@ -3,6 +3,7 @@ import std.time
 import std.uuid
 import std.encoding
 import "./config.ecko"
+import "./scanner.ecko"
 import "./s3.ecko"
 import "./state.ecko"
 import "./sync.ecko"
@@ -81,9 +82,11 @@ export fn rebuild_state(cfg, job, db) {
     mut rows = []
     for o in s3.list_objects(client, job.prefix + "/") {
         if starts_with(o.key, vprefix) { continue }
+        path = o.key[len(job.prefix)..]
+        # Another job may share the prefix; its files are not this job's.
+        unless scanner.under_any(path, job.paths) { continue }
         meta = s3.head_object(client, o.key)
         if meta == null { continue }
-        path = o.key[len(job.prefix)..]
         row = if has(meta, "symlink") {
             { path: path, size: 0, mtime: 0, sha256: planner.link_sha(encoding.url_decode(meta.symlink)), kind: "symlink" }
         } else {

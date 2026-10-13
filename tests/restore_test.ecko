@@ -151,7 +151,9 @@ test.case("I2: symlink with a non-ASCII target restores", fn() {
 
 test.case("M5: keys that climb out of --to are refused", fn() {
     env = setup()
-    fake_s3.put_raw("pc/../../escape.txt", bytes("x"), {})
+    # Under the job's root, so it passes the job's own-paths filter, then
+    # climbs out of it.
+    fake_s3.put_raw("pc" + env.root + "/../../escape.txt", bytes("x"), {})
     o = opts({})
     r = restore.restore(CLIENT, env.job, o)
     test.eq(r.restored, 0)

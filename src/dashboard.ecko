@@ -9,6 +9,7 @@ import "./status.ecko"
 
 let RECENT_RUNS = 10
 let REFRESH_SECONDS = 30
+let REFRESH_RUNNING_SECONDS = 3
 let DAY = 86400000
 
 ## A connection to the state database that refuses writes (SQLite
@@ -27,6 +28,7 @@ fn run_view(r) = {
     id: r.id, status: r.status, started_at: r.started_at, finished_at: r.finished_at,
     duration_ms: duration(r), uploaded: r.uploaded, replaced: r.replaced, deleted: r.deleted,
     pruned: r.pruned, bytes: r.bytes, problem_count: r.problems, error: r.error,
+    planned: get(r, "planned"), done: get(r, "done") ?? 0,
 }
 
 fn job_view(job, db, now) {
@@ -51,6 +53,8 @@ fn job_view(job, db, now) {
         deleted: if last == null { 0 } else { last.deleted },
         pruned: if last == null { 0 } else { last.pruned },
         bytes: if last == null { 0 } else { last.bytes },
+        planned: if last == null { null } else { get(last, "planned") },
+        done: if last == null { 0 } else { get(last, "done") ?? 0 },
         error: if last == null { null } else { last.error },
         problems: if last == null { [] } else { last.problem_list },
         runs: map(runs, run_view),
@@ -108,6 +112,13 @@ fn schedule_text(s) {
     }
 }
 
+# 300897 -> "300,897"
+fn commas(n) {
+    digits = string(n)
+    if len(digits) <= 3 { return digits }
+    commas(digits[..len(digits) - 3]) + "," + digits[len(digits) - 3..]
+}
+
 fn pad2(n) = if n < 10 { "0" + string(n) } else { string(n) }
 
 let GLYPHS = { ok: "✓", partial: "!", running: "…", failed: "×", "never run": "–" }
@@ -136,7 +147,7 @@ fn problems_html(j) {
 }
 
 fn run_row(r) = "<tr><td>" + esc(at_text(r.started_at)) + "</td><td>" + badge(r.status) + "</td><td>" + esc(dur_text(r.duration_ms)) +
-    "</td><td class=\"num\">" + esc(r.uploaded) + "</td><td class=\"num\">" + esc(r.replaced) + "</td><td class=\"num\">" + esc(r.deleted) +
+    "</td><td class=\"num\">" + commas(r.uploaded) + "</td><td class=\"num\">" + commas(r.replaced) + "</td><td class=\"num\">" + commas(r.deleted) +
     "</td><td class=\"num\">" + esc(status.size_text(r.bytes)) + "</td><td class=\"num\">" + esc(r.problem_count) + "</td></tr>"
 
 # The recent runs as a strip, oldest first: a glance at the pattern. The table
@@ -150,7 +161,28 @@ fn history(j) {
 
 fn kpi(label, value, detail) = "<div class=\"kpi\"><dt>" + label + "</dt><dd><span class=\"value\">" + esc(value) + "</span><span class=\"when\">" + esc(detail) + "</span></dd></div>"
 
-fn stat(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(value) + "</dd></div>"
+fn stat(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(if type_of(value) == "int" { commas(value) } else { value }) + "</dd></div>"
+
+# A run in progress: how far it has got, how fast, and roughly how long is
+# left, from the progress it saves to the database about once a second.
+fn progress_html(j, now) {
+    bar_label = "backup progress of " + esc(j.job)
+    if j.planned == null {
+        return "<section class=\"block\"><h3>in progress</h3><progress id=\"progress-" + j.job + "\" aria-label=\"" + bar_label + "\"></progress>" +
+            "<p class=\"progress-text\">scanning files…</p></section>"
+    }
+    elapsed_s = max([1, (now - j.started_at) // 1000])
+    rate = j.done / elapsed_s
+    pace = if j.done == 0 { "starting uploads" } else {
+        left = if rate > 0 { (j.planned - j.done) / rate * 1000 } else { 0 }
+        per = if rate >= 10 { string(int(rate)) } else { string(int(rate * 10) / 10) }
+        per + " files/s · about " + span_text(left) + " left"
+    }
+    "<section class=\"block\"><h3>in progress</h3>" +
+        "<progress id=\"progress-" + j.job + "\" max=\"" + string(j.planned) + "\" value=\"" + string(j.done) + "\" aria-label=\"" + bar_label + "\"></progress>" +
+        "<p class=\"progress-text\"><strong>" + commas(j.done) + " of " + commas(j.planned) + "</strong> files · " + esc(status.size_text(j.bytes)) + " · " + esc(pace) + "</p>" +
+        "<dl class=\"stats\">" + stat("uploaded", j.uploaded) + stat("replaced", j.replaced) + stat("deleted", j.deleted) + "</dl></section>"
+}
 
 fn job_card(j, now) {
     overdue = if j.overdue { " <span class=\"badge bad\"><span aria-hidden=\"true\">!</span> overdue</span>" } else { "" }
@@ -166,6 +198,7 @@ fn job_card(j, now) {
         "<section class=\"block\"><h3>changes in the last run</h3><dl class=\"stats\">" + stat("uploaded", j.uploaded) + stat("replaced", j.replaced) +
             stat("deleted", j.deleted) + stat("pruned", j.pruned) + stat("data", status.size_text(j.bytes)) + "</dl></section>"
     }
+    live = if j.started_at != null and j.finished_at == null { progress_html(j, now) } else { "" }
     err = if j.error == null { "" } else { "<div class=\"callout\"><strong>last run failed</strong><p>" + esc(j.error) + "</p></div>" }
     runs = if len(j.runs) == 0 {
         due = if j.next_due <= now { "as soon as the daemon is free" } else { at_text(j.next_due) }
@@ -179,7 +212,7 @@ fn job_card(j, now) {
     }
     "<section class=\"job " + tone(j.status) + "\" aria-labelledby=\"job-" + j.job + "\">" +
         "<header class=\"job-head\"><h2 id=\"job-" + j.job + "\">" + esc(j.job) + "</h2>" + badge(j.status) + overdue + meta + "</header>" +
-        "<div class=\"job-body\"><div class=\"facts\">" + kpis + stats + "</div><div class=\"detail\">" + err + problems_html(j) + runs + "</div></div></section>"
+        "<div class=\"job-body\"><div class=\"facts\">" + kpis + stats + "</div><div class=\"detail\">" + live + err + problems_html(j) + runs + "</div></div></section>"
 }
 
 let CSS = r"""
@@ -207,6 +240,7 @@ let CSS = r"""
 
     .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.5rem; padding: 0.875rem var(--gutter); background: var(--surface); border-bottom: 1px solid var(--border); }
     .brand { display: flex; align-items: center; gap: 0.75rem; }
+    .logo { display: block; flex: none; border-radius: 7px; }
     h1 { font-size: 1.125rem; line-height: 1.3; }
     .sub { color: var(--text-muted); font-size: 0.875rem; flex: 1 1 20rem; }
     button { font: inherit; font-size: 0.875rem; padding: 0.375rem 0.875rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); cursor: pointer; }
@@ -253,6 +287,8 @@ let CSS = r"""
     .problems li::marker { color: var(--warn-fg); }
     details { margin-top: 0.25rem; }
     summary { cursor: pointer; color: var(--link); width: fit-content; font-size: 0.875rem; }
+    progress { display: block; width: 100%; height: 0.75rem; margin: 0.25rem 0 0.5rem; accent-color: var(--info-fg); }
+    .progress-text { font-variant-numeric: tabular-nums; margin-bottom: 0.75rem; }
     .empty { border: 1px dashed var(--border); border-radius: var(--radius); padding: 1.25rem; color: var(--text-muted); }
     .empty strong { color: var(--text); }
 
@@ -269,7 +305,8 @@ let CSS = r"""
     .num { text-align: end; font-variant-numeric: tabular-nums; }
 """
 
-# Updates the page in place every REFRESH_SECONDS, keeping the reader's
+# Updates the page in place every data-refresh ms (faster while a run is
+# going), keeping the reader's
 # place, open disclosures and focus. Pausable, and idle while the tab is hidden.
 let SCRIPT = r"""
 (function () {
@@ -278,8 +315,11 @@ let SCRIPT = r"""
     paused = !paused;
     btn.textContent = paused ? 'Resume updates' : 'Pause updates';
   });
+  function schedule() {
+    setTimeout(update, Number(document.getElementById('main').dataset.refresh) || 30000);
+  }
   function update() {
-    if (paused || document.hidden) return;
+    if (paused || document.hidden) { schedule(); return; }
     fetch(location.pathname, { cache: 'no-store' }).then(function (r) {
       if (!r.ok) throw new Error(r.status);
       return r.text();
@@ -289,36 +329,45 @@ let SCRIPT = r"""
       var open = Array.prototype.map.call(main.querySelectorAll('details[open]'), function (d) { return d.id; });
       var focused = main.contains(document.activeElement) ? document.activeElement.id : '';
       main.innerHTML = next.getElementById('main').innerHTML;
+      main.dataset.refresh = next.getElementById('main').dataset.refresh;
       open.forEach(function (id) { var d = document.getElementById(id); if (d) d.open = true; });
       if (focused) { var f = document.getElementById(focused); if (f) f.focus({ preventScroll: true }); }
       document.title = next.title;
       document.getElementById('favicon').href = next.getElementById('favicon').href;
+      document.getElementById('logo').src = next.getElementById('logo').src;
       document.getElementById('updated').textContent = next.getElementById('updated').textContent;
       conn.textContent = '';
+      schedule();
     }).catch(function () {
       conn.textContent = " · can't reach the daemon, showing the last data it sent. Check: systemctl status bit-by-bit";
+      schedule();
     });
   }
-  setInterval(update, REFRESH_MS);
+  schedule();
 })();
 """
 
-# The tab icon: bits stacking up in three columns, one more each time, which
-# is what an incremental backup does. The newest bit, top right, shows the
-# overall health, so a background tab still tells you whether to look.
-let ICON_OK = "#3fb950"
-let ICON_BAD = "#f85149"
+# The tab icon: an upload arrow whose shaft breaks up into bits, so the
+# backup assembles bit by bit as it rises. The arrow's colour is the overall
+# health, cyan to violet when every backup is fine and orange to red when one
+# needs attention, so a background tab still says whether to look.
+let ICON_OK = ["#22d3ee", "#8b5cf6"]
+let ICON_BAD = ["#ffb03a", "#f43f5e"]
+# The trailing bits: x, y, opacity. They fade and scatter as they fall away.
+let ICON_BITS = [[12.2, 19.8, 0.85], [16.2, 19.8, 0.85], [12.2, 23.4, 0.5], [17.6, 23.8, 0.4], [14.4, 26.8, 0.22]]
 
 fn favicon(healthy) {
-    bit = fn(x, y, fill, opacity) "<rect x='{x}' y='{y}' width='7' height='7' rx='1.75' fill='{fill}' fill-opacity='{opacity}'/>"
-    newest = if healthy { ICON_OK } else { ICON_BAD }
-    svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>" +
-        "<defs><linearGradient id='g' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='#2f81f7'/><stop offset='1' stop-color='#0a3d91'/></linearGradient></defs>" +
-        "<rect width='32' height='32' rx='7' fill='url(#g)'/>" +
-        bit("3.5", "21.5", "#fff", "0.55") +
-        bit("12.5", "21.5", "#fff", "0.75") + bit("12.5", "12.5", "#fff", "0.75") +
-        bit("21.5", "21.5", "#fff", "1") + bit("21.5", "12.5", "#fff", "1") + bit("21.5", "3.5", newest, "1") +
-        "</svg>"
+    (top, bottom) = if healthy { ICON_OK } else { ICON_BAD }
+    arrow = "<path d='M16 3.5 L27 14.5 L20 14.5 L20 19 L12 19 L12 14.5 L5 14.5 Z' stroke-linejoin='round'/>" +
+        join(map(ICON_BITS, fn(b) "<rect x='{b[0]}' y='{b[1]}' width='3.4' height='3.4' rx='0.7' fill-opacity='{b[2]}'/>"), "")
+    svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs>" +
+        "<radialGradient id='t' cx='0.5' cy='0.25' r='0.8'><stop offset='0' stop-color='#1d2b55'/><stop offset='1' stop-color='#070b16'/></radialGradient>" +
+        "<linearGradient id='a' x1='0' y1='3.5' x2='0' y2='31' gradientUnits='userSpaceOnUse'><stop offset='0' stop-color='" + top + "'/><stop offset='1' stop-color='" + bottom + "'/></linearGradient>" +
+        "<filter id='g' x='-50%' y='-50%' width='200%' height='200%'><feGaussianBlur stdDeviation='1.6'/></filter></defs>" +
+        "<rect width='32' height='32' rx='8' fill='url(#t)'/>" +
+        "<rect x='0.5' y='0.5' width='31' height='31' rx='7.5' fill='none' stroke='#fff' stroke-opacity='0.12'/>" +
+        "<g fill='url(#a)' opacity='0.55' filter='url(#g)'>" + arrow + "</g>" +
+        "<g fill='url(#a)'>" + arrow + "</g></svg>"
     "data:image/svg+xml," + replace(svg, "#", "%23")
 }
 
@@ -326,21 +375,23 @@ fn favicon(healthy) {
 export fn render_html(snap) {
     now = snap.daemon.now
     health_text = if snap.healthy { "ok" } else { "needs attention" }
+    icon = favicon(snap.healthy)
     overall = if snap.healthy { "<span class=\"badge ok\"><span aria-hidden=\"true\">✓</span> all backups healthy</span>" } else { "<span class=\"badge bad\"><span aria-hidden=\"true\">!</span> needs attention</span>" }
     alert = if snap.healthy { "" } else {
         "<section class=\"alert\" aria-labelledby=\"attention\"><h2 id=\"attention\">needs attention</h2><ul>" + join(map(snap.reasons, li), "") + "</ul></section>"
     }
     cards = join(map(snap.jobs, fn(j) job_card(j, now)), "")
-    script = replace(SCRIPT, "REFRESH_MS", string(REFRESH_SECONDS * 1000))
+    busy = any(snap.jobs, fn(j) j.status == "running")
+    refresh_ms = (if busy { REFRESH_RUNNING_SECONDS } else { REFRESH_SECONDS }) * 1000
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
-        "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"" + favicon(snap.healthy) + "\">" +
+        "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"" + icon + "\">" +
         "<title>bit-by-bit: " + health_text + "</title><style>" + CSS + "</style></head><body>" +
-        "<header class=\"topbar\"><div class=\"brand\"><h1>bit-by-bit</h1>" + overall + "</div>" +
+        "<header class=\"topbar\"><div class=\"brand\"><img class=\"logo\" id=\"logo\" src=\"" + icon + "\" width=\"28\" height=\"28\" alt=\"\"><h1>bit-by-bit</h1>" + overall + "</div>" +
         "<p class=\"sub\"><span id=\"updated\">daemon up " + esc(dur_text(snap.daemon.uptime_ms)) + " (since " + esc(at_text(snap.daemon.started_at)) +
         ") &middot; updated " + esc(at_text(now)) + "</span><span id=\"conn\" role=\"status\"></span></p>" +
         "<button type=\"button\" id=\"pause\">Pause updates</button></header>" +
-        "<main id=\"main\">" + alert + cards + "</main><script>" + script + "</script></body></html>"
+        "<main id=\"main\" data-refresh=\"" + string(refresh_ms) + "\">" + alert + cards + "</main><script>" + SCRIPT + "</script></body></html>"
 }
 
 # ---- HTTP ------------------------------------------------------------------------

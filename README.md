@@ -83,6 +83,10 @@ See `deploy/config.example.json`. The full field reference is in
 - **Excludes remove files from the backup.** A file that newly matches
   `exclude` is treated like a deleted file: its remote copy moves to
   `_versions/` and is pruned after `keep_versions_days`.
+- **Several jobs can share a prefix,** such as one per folder of the same
+  machine, as long as their `paths` don't overlap. Each job only rebuilds,
+  prunes, lists and restores its own files. Nested prefixes (`pc` and `pc/docs`)
+  are refused, because two jobs could then write the same object.
 - **Changing `prefix` or the destination** uploads everything to the new place.
   Objects under the old prefix are left alone; delete them yourself if you no
   longer want them.
@@ -194,7 +198,7 @@ The daemon can serve a read-only status page. It's off unless the config has:
 
 | URL | What |
 |---|---|
-| `http://127.0.0.1:8484/` | Each job's status, how long ago its last good backup finished, when it runs next, its schedule and destination, the last run's changes, errors, problems and recent runs. Full-width, and follows the system light or dark theme. The tab icon's newest bit is green when every backup is healthy and red when one needs attention. Updates in place every 30 seconds (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
+| `http://127.0.0.1:8484/` | Each job's status, live progress of a running backup (files done of planned, data, files/s and time left, saved about once a second), how long ago its last good backup finished, when it runs next, its schedule and destination, the last run's changes, errors, problems and recent runs. Full-width, and follows the system light or dark theme. The tab icon, an upload arrow whose shaft breaks into bits, glows cyan to violet when every backup is healthy and orange to red when one needs attention. Updates in place every 3 seconds while a backup runs and every 30 seconds otherwise (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
 | `/api/status` | The same data as JSON. |
 | `/healthz` | `200 ok`, or `503` listing why: a job's last run failed, or it hasn't run for more than twice its interval. Point an uptime monitor at it. |
 

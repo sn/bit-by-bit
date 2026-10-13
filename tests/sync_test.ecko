@@ -21,8 +21,9 @@ fn setup() {
     fs.write(fs.join(root, "a.txt"), "alpha")
     fs.write(fs.join(root, "sub/b.txt"), "bravo")
     job = { name: "t", prefix: "pc", paths: [root], exclude: [], follow_symlinks: false, keep_versions_days: 30 }
-    db = state.open(fs.join(fs.temp_dir(), "state"))
-    { root: root, job: job, db: db }
+    state_dir = fs.join(fs.temp_dir(), "state")
+    db = state.open(state_dir)
+    { root: root, job: job, db: db, state_dir: state_dir }
 }
 
 fn ctx(env, opts) {
@@ -111,12 +112,16 @@ test.case("old versions are pruned, recent kept", fn() {
     env = setup()
     old_ts = sync.run_ts_of(clock - 40 * 86400000)
     new_ts = sync.run_ts_of(clock - 1 * 86400000)
-    fake_s3.put_raw("pc/_versions/" + old_ts + "/x", bytes("old"), {})
-    fake_s3.put_raw("pc/_versions/" + new_ts + "/x", bytes("new"), {})
+    x = env.root + "/x"
+    fake_s3.put_raw("pc/_versions/" + old_ts + x, bytes("old"), {})
+    fake_s3.put_raw("pc/_versions/" + new_ts + x, bytes("new"), {})
+    # Not this job's: outside its paths (another job may share the prefix).
+    fake_s3.put_raw("pc/_versions/" + old_ts + "/elsewhere/y", bytes("other"), {})
     o = run(env)
     test.eq(o.pruned, 1)
-    test.eq(fake_s3.object("pc/_versions/" + old_ts + "/x"), null)
-    test.ok(fake_s3.object("pc/_versions/" + new_ts + "/x") != null, "recent kept")
+    test.eq(fake_s3.object("pc/_versions/" + old_ts + x), null)
+    test.ok(fake_s3.object("pc/_versions/" + new_ts + x) != null, "recent kept")
+    test.ok(fake_s3.object("pc/_versions/" + old_ts + "/elsewhere/y") != null, "another job's copy kept")
 })
 
 test.case("bad credentials fail the run and change nothing", fn() {
@@ -219,6 +224,29 @@ test.case("a large file streams its parts, several at a time", fn() {
     # create, 4 parts, complete are held. With parts sent one at a time,
     # at most the two small files can arrive during a held request.
     test.ok(max(fake_s3.overlaps_()) >= 3, "requests arriving during a held part: {fake_s3.overlaps_()}")
+})
+
+# The dashboard runs in another process and only sees the database, so a
+# run saves its progress as it goes, including while one slow file holds
+# things up and no other result arrives.
+test.case("progress is saved while the run is still going", fn() {
+    env = setup()
+    for i in 0..6 { fs.write(fs.join(env.root, "f{i}.txt"), "file {i}") }
+    fs.write(fs.join(env.root, "slow.bin"), "slow")
+    fake_s3.delay("slow.bin", 1500)
+    c = ctx(env, { cfg: merge(CFG, { record_every_ms: 200 }) })
+    async fn go() = sync.run(c)
+    task = go()
+    sleep(900)
+    watcher = state.open(env.state_dir)
+    mid = state.last_run(watcher, "t")
+    state.close(watcher)
+    o = await task
+    test.eq([mid.status, mid.planned], ["running", 9])
+    test.ok(mid.done >= 8 and mid.uploaded >= 8, "saved mid-run: done {mid.done}, uploaded {mid.uploaded}")
+    test.eq([o.status, o.uploaded], ["ok", 9])
+    final = state.last_run(env.db, "t")
+    test.eq([final.status, final.done, final.planned], ["ok", 9, 9])
 })
 
 test.case("dry run changes nothing", fn() {

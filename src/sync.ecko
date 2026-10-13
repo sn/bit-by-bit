@@ -219,8 +219,12 @@ export fn prune(ctx) {
     mut pruned = 0
     mut problems = []
     for o in s3.list_objects(ctx.client, vprefix) {
-        ts = split(o.key[len(vprefix)..], "/")[0]
-        ms = try { run_ts_ms(ts) } catch (e) { null }
+        rest = o.key[len(vprefix)..]
+        slash = index_of(rest, "/")
+        if slash < 0 { continue }
+        # Another job may share the prefix, with its own keep_versions_days.
+        unless scanner.under_any(rest[slash..], ctx.job.paths) { continue }
+        ms = try { run_ts_ms(rest[..slash]) } catch (e) { null }
         if ms == null or ms > cutoff { continue }
         try {
             s3.delete_object(ctx.client, o.key)
@@ -265,6 +269,7 @@ export fn run_job(ctx) {
         for a in p.actions { ctx.log("info", "would " + a.op, { path: a.path }) }
         return merge(totals, { status: "ok", error: null })
     }
+    state.set_planned(ctx.db, ctx.run_id, len(p.actions))
     mut fatal = null
     # A worker pool: each worker takes the next action as soon as it finishes
     # one, so a large file holds up only its own worker. Results are recorded
@@ -289,30 +294,57 @@ export fn run_job(ctx) {
     }
     closer = close_when_done()
     # Index rows are written in one transaction per RECORD_BATCH results or
-    # per RECORD_EVERY_MS, whichever comes first: a commit per file costs about
+    # per record_every_ms, whichever comes first: a commit per file costs about
     # 100x more. A crash loses at most one batch of rows, and those files are
-    # uploaded again next run.
+    # uploaded again next run. The same transaction saves the run's progress
+    # for the dashboard, which runs in another process and reads only the
+    # database. A ticker wakes the loop so progress is saved on time even
+    # while one slow file holds things up and no other result arrives.
+    every_ms = get(ctx.cfg, "record_every_ms") ?? RECORD_EVERY_MS
     mut done = 0
+    mut saved = 0
     mut buffered = []
     mut flushed_at = time.now()
     fn flush() {
         if len(buffered) == 0 { return null }
+        saved = saved + len(buffered)
         sql.transaction(ctx.db, fn(tx) {
             in_tx = set(ctx, "db", tx)
             for b in buffered { totals = record(in_tx, totals, b) }
+            state.save_progress(tx, ctx.run_id, saved, totals)
         })
         buffered = []
         flushed_at = time.now()
     }
+    ticking = cell(true)
+    async fn ticker() {
+        while cell_get(ticking) {
+            sleep(every_ms)
+            if cell_get(ticking) {
+                # The results channel closes when the workers finish; a tick
+                # sent after that has nowhere to go and ends the ticker.
+                ok = try { send(results, { op: "tick" }) true } catch (e) { false }
+                unless ok { break }
+            }
+        }
+    }
+    ticks = ticker()
     for r in results {
+        if r.op == "tick" {
+            if time.now() - flushed_at >= every_ms { flush() }
+            continue
+        }
         done = done + 1
         buffered = push(buffered, r)
-        if len(buffered) >= RECORD_BATCH or time.now() - flushed_at >= RECORD_EVERY_MS { flush() }
+        if len(buffered) >= RECORD_BATCH or time.now() - flushed_at >= every_ms { flush() }
         if r.op == "fatal" and fatal == null { fatal = r }
         if fatal != null or ctx.should_stop() { cell_set(halt, true) }
     }
+    cell_set(ticking, false)
+    cancel(ticks)   # ends its sleep at once, rather than up to every_ms later
     await closer
     flush()
+    try { await ticks } catch (e) { null }
     if fatal != null { error({ kind: "job_fatal", message: fatal.message, totals: totals }) }
     stopped = done < len(p.actions)
     if stopped {

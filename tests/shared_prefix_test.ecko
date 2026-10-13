@@ -1,0 +1,100 @@
+import std.test
+import std.fs
+import std.os
+import "../src/config.ecko"
+import "../src/state.ecko"
+import "../src/runner.ecko"
+import "../src/restore.ecko"
+import "../testkit/fake_s3.ecko"
+
+# Several jobs may back up different folders of one machine under one prefix.
+# Every key is the prefix plus a file's absolute path, so their objects never
+# meet; but anything that lists the prefix must keep to the job's own paths,
+# or one job rebuilds, prunes and restores the other's files.
+
+port = fake_s3.start()
+os.set_env("BBB_FAKE_ACCESS_KEY_ID", fake_s3.ACCESS_KEY)
+os.set_env("BBB_FAKE_SECRET_ACCESS_KEY", fake_s3.SECRET_KEY)
+
+fn raw_config(jobs) = {
+    state_dir: fs.join(fs.temp_dir(), "state"),
+    destinations: { fake: {
+        provider: "s3", endpoint: "http://127.0.0.1:{port}", region: "us-east-1",
+        bucket: fake_s3.BUCKET, path_style: true, allow_insecure: true, server_side_encryption: false,
+    } },
+    jobs: jobs,
+    retry: { attempts: 2, base_delay: "1ms", max_delay: "5ms" },
+}
+
+fn job(name, prefix, paths, keep) = { name: name, destination: "fake", prefix: prefix, paths: paths, schedule: { every: "1h" }, keep_versions_days: keep }
+
+fn setup() {
+    fake_s3.reset()
+    base = fs.temp_dir()
+    docs = fs.join(base, "docs")
+    pics = fs.join(base, "pics")
+    fs.mkdir(docs)
+    fs.mkdir(pics)
+    fs.write(fs.join(docs, "a.txt"), "alpha")
+    fs.write(fs.join(pics, "p.jpg"), "picture")
+    r = config.validate(raw_config([job("docs", "pc", [docs], 0), job("pics", "pc", [pics], 30)]))
+    test.eq(r.errors, [])
+    cfg = r.config
+    { cfg: cfg, docs: cfg.jobs[0], pics: cfg.jobs[1], db: state.open(cfg.state_dir), docs_root: docs, pics_root: pics }
+}
+
+fn go(env, j) = runner.run_job(env.cfg, j, env.db, { dry_run: false, should_stop: fn() false })
+fn current_keys() = sort(filter(keys(fake_s3.objects_()), fn(k) not contains(k, "/_versions/")))
+fn version_keys() = filter(keys(fake_s3.objects_()), fn(k) contains(k, "/_versions/"))
+
+test.case("jobs with different folders may share a prefix", fn() {
+    env = setup()
+    test.eq([go(env, env.docs).status, go(env, env.pics).status], ["ok", "ok"])
+    test.eq(current_keys(), sort(["pc" + env.docs_root + "/a.txt", "pc" + env.pics_root + "/p.jpg"]))
+})
+
+test.case("rebuilding one job's index leaves the other job's files alone", fn() {
+    env = setup()
+    go(env, env.docs)
+    go(env, env.pics)
+    state.replace_index(env.db, "docs", [])
+    test.eq(runner.rebuild_state(env.cfg, env.docs, env.db), 1)
+    test.eq(keys(state.index(env.db, "docs")), [env.docs_root + "/a.txt"])
+    # The next docs run must not take pics' files for deleted docs files.
+    o = go(env, env.docs)
+    test.eq(o.deleted, 0)
+    test.ok(contains(current_keys(), "pc" + env.pics_root + "/p.jpg"), "pics still backed up")
+})
+
+test.case("pruning one job's versions leaves the other job's history alone", fn() {
+    env = setup()
+    go(env, env.docs)
+    go(env, env.pics)
+    fs.write(fs.join(env.pics_root, "p.jpg"), "picture, edited")
+    go(env, env.pics)   # pics keeps its old copy for 30 days
+    test.eq(len(version_keys()), 1)
+    go(env, env.docs)   # docs keeps none: its prune must not touch pics' copy
+    test.eq(len(version_keys()), 1)
+})
+
+test.case("ls and restore show only the job's own files", fn() {
+    env = setup()
+    go(env, env.docs)
+    go(env, env.pics)
+    picked = restore.select(runner.make_client(env.cfg, env.docs), env.docs, {})
+    test.eq(map(picked, fn(x) x.path), [env.docs_root + "/a.txt"])
+})
+
+test.case("a shared prefix is refused only when the jobs' folders overlap", fn() {
+    a = "/data/a"
+    errs = fn(jobs) config.validate(raw_config(jobs)).errors
+    test.eq(errs([job("x", "pc", [a], 30), job("y", "pc", ["/data/b"], 30)]), [])
+    overlap = errs([job("x", "pc", ["/data"], 30), job("y", "pc", [a], 30)])
+    test.eq(len(overlap), 1)
+    test.ok(contains(overlap[0], "back up the same files under prefix 'pc'"), overlap[0])
+    # Nested prefixes can still put two jobs' files at one key.
+    nested = errs([job("x", "pc", [a], 30), job("y", "pc/b", ["/data/c"], 30)])
+    test.ok(any(nested, fn(e) contains(e, "nested prefixes")), string(nested))
+})
+
+fake_s3.stop()

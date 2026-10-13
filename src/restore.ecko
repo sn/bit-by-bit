@@ -4,6 +4,7 @@ import std.hash
 import std.encoding
 import "./s3.ecko"
 import "./sync.ecko"
+import "./scanner.ecko"
 import "./util.ecko"
 
 fn wanted(path, sub) = sub == null or path == sub or starts_with(path, sub + "/")
@@ -14,14 +15,17 @@ fn catalogue(c, job) {
     vprefix = job.prefix + "/_versions/"
     mut current = []
     mut versions = []
+    # Another job may share the prefix: keep to this job's own paths.
+    mine = fn(path) scanner.under_any(path, job.paths)
     for o in s3.list_objects(c, job.prefix + "/") {
         if starts_with(o.key, vprefix) {
             rest = o.key[len(vprefix)..]
             slash = index_of(rest, "/")
-            if slash < 0 { continue }
+            if slash < 0 or not mine(rest[slash..]) { continue }
             versions = push(versions, { path: rest[slash..], ts: rest[..slash], key: o.key })
         } else {
-            current = push(current, { path: o.key[len(job.prefix)..], key: o.key })
+            path = o.key[len(job.prefix)..]
+            if mine(path) { current = push(current, { path: path, key: o.key }) }
         }
     }
     { current: util.index_by(current, fn(x) x.path), versions: group_by(versions, fn(x) x.path) }

@@ -73,11 +73,11 @@ test.case("http endpoint needs allow_insecure", fn() {
     test.eq(config.validate(merge(base(), { destinations: { "aws-main": d2 } })).errors, [])
 })
 
-test.case("overlapping prefixes on one destination", fn() {
+test.case("nested prefixes on one destination", fn() {
     j1 = base().jobs[0]
     j2 = merge(j1, { name: "nested", prefix: "laptop/home/sub" })
     r = config.validate(merge(base(), { jobs: [j1, j2] }))
-    test.ok(has_error(r, "overlapping prefixes"), string(r.errors))
+    test.ok(has_error(r, "nested prefixes"), string(r.errors))
 })
 
 test.case("duplicate job names and /_versions paths", fn() {

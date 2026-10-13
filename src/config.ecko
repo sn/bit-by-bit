@@ -3,6 +3,7 @@ import std.fs
 import std.os
 import std.re
 import "./duration.ecko"
+import "./scanner.ecko"
 
 let TOP_KEYS = ["state_dir", "log", "destinations", "jobs", "retry", "concurrency", "multipart_threshold", "multipart_part_size", "dashboard"]
 let DASHBOARD_KEYS = ["listen", "allow_remote"]
@@ -224,13 +225,21 @@ export fn validate(raw) {
                 follow_symlinks: want_bool(j, "follow_symlinks", p, false),
             })
         }
-        # Two jobs on the same destination must not share or nest prefixes.
+        # Jobs on one destination may share a prefix: every key is the prefix
+        # plus a file's absolute path, so jobs backing up different folders
+        # never write the same object. They may not back up the same files
+        # there, and may not nest prefixes, where `a` + `/b/x` and `a/b` + `/x`
+        # are the same key.
         for (a_i, a) in enumerate(jobs) {
             for b in drop(jobs, a_i + 1) {
-                if a.destination == b.destination and a.prefix != null and b.prefix != null {
-                    if a.prefix == b.prefix or starts_with(a.prefix, b.prefix + "/") or starts_with(b.prefix, a.prefix + "/") {
-                        err("$.jobs", "jobs '{a.name}' and '{b.name}' use overlapping prefixes on destination '{a.destination}'")
+                if a.destination != b.destination or a.prefix == null or b.prefix == null { continue }
+                if a.prefix == b.prefix {
+                    shared = any(a.paths, fn(pa) scanner.under_any(pa, b.paths) or any(b.paths, fn(pb) scanner.under_any(pb, [pa])))
+                    if shared {
+                        err("$.jobs", "jobs '{a.name}' and '{b.name}' back up the same files under prefix '{a.prefix}' on destination '{a.destination}' - give their paths separate folders or the jobs separate prefixes")
                     }
+                } else if starts_with(a.prefix, b.prefix + "/") or starts_with(b.prefix, a.prefix + "/") {
+                    err("$.jobs", "jobs '{a.name}' and '{b.name}' use nested prefixes '{a.prefix}' and '{b.prefix}' on destination '{a.destination}' - use the same prefix or unrelated ones")
                 }
             }
         }

@@ -79,10 +79,11 @@ fn handle(req) {
     segs = split(path[1..], "/")
     bucket = segs[0]
     key = join(drop(segs, 1), "/")
-    cell_update(log_, fn(l) push(l, req.method + " " + key))
+    # The position in the log comes from the same atomic update that adds this
+    # request, so a concurrent request can't slip in between.
+    arrived = len(cell_update(log_, fn(l) push(l, req.method + " " + key)))
     d = find(cell_get(delays), fn(x) contains(key, x.key_contains))
     if d != null {
-        arrived = len(cell_get(log_))
         sleep(d.ms)
         cell_update(overlaps, fn(o) push(o, len(cell_get(log_)) - arrived))
     }
