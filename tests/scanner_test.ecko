@@ -103,3 +103,45 @@ test.case("under_any", fn() {
     test.ok(scanner.under_any("/a/b", ["/a/b"]), "equal")
     test.ok(not scanner.under_any("/a/bc", ["/a/b"]), "sibling prefix")
 })
+
+# The scanner matches excludes with one precompiled regex (fs.match compiles
+# its pattern on every call, which dominated large scans). It must agree with
+# fs.match on every path.
+test.case("the compiled exclude matcher agrees with fs.match", fn() {
+    pats = ["**/node_modules/**", "**/*.tmp", "**/.playwright-mcp**", "/home/*/cache/?.log", "**/a+b (1).[ch]", r"**/x.{y}", r"**/back\slash", "**/^$|"]
+    paths = [
+        "/r/node_modules/x/y.js", "/r/node_modules", "/r/sub/file.tmp", "/r/file.tmpx", "/r/.playwright-mcp-1/z",
+        "/home/sean/cache/a.log", "/home/sean/cache/ab.log", "/home/a/b/cache/a.log", "/r/a+b (1).c", "/r/a+b (1).h",
+        "/r/aab (1).c", r"/r/x.{y}", "/r/x.y", r"/r/back\slash", "/r/^$|", "/r/ünï ✓.tmp", "/r/plain.txt",
+    ]
+    m = scanner.matcher(pats)
+    for p in paths {
+        test.eq([p, m(p)], [p, any(pats, fn(x) fs.match(p, x))])
+    }
+    test.eq(scanner.matcher([])("/anything"), false)
+})
+
+# Wide enough that the scan hands subtrees to parallel workers. The merged
+# result must be exactly what one walk would find.
+test.case("a wide tree scans completely, deep problems included", fn() {
+    root = fs.join(fs.temp_dir(), "wide")
+    mut want = []
+    for i in 0..300 {
+        d = "d{i}/inner"
+        fs.mkdir(fs.join(root, d))
+        fs.write(fs.join(root, d + "/f.txt"), "x")
+        fs.write(fs.join(root, d + "/skip.tmp"), "x")
+        want = push(want, d + "/f.txt")
+    }
+    fs.mkdir(fs.join(root, "d77/inner/node_modules/pkg"))
+    fs.write(fs.join(root, "d77/inner/node_modules/pkg/i.js"), "x")
+    fs.mkdir(fs.join(root, "d120/inner/locked"))
+    fs.chmod(fs.join(root, "d120/inner/locked"), "000")
+    proc.run("mkfifo", [fs.join(root, "d33/inner/fifo")])
+    r = scanner.scan(job(root, {}))
+    fs.chmod(fs.join(root, "d120/inner/locked"), "755")
+    test.eq(rel(root, r.entries), sort(want))
+    test.eq(r.protected, [fs.join(root, "d120/inner/locked")])
+    test.eq(r.skipped, 1)
+    test.eq(len(r.problems), 1)
+})

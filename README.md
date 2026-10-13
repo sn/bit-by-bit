@@ -57,7 +57,7 @@ config shows up as repeated errors in the journal, not as a stopped service.
 | Follow the log | `journalctl -u bit-by-bit -f` (also written to `/var/log/bit-by-bit/bit-by-bit.log`) |
 | Apply config changes | `sudo systemctl reload bit-by-bit` |
 | Back up now | `sudo bit-by-bit run home`. A run holds `job-<name>.lock` in `state_dir`, so it never overlaps the daemon's run of the same job. |
-| Stop it | `sudo systemctl stop bit-by-bit`. It finishes the current batch, waiting up to 60 seconds. |
+| Stop it | `sudo systemctl stop bit-by-bit`. Uploads already started finish; nothing new starts. It waits up to 60 seconds. |
 | Turn it off | `sudo systemctl disable --now bit-by-bit` |
 
 ## Configure
@@ -86,9 +86,10 @@ See `deploy/config.example.json`. The full field reference is in
 - **Changing `prefix` or the destination** uploads everything to the new place.
   Objects under the old prefix are left alone; delete them yourself if you no
   longer want them.
-- **Concurrency:** uploads run in batches of `concurrency` files (default 4,
-  up to 32), and each batch waits for its slowest file. Raise it for trees of
-  many small files.
+- **Concurrency:** `concurrency` workers (default 4, up to 32) each take the
+  next file as soon as they finish one, so a large file holds up only its own
+  worker. Raise it for trees of many small files. The scan before the uploads
+  also runs in parallel for large trees (except with `follow_symlinks`).
 
 ### AWS S3 setup
 

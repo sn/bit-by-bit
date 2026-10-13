@@ -259,17 +259,39 @@ export fn run_job(ctx) {
         for a in p.actions { ctx.log("info", "would " + a.op, { path: a.path }) }
         return merge(totals, { status: "ok", error: null })
     }
-    mut stopped = false
-    for batch in chunk(p.actions, ctx.cfg.concurrency) {
-        if ctx.should_stop() {
-            stopped = true
-            break
+    mut fatal = null
+    # A worker pool: each worker takes the next action as soon as it finishes
+    # one, so a large file holds up only its own worker. Results are recorded
+    # here, one at a time, as they arrive. A fatal error or a shutdown request
+    # stops workers taking new actions; ones already started finish and are
+    # recorded.
+    todo = channel()
+    for a in p.actions { send(todo, a) }
+    close(todo)
+    results = channel()
+    halt = cell(ctx.should_stop())
+    async fn worker() {
+        for a in todo {
+            if cell_get(halt) { break }
+            send(results, execute(ctx, a))
         }
-        results = if len(batch) == 1 { [execute(ctx, batch[0])] } else { pmap(batch, fn(a) execute(ctx, a)) }
-        for r in results { totals = record(ctx, totals, r) }
-        fatal = find(results, fn(r) r.op == "fatal")
-        if fatal != null { error({ kind: "job_fatal", message: fatal.message, totals: totals }) }
     }
+    workers = map(0..min([ctx.cfg.concurrency, max([len(p.actions), 1])]), fn(i) worker())
+    async fn close_when_done() {
+        for w in workers { await w }
+        close(results)
+    }
+    closer = close_when_done()
+    mut done = 0
+    for r in results {
+        done = done + 1
+        totals = record(ctx, totals, r)
+        if r.op == "fatal" and fatal == null { fatal = r }
+        if fatal != null or ctx.should_stop() { cell_set(halt, true) }
+    }
+    await closer
+    if fatal != null { error({ kind: "job_fatal", message: fatal.message, totals: totals }) }
+    stopped = done < len(p.actions)
     if stopped {
         return merge(totals, { status: "failed", error: "stopped before finishing (shutdown requested)" })
     }

@@ -168,6 +168,20 @@ test.case("large files use multipart; stale uploads are aborted", fn() {
     test.ok(contains(fake_s3.requests(), "DELETE pc/stale"), "stale upload aborted")
 })
 
+test.case("a slow upload doesn't hold up the files after it", fn() {
+    env = setup()
+    fs.write(fs.join(env.root, "big.bin"), "slow")
+    for i in 0..6 { fs.write(fs.join(env.root, "f{i}.txt"), "fast {i}") }
+    fake_s3.delay("big.bin", 500)
+    o = run(env)
+    test.eq([o.status, o.uploaded], ["ok", 9])
+    # concurrency is 2. In fixed batches only the slow file's batch-mate can
+    # start while it uploads; with a worker pool the other worker keeps going.
+    held = fake_s3.overlaps_()
+    test.eq(len(held), 1)
+    test.ok(held[0] >= 4, "requests that started during the slow upload: {held[0]}")
+})
+
 test.case("dry run changes nothing", fn() {
     env = setup()
     o = sync.run(ctx(env, { dry_run: true }))

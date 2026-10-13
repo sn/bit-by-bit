@@ -1,25 +1,43 @@
 import std.fs
+import std.re
 
-fn excluded(path, patterns) = any(patterns, fn(p) fs.match(path, p))
+# fs.match's glob syntax as a regex, the same conversion it does itself
+# (core/crates/ecko-std/src/fs.rs fnmatch_to_regex): * is .* (it crosses /),
+# ? is one character, [...] is a class, and the rest is literal.
+let GLOB_ESCAPE = [".", "(", ")", "+", "|", "^", "$", r"{", r"}", "\\"]
+fn glob_regex(pat) = "^" + join(map(chars(pat), fn(c) if c == "*" { ".*" } else if c == "?" { "." } else if contains(GLOB_ESCAPE, c) { "\\" + c } else { c }), "") + "$"
+
+## A function that tells whether a path matches any of `patterns`, with
+## fs.match semantics. fs.match compiles its pattern on every call; this
+## builds one regex, which std.re compiles once and caches, so a scan of
+## hundreds of thousands of paths stays fast.
+export fn matcher(patterns) {
+    if len(patterns) == 0 { return fn(path) false }
+    combined = join(map(patterns, fn(p) "(?:" + glob_regex(p) + ")"), "|")
+    fn(path) re.test(combined, path)
+}
 
 # A directory is pruned when it matches a pattern, or when a "/**" pattern
 # matches the directory itself (so "**/node_modules/**" skips the whole tree).
-fn pruned(dir, patterns) = any(patterns, fn(p) fs.match(dir, p) or (ends_with(p, "/**") and fs.match(dir, p[..len(p) - 3])))
+fn prune_patterns(patterns) = patterns + map(filter(patterns, fn(p) ends_with(p, "/**")), fn(p) p[..len(p) - 3])
 
-## Scan a job's paths. Never raises for filesystem problems; returns
-## {
-##   entries:   [{ path, kind: "file" | "symlink", size, mtime, target }]
-##   problems:  [String]           - things that make the run "partial"
-##   protected: [String]           - roots/dirs that could not be read; nothing
-##                                   under them may be deleted remotely
-##   skipped:   Int                - special files (fifo, socket, device)
-## }
-export fn scan(job) {
+# Directories queued before the scan splits the rest of the tree across
+# parallel workers, and how many directories each worker takes at a time.
+let SPLIT_AT = 256
+let SPLIT_CHUNK = 8
+
+fn empty_result(seen) = { entries: [], problems: [], protected: [], skipped: 0, pending: [], seen: seen }
+
+# Walk breadth-first from `dirs`, classifying everything below them. With
+# `limit`, stop once that many directories are waiting and return them
+# unvisited in `pending`. `seen` holds the real paths of linked directories
+# already entered (follow_symlinks only), so a loop is entered once.
+fn walk(dirs, job, excluded, pruned, limit, seen_in) {
     mut entries = []
     mut problems = []
     mut protected = []
     mut skipped = 0
-    mut seen_dirs = {}
+    mut seen = seen_in
 
     fn add_file(path) {
         try {
@@ -40,16 +58,16 @@ export fn scan(job) {
         }
     }
 
-    # Classify one non-root path; directories are returned for the caller to
-    # queue rather than walked recursively.
+    # Classify one path below a directory; a directory is returned for the
+    # caller to queue rather than walked recursively.
     fn visit(path) {
-        if excluded(path, job.exclude) { return null }
+        if excluded(path) { return null }
         if fs.is_symlink(path) and not job.follow_symlinks {
             add_link(path)
             return null
         }
         if fs.is_dir(path) {
-            if pruned(path, job.exclude) { null } else { path }
+            if pruned(path) { null } else { path }
         } else if fs.is_file(path) {
             add_file(path)
             null
@@ -63,52 +81,105 @@ export fn scan(job) {
         }
     }
 
+    # The queue only grows and a cursor walks it: pop() and take() copy the
+    # list, which is quadratic.
+    mut queue = dirs
+    mut i = 0
+    while i < len(queue) {
+        if limit != null and len(queue) - i >= limit { break }
+        dir = queue[i]
+        i = i + 1
+        # Loops can only enter through a symlink, so only start directories
+        # and linked directories are remembered (set() copies the map per call).
+        if job.follow_symlinks and (i <= len(dirs) or fs.is_symlink(dir)) {
+            real = try { fs.canonical(dir) } catch (e) { dir }
+            if has(seen, real) { continue }
+            seen = set(seen, real, true)
+        }
+        children = try { fs.list_dir(dir) } catch (e) {
+            problems = push(problems, "{dir}: unreadable directory: " + string(get(e, "message")))
+            protected = push(protected, dir)
+            null
+        }
+        if children == null { continue }
+        for name in sort(children) {
+            sub = visit(fs.join(dir, name))
+            if sub != null { queue = push(queue, sub) }
+        }
+    }
+    { entries: entries, problems: problems, protected: protected, skipped: skipped, pending: drop(queue, i), seen: seen }
+}
+
+fn merge_results(a, b) = {
+    entries: a.entries + b.entries, problems: a.problems + b.problems, protected: a.protected + b.protected,
+    skipped: a.skipped + b.skipped, pending: a.pending + b.pending, seen: a.seen,
+}
+
+## Scan a job's paths. Never raises for filesystem problems; returns
+## {
+##   entries:   [{ path, kind: "file" | "symlink", size, mtime, target }]
+##   problems:  [String]           - things that make the run "partial"
+##   protected: [String]           - roots/dirs that could not be read; nothing
+##                                   under them may be deleted remotely
+##   skipped:   Int                - special files (fifo, socket, device)
+## }
+## A large tree is walked a few levels deep on this thread, then the rest is
+## split across parallel workers. With follow_symlinks the whole scan stays on
+## one thread, because loop detection needs one shared record of what it entered.
+export fn scan(job) {
+    excluded = matcher(job.exclude)
+    pruned = matcher(prune_patterns(job.exclude))
+    limit = if job.follow_symlinks { null } else { SPLIT_AT }
+    mut out = empty_result({})
+
+    fn note(msg, path) { out = merge_results(out, merge(empty_result(out.seen), { problems: [msg], protected: [path] })) }
+
     for root in job.paths {
         unless fs.exists(root) or fs.is_symlink(root) {
-            problems = push(problems, "{root}: path does not exist")
-            protected = push(protected, root)
+            note("{root}: path does not exist", root)
             continue
         }
         if not fs.is_dir(root) or (fs.is_symlink(root) and not job.follow_symlinks) {
             if fs.is_symlink(root) and not job.follow_symlinks {
-                add_link(root)
+                out = merge_results(out, root_link(root))
             } else if fs.is_file(root) {
-                add_file(root)
+                out = merge_results(out, root_file(root))
             } else {
                 # A followed link to a missing target, or a special file:
                 # nothing to back up, and nothing under it may be deleted.
-                problems = push(problems, "{root}: not a readable file or directory")
-                protected = push(protected, root)
+                note("{root}: not a readable file or directory", root)
             }
             continue
         }
-        # Breadth-first over directories. The queue only grows and a cursor
-        # walks it: pop() and take() copy the list, which is quadratic.
-        mut queue = [root]
-        mut i = 0
-        while i < len(queue) {
-            dir = queue[i]
-            i = i + 1
-            # Loops can only enter through a symlink, so only roots and linked
-            # directories are remembered (set() copies the map per call).
-            if job.follow_symlinks and (dir == root or fs.is_symlink(dir)) {
-                real = try { fs.canonical(dir) } catch (e) { dir }
-                if has(seen_dirs, real) { continue }
-                seen_dirs = set(seen_dirs, real, true)
-            }
-            children = try { fs.list_dir(dir) } catch (e) {
-                problems = push(problems, "{dir}: unreadable directory: " + string(get(e, "message")))
-                protected = push(protected, dir)
-                null
-            }
-            if children == null { continue }
-            for name in sort(children) {
-                sub = visit(fs.join(dir, name))
-                if sub != null { queue = push(queue, sub) }
-            }
+        r = walk([root], job, excluded, pruned, limit, out.seen)
+        out = merge_results(out, set(r, "pending", []))
+        if len(r.pending) > 0 {
+            parts = pmap(chunk(r.pending, SPLIT_CHUNK), fn(ds) walk(ds, job, excluded, pruned, null, {}))
+            for part in parts { out = merge_results(out, part) }
         }
     }
-    { entries: sort_by(entries, fn(e) e.path), problems: problems, protected: protected, skipped: skipped }
+    {
+        entries: sort_by(out.entries, fn(e) e.path), problems: sort(out.problems),
+        protected: sort(out.protected), skipped: out.skipped,
+    }
+}
+
+fn root_file(path) {
+    r = empty_result({})
+    try {
+        set(r, "entries", [{ path: path, kind: "file", size: fs.size(path), mtime: fs.modified(path), target: null }])
+    } catch (e) {
+        merge(r, { problems: ["{path}: " + string(get(e, "message"))], protected: [path] })
+    }
+}
+
+fn root_link(path) {
+    r = empty_result({})
+    try {
+        set(r, "entries", [{ path: path, kind: "symlink", size: 0, mtime: 0, target: fs.canonical(path) }])
+    } catch (e) {
+        merge(r, { problems: ["{path}: broken symlink"], protected: [path] })
+    }
 }
 
 ## True when `path` is one of `dirs` or inside one of them.

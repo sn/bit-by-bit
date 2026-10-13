@@ -21,6 +21,8 @@ let log_ = cell([])          # ["METHOD key", ...] for every request that reache
 let page_size = cell(1000)
 let next_id = cell(0)
 let copy_limit = cell(0)     # >0: plain CopyObject of a larger source fails, like S3 over 5 GiB
+let delays = cell([])        # [{ key_contains, ms }]: hold matching requests this long
+let overlaps = cell([])      # per delayed request: how many other requests arrived while it was held
 
 fn xml_error(status, code) = http.response(status, "<Error><Code>{code}</Code><Message>{code}</Message></Error>", headers: { "content-type": "application/xml" })
 
@@ -78,6 +80,12 @@ fn handle(req) {
     bucket = segs[0]
     key = join(drop(segs, 1), "/")
     cell_update(log_, fn(l) push(l, req.method + " " + key))
+    d = find(cell_get(delays), fn(x) contains(key, x.key_contains))
+    if d != null {
+        arrived = len(cell_get(log_))
+        sleep(d.ms)
+        cell_update(overlaps, fn(o) push(o, len(cell_get(log_)) - arrived))
+    }
     f = take_fault(req.method, key)
     if f != null { return xml_error(f.status, f.code) }
     # Real S3 refuses a PUT or POST without content-length, even an empty one.
@@ -196,12 +204,20 @@ export fn reset() {
     cell_set(log_, [])
     cell_set(page_size, 1000)
     cell_set(copy_limit, 0)
+    cell_set(delays, [])
+    cell_set(overlaps, [])
 }
 
 ## Fail the next `times` requests whose method matches ("*" for any) and whose
 ## key contains `key_contains`, answering `status` with S3 error `code`.
 export fn fail_next(method, key_contains, status, code, times) =
     cell_update(faults, fn(f) push(f, { method: method, key_contains: key_contains, status: status, code: code, times: times }))
+
+## Hold every request whose key contains `key_contains` for `ms` before
+## answering it, like a large upload on a slow link.
+export fn delay(key_contains, ms) = cell_update(delays, fn(d) push(d, { key_contains: key_contains, ms: ms }))
+## For each delayed request, the number of other requests that arrived while it was held.
+export fn overlaps_() = cell_get(overlaps)
 
 export fn set_page_size(n) = cell_set(page_size, n)
 export fn set_copy_limit(n) = cell_set(copy_limit, n)
