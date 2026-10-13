@@ -82,6 +82,17 @@ test.case("the page uses the full width", fn() {
     test.ok(not contains(http.get(url("/")).body, "max-width: 60rem"), "no narrow column")
 })
 
+test.case("the favicon carries the overall health", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    ok = http.get(url("/")).body
+    test.ok(contains(ok, "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,"), "inline svg icon")
+    test.ok(contains(ok, "%233fb950"), "green newest bit when healthy")
+    record("home", "r2", time.now() - 60000, "failed", [], "boom")
+    bad = http.get(url("/")).body
+    test.ok(contains(bad, "%23f85149") and not contains(bad, "%233fb950"), "red newest bit when not")
+})
+
 test.case("the tab title carries the overall health", fn() {
     reset()
     record("home", "r1", time.now() - H, "ok", [], null)

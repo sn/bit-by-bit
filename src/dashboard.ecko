@@ -292,6 +292,7 @@ let SCRIPT = r"""
       open.forEach(function (id) { var d = document.getElementById(id); if (d) d.open = true; });
       if (focused) { var f = document.getElementById(focused); if (f) f.focus({ preventScroll: true }); }
       document.title = next.title;
+      document.getElementById('favicon').href = next.getElementById('favicon').href;
       document.getElementById('updated').textContent = next.getElementById('updated').textContent;
       conn.textContent = '';
     }).catch(function () {
@@ -301,6 +302,25 @@ let SCRIPT = r"""
   setInterval(update, REFRESH_MS);
 })();
 """
+
+# The tab icon: bits stacking up in three columns, one more each time, which
+# is what an incremental backup does. The newest bit, top right, shows the
+# overall health, so a background tab still tells you whether to look.
+let ICON_OK = "#3fb950"
+let ICON_BAD = "#f85149"
+
+fn favicon(healthy) {
+    bit = fn(x, y, fill, opacity) "<rect x='{x}' y='{y}' width='7' height='7' rx='1.75' fill='{fill}' fill-opacity='{opacity}'/>"
+    newest = if healthy { ICON_OK } else { ICON_BAD }
+    svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>" +
+        "<defs><linearGradient id='g' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='#2f81f7'/><stop offset='1' stop-color='#0a3d91'/></linearGradient></defs>" +
+        "<rect width='32' height='32' rx='7' fill='url(#g)'/>" +
+        bit("3.5", "21.5", "#fff", "0.55") +
+        bit("12.5", "21.5", "#fff", "0.75") + bit("12.5", "12.5", "#fff", "0.75") +
+        bit("21.5", "21.5", "#fff", "1") + bit("21.5", "12.5", "#fff", "1") + bit("21.5", "3.5", newest, "1") +
+        "</svg>"
+    "data:image/svg+xml," + replace(svg, "#", "%23")
+}
 
 ## The dashboard page for a snapshot.
 export fn render_html(snap) {
@@ -314,6 +334,7 @@ export fn render_html(snap) {
     script = replace(SCRIPT, "REFRESH_MS", string(REFRESH_SECONDS * 1000))
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+        "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"" + favicon(snap.healthy) + "\">" +
         "<title>bit-by-bit: " + health_text + "</title><style>" + CSS + "</style></head><body>" +
         "<header class=\"topbar\"><div class=\"brand\"><h1>bit-by-bit</h1>" + overall + "</div>" +
         "<p class=\"sub\"><span id=\"updated\">daemon up " + esc(dur_text(snap.daemon.uptime_ms)) + " (since " + esc(at_text(snap.daemon.started_at)) +
