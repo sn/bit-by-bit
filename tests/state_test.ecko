@@ -1,7 +1,6 @@
 import std.test
 import std.fs
 import "../src/state.ecko"
-import "../src/util.ecko"
 
 fn fresh() = state.open(fs.join(fs.temp_dir(), "state"))
 
@@ -26,12 +25,12 @@ test.case("index put, touch, remove, per job", fn() {
     state.put_file(db, "home", { path: "/b", size: 3, mtime: 4, sha256: "h2", kind: "symlink" })
     state.put_file(db, "other", { path: "/a", size: 9, mtime: 9, sha256: "h9", kind: "file" })
     state.touch_file(db, "home", "/a", 50)
-    test.eq(util.lookup(state.index(db, "home"), "/a"), { path: "/a", size: 1, mtime: 50, sha256: "h1", kind: "file" })
+    test.eq(get(state.index(db, "home"), "/a"), { path: "/a", size: 1, mtime: 50, sha256: "h1", kind: "file" })
     state.remove_file(db, "home", "/b")
     test.eq(keys(state.index(db, "home")), ["/a"])
-    test.eq(util.lookup(state.index(db, "other"), "/a").sha256, "h9")
+    test.eq(get(state.index(db, "other"), "/a").sha256, "h9")
     state.put_file(db, "home", { path: "/a", size: 7, mtime: 8, sha256: "new", kind: "file" })
-    test.eq(util.lookup(state.index(db, "home"), "/a").sha256, "new")
+    test.eq(get(state.index(db, "home"), "/a").sha256, "new")
 })
 
 test.case("replace_index swaps a job's rows atomically", fn() {

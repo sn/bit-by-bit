@@ -2,5 +2,7 @@
   "version": "0.1.0",
   "entrypoint": "main.ecko",
   "capabilities": [],
-  "dependencies": {}
+  "dependencies": {
+    "xml": "github.com/ecko-lang/xml@0.38.0"
+  }
 }

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "packages": {
+    "github.com/ecko-lang/xml": {
+      "source": "https://codeload.github.com/ecko-lang/xml/zip/refs/tags/v0.38.0",
+      "version": "0.38.0",
+      "dependencies": {}
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "module": "github.com/ecko-lang/xml",
+  "version": "0.38.0",
+  "ecko": "0.65.0",
+  "entrypoint": "main.ecko",
+  "description": "An XML parser for Ecko: parse to a node tree with entities and CDATA decoded, query by tag or path, extract text, and rebuild. Malformed input throws a parse error with a position. Pure - no capabilities.",
+  "author": "Sean Nieuwoudt <sean@underwulf.com>",
+  "license": "MIT",
+  "capabilities": [],
+  "dependencies": {}
+}

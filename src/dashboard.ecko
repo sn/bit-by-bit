@@ -1,0 +1,179 @@
+import std.http
+import std.sql
+import std.fs
+import std.bg
+import std.time
+import "./state.ecko"
+import "./scheduler.ecko"
+import "./status.ecko"
+
+let RECENT_RUNS = 10
+let REFRESH_SECONDS = 30
+let DAY = 86400000
+
+## A connection to the state database that refuses writes (SQLite
+## `query_only`): the dashboard only ever reads.
+export fn open_readonly(state_dir) {
+    db = sql.open(fs.join(state_dir, "state.db"))
+    sql.query(db, "pragma query_only = 1")
+    db
+}
+
+fn interval_ms(schedule) = if schedule.kind == "every" { schedule.ms } else { DAY }
+
+fn duration(r) = if r.finished_at == null { null } else { r.finished_at - r.started_at }
+
+fn run_view(r) = {
+    id: r.id, status: r.status, started_at: r.started_at, finished_at: r.finished_at,
+    duration_ms: duration(r), uploaded: r.uploaded, replaced: r.replaced, deleted: r.deleted,
+    pruned: r.pruned, bytes: r.bytes, problem_count: r.problems, error: r.error,
+}
+
+fn job_view(job, db, now) {
+    runs = state.recent_runs(db, job.name, RECENT_RUNS)
+    last = first(runs)
+    last_ms = if last == null { null } else { last.started_at }
+    overdue = last != null and last.status != "running" and now - last.started_at > 2 * interval_ms(job.schedule)
+    {
+        job: job.name,
+        status: if last == null { "never run" } else { last.status },
+        started_at: last_ms,
+        finished_at: if last == null { null } else { last.finished_at },
+        next_due: scheduler.next_due(job.schedule, last_ms, now, scheduler.local_offset_ms(now)),
+        overdue: overdue,
+        uploaded: if last == null { 0 } else { last.uploaded },
+        replaced: if last == null { 0 } else { last.replaced },
+        deleted: if last == null { 0 } else { last.deleted },
+        pruned: if last == null { 0 } else { last.pruned },
+        bytes: if last == null { 0 } else { last.bytes },
+        error: if last == null { null } else { last.error },
+        problems: if last == null { [] } else { last.problem_list },
+        runs: map(runs, run_view),
+    }
+}
+
+## Why the backups are unhealthy: { ok: Bool, reasons: [String] }. A job is
+## unhealthy when its last run failed, or when it has not started a run for
+## more than twice its interval.
+export fn health(snap) {
+    mut reasons = []
+    for j in snap.jobs {
+        if j.status == "failed" { reasons = push(reasons, "{j.job}: last run failed") }
+        if j.overdue { reasons = push(reasons, "{j.job}: overdue (no run for more than twice its interval)") }
+    }
+    { ok: len(reasons) == 0, reasons: reasons }
+}
+
+## Everything the dashboard shows, as plain data.
+export fn snapshot(cfg, db, now, started_at) {
+    jobs = map(cfg.jobs, fn(job) job_view(job, db, now))
+    base = { daemon: { started_at: started_at, uptime_ms: now - started_at, now: now }, jobs: jobs }
+    h = health(base)
+    merge(base, { healthy: h.ok, reasons: h.reasons })
+}
+
+# ---- HTML ------------------------------------------------------------------------
+
+fn esc(v) = escape_html(string(v ?? ""))
+
+fn at_text(ms) = if ms == null { "-" } else { time.format_local(ms, "%Y-%m-%d %H:%M") }
+
+fn dur_text(ms) {
+    if ms == null { return "-" }
+    secs = int(ms / 1000)
+    if secs < 60 { "{secs}s" } else if secs < 3600 { string(int(secs / 60)) + "m " + string(secs % 60) + "s" } else { string(int(secs / 3600)) + "h " + string(int(secs % 3600 / 60)) + "m" }
+}
+
+fn badge(s) {
+    cls = match s { "ok" => "ok" "partial" => "warn" "running" => "info" "never run" => "muted" _ => "bad" }
+    "<span class=\"badge " + cls + "\">" + esc(s) + "</span>"
+}
+
+fn job_card(j, now) {
+    due = if j.next_due <= now { "now" } else { at_text(j.next_due) }
+    overdue = if j.overdue { " <span class=\"badge bad\">overdue</span>" } else { "" }
+    err = if j.error == null { "" } else { "<p class=\"error\">" + esc(j.error) + "</p>" }
+    probs = if len(j.problems) == 0 { "" } else {
+        items = join(map(take(j.problems, 5), fn(p) "<li>" + esc(p) + "</li>"), "")
+        more = if len(j.problems) > 5 { "<li>... and " + string(len(j.problems) - 5) + " more</li>" } else { "" }
+        "<ul class=\"problems\">" + items + more + "</ul>"
+    }
+    rows = join(map(j.runs, fn(r) "<tr><td>" + esc(at_text(r.started_at)) + "</td><td>" + badge(r.status) +
+        "</td><td>" + esc(dur_text(r.duration_ms)) + "</td><td>" + esc(r.uploaded) + " / " + esc(r.replaced) + " / " +
+        esc(r.deleted) + "</td><td>" + esc(status.size_text(r.bytes)) + "</td><td>" + esc(r.problem_count) + "</td></tr>"), "")
+    table = if len(j.runs) == 0 { "" } else {
+        "<table><thead><tr><th>started</th><th>status</th><th>took</th><th>up / repl / del</th><th>data</th><th>problems</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    }
+    "<section class=\"card\"><h2>" + esc(j.job) + " " + badge(j.status) + overdue + "</h2>" +
+        "<p class=\"meta\">last run " + esc(at_text(j.started_at)) + " &middot; next " + esc(due) +
+        " &middot; uploaded " + esc(j.uploaded) + ", replaced " + esc(j.replaced) + ", deleted " + esc(j.deleted) +
+        ", pruned " + esc(j.pruned) + ", " + esc(status.size_text(j.bytes)) + "</p>" + err + probs + table + "</section>"
+}
+
+let CSS = r"""
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 960px; padding: 24px; color: #1f2328; background: #f6f8fa; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: #59636e; margin: 0 0 20px; }
+    .card { background: #fff; border: 1px solid #d1d9e0; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 18px; margin: 0 0 4px; }
+    .meta { color: #59636e; margin: 0 0 8px; }
+    .badge { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 10px; vertical-align: middle; }
+    .ok { background: #dafbe1; color: #1a7f37; } .warn { background: #fff8c5; color: #9a6700; }
+    .bad { background: #ffebe9; color: #cf222e; } .info { background: #ddf4ff; color: #0969da; } .muted { background: #eff2f5; color: #59636e; }
+    .error { color: #cf222e; margin: 4px 0; word-break: break-word; }
+    .problems { margin: 4px 0 8px; padding-left: 20px; color: #9a6700; word-break: break-word; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { text-align: left; padding: 4px 8px; border-top: 1px solid #eff2f5; }
+    th { color: #59636e; font-weight: 600; }
+"""
+
+## The dashboard page for a snapshot.
+export fn render_html(snap) {
+    now = snap.daemon.now
+    overall = if snap.healthy { badge("ok") } else { "<span class=\"badge bad\">attention</span>" }
+    reasons = if snap.healthy { "" } else { "<ul class=\"problems\">" + join(map(snap.reasons, fn(r) "<li>" + esc(r) + "</li>"), "") + "</ul>" }
+    cards = join(map(snap.jobs, fn(j) job_card(j, now)), "")
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+        "<meta http-equiv=\"refresh\" content=\"{REFRESH_SECONDS}\">" +
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+        "<title>bit-by-bit</title><style>" + CSS + "</style></head><body>" +
+        "<h1>bit-by-bit " + overall + "</h1>" +
+        "<p class=\"sub\">daemon up " + esc(dur_text(snap.daemon.uptime_ms)) + " (since " + esc(at_text(snap.daemon.started_at)) +
+        ") &middot; updated " + esc(at_text(now)) + "</p>" + reasons + cards + "</body></html>"
+}
+
+# ---- HTTP ------------------------------------------------------------------------
+
+## Answer one request. cfg_cell holds the live config (updated on reload).
+export fn handle(req, cfg_cell, db, started_at) {
+    unless req.method == "GET" or req.method == "HEAD" { return http.response(405, "method not allowed", headers: { allow: "GET, HEAD" }) }
+    snap = snapshot(cell_get(cfg_cell), db, time.now(), started_at)
+    match req.path {
+        "/" => http.html(render_html(snap))
+        "/api/status" => http.json(snap)
+        "/healthz" => {
+            h = health(snap)
+            if h.ok { http.text("ok\n") } else { http.response(503, join(h.reasons, "\n") + "\n", headers: { "content-type": "text/plain; charset=utf-8" }) }
+        }
+        _ => http.not_found()
+    }
+}
+
+## Start the dashboard in the background and return the port it bound.
+## Raises { kind: "dashboard", message } if the server cannot start (for
+## example, the port is taken).
+export fn start(cfg_cell, state_dir, started_at) {
+    d = cell_get(cfg_cell).dashboard
+    db = open_readonly(state_dir)
+    task = bg.spawn(fn() http.serve(d.port, fn(req) handle(req, cfg_cell, db, started_at), host: d.host))
+    for i in 0..250 {
+        p = http.port()
+        if p != null { return p }
+        if bg.status(task) == "failed" {
+            msg = try { bg.result(task) } catch (e) { string(get(e, "message") ?? e) }
+            error({ kind: "dashboard", message: "dashboard could not start on {d.host}:{d.port}: {msg}" })
+        }
+        sleep(20)
+    }
+    error({ kind: "dashboard", message: "dashboard did not start on {d.host}:{d.port} within 5s" })
+}

@@ -114,7 +114,21 @@ test.case("mode and mtime are restored", fn() {
     restore.restore(CLIENT, env.job, o)
     out = o.to + p
     test.eq(fs.mode(out), "640")
-    test.eq(int(fs.modified(out) / 1000), int(fs.modified(p) / 1000))
+    test.eq(fs.modified(out), fs.modified(p))
+})
+
+test.case("a file name that is not valid UTF-8 backs up and restores", fn() {
+    env = setup()
+    # U+F7FF is how Ecko spells the raw byte 0xFF in a file name.
+    name = "bad\u{F7FF}name.txt"
+    fs.write(fs.join(env.root, name), "raw")
+    test.eq(fs.list_dir(env.root), [name])
+    run_at(env, T0)
+    o = opts({})
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq(r.failed, [])
+    test.eq(fs.list_dir(o.to + env.root), [name])
+    test.eq(read_out(o, env, name), "raw")
 })
 
 test.case("--at older than history is refused", fn() {

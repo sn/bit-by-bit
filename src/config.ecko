@@ -4,7 +4,9 @@ import std.os
 import std.re
 import "./duration.ecko"
 
-let TOP_KEYS = ["state_dir", "log", "destinations", "jobs", "retry", "concurrency", "multipart_threshold", "multipart_part_size"]
+let TOP_KEYS = ["state_dir", "log", "destinations", "jobs", "retry", "concurrency", "multipart_threshold", "multipart_part_size", "dashboard"]
+let DASHBOARD_KEYS = ["listen", "allow_remote"]
+let LOOPBACK = ["127.0.0.1", "localhost", "::1"]
 let LOG_KEYS = ["level", "file"]
 let DEST_KEYS = ["provider", "endpoint", "region", "bucket", "credentials_file", "server_side_encryption", "path_style", "allow_insecure"]
 let JOB_KEYS = ["name", "destination", "prefix", "paths", "exclude", "schedule", "keep_versions_days", "follow_symlinks"]
@@ -234,6 +236,31 @@ export fn validate(raw) {
         }
     }
 
+    # dashboard (optional)
+    mut dashboard = null
+    if has(raw, "dashboard") {
+        d = raw.dashboard
+        if not is_map(d) {
+            err("$.dashboard", "must be an object")
+        } else {
+            unknown_keys(d, DASHBOARD_KEYS, "$.dashboard")
+            allow_remote = want_bool(d, "allow_remote", "$.dashboard", false)
+            listen = want_string(d, "listen", "$.dashboard", true)
+            caps = if listen == null { null } else { re.captures(r"^(\[[0-9a-fA-F:]+\]|[^:]+):(\d+)$", listen) }
+            if listen != null and caps == null {
+                err("$.dashboard.listen", "must be host:port, e.g. 127.0.0.1:8484")
+            } else if caps != null {
+                host = replace(replace(caps[1], "[", ""), "]", "")
+                port = int(caps[2])
+                if port > 65535 { err("$.dashboard.listen", "port must be 0-65535") }
+                unless contains(LOOPBACK, host) or allow_remote {
+                    err("$.dashboard.listen", "{host} is not a loopback address - the dashboard has no login, so set allow_remote: true to expose it deliberately")
+                }
+                dashboard = { host: host, port: port, allow_remote: allow_remote }
+            }
+        }
+    }
+
     part_size = parsed("$.multipart_part_size", fn() duration.parse_size(opt(raw, "multipart_part_size", "16MiB")), 16777216)
     if part_size < 5242880 { err("$.multipart_part_size", "must be at least 5MiB") }
 
@@ -246,6 +273,7 @@ export fn validate(raw) {
         concurrency: want_int(raw, "concurrency", "$", 4, 1, 32),
         multipart_threshold: parsed("$.multipart_threshold", fn() duration.parse_size(opt(raw, "multipart_threshold", "64MiB")), 67108864),
         multipart_part_size: part_size,
+        dashboard: dashboard,
     }
     { config: config, errors: errors, warnings: warnings }
 }

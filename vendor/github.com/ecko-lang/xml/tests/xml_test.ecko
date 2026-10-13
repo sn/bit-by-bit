@@ -1,0 +1,307 @@
+# Tests for the xml package - offline, deterministic.
+import std.test
+import "../main.ecko"
+xml = main
+
+RSS = "<rss><channel><title>News</title><item><title>A</title></item><item><title>B</title></item></channel></rss>"
+
+# Tree builders, for spelling out expected trees.
+fn el(tag, attrs, kids) = { tag: tag, attrs: attrs, children: kids }
+
+fn tx(s) = { tag: "#text", text: s }
+
+fn root(kids) = el("#root", {}, kids)
+
+# The error a call throws, or null when it does not throw.
+fn caught(f) {
+    try {
+        f()
+        null
+    } catch (e) { e }
+}
+
+# ---- what 0.37 already did, unchanged ----------------------------------------
+
+test.case("find by tag returns all descendants", fn() {
+    doc = xml.parse(RSS)
+    test.eq(len(xml.find(doc, "item")), 2)
+})
+
+test.case("find by path navigates children", fn() {
+    doc = xml.parse(RSS)
+    items = xml.find(doc, "channel/item")
+    test.eq(len(items), 2)
+    test.eq(xml.text(xml.find(items[0], "title")[0]), "A")
+})
+
+test.case("attributes, case-sensitive", fn() {
+    doc = xml.parse("<Note id=\"1\" Lang=\"en\">hi</Note>")
+    note = xml.find(doc, "Note")[0]
+    test.eq(note.tag, "Note")
+    test.eq(xml.attr(note, "id"), "1")
+    test.eq(xml.attr(note, "Lang"), "en")
+    test.eq(xml.attr(note, "lang"), null)  # case matters
+})
+
+test.case("text content concatenates", fn() {
+    doc = xml.parse("<a><b>x</b><b>y</b></a>")
+    test.eq(xml.text(doc), "xy")
+})
+
+test.case("self-closing elements", fn() {
+    doc = xml.parse("<root><br/><item v=\"1\"/></root>")
+    test.eq(len(xml.find(doc, "br")), 1)
+    test.eq(xml.attr(xml.find(doc, "item")[0], "v"), "1")
+})
+
+test.case("build round-trips a simple tree", fn() {
+    doc = xml.parse("<a x=\"1\"><b>t</b></a>")
+    test.eq(xml.build(xml.find(doc, "a")[0]), "<a x=\"1\"><b>t</b></a>")
+})
+
+test.case("the XML declaration is skipped", fn() {
+    doc = xml.parse("<?xml version=\"1.0\"?><root>ok</root>")
+    test.eq(xml.text(doc), "ok")
+})
+
+# The trees 0.37 produced for well-formed input, spelled out. Whitespace runs
+# between elements stay as #text nodes, exactly as before.
+test.case("regression: pretty-printed document keeps its whitespace nodes", fn() {
+    doc = xml.parse(
+        "<?xml version=\"1.0\"?>\n<root>\n  <item v=\"1\"/>\n  <item v='2'>two</item>\n</root>\n",
+    )
+    want = root(
+        [
+            tx("\n"),
+            el(
+                "root",
+                {},
+                [
+                    tx("\n  "),
+                    el("item", { v: "1" }, []),
+                    tx("\n  "),
+                    el("item", { v: "2" }, [tx("two")]),
+                    tx("\n"),
+                ],
+            ),
+            tx("\n"),
+        ],
+    )
+    test.eq(doc, want)
+})
+
+test.case("regression: comments and a plain DOCTYPE leave no node", fn() {
+    doc = xml.parse(
+        "<!DOCTYPE note SYSTEM \"note.dtd\"><note><to>Tove</to><!-- c --><from>Jani</from></note>",
+    )
+    test.eq(doc, root([el("note", {}, [el("to", {}, [tx("Tove")]), el("from", {}, [tx("Jani")])])]))
+})
+
+test.case("regression: mixed content, nesting, prefixes and fragments", fn() {
+    test.eq(
+        xml.parse("<p>Hello <b>bold</b> world</p>"),
+        root([el("p", {}, [tx("Hello "), el("b", {}, [tx("bold")]), tx(" world")])]),
+    )
+    test.eq(xml.parse("<a><a>deep</a></a>"), root([el("a", {}, [el("a", {}, [tx("deep")])])]))
+    test.eq(
+        xml.parse("<s3:Key xmlns:s3=\"urn:x\">k</s3:Key>"),
+        root([el("s3:Key", { "xmlns:s3": "urn:x" }, [tx("k")])]),
+    )
+    test.eq(xml.parse("<a/><b/>"), root([el("a", {}, []), el("b", {}, [])]))
+})
+
+test.case("regression: build output for a parsed RSS feed", fn() {
+    test.eq(xml.build(xml.parse(RSS)), RSS)
+})
+
+# ---- S3 ----------------------------------------------------------------------
+
+S3 = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Name>backups</Name>
+      <Prefix>db/</Prefix>
+      <KeyCount>2</KeyCount>
+      <MaxKeys>2</MaxKeys>
+      <IsTruncated>true</IsTruncated>
+      <Contents>
+        <Key>db/2026-10-11.sql.gz</Key>
+        <LastModified>2026-10-11T02:00:04.000Z</LastModified>
+        <ETag>&quot;9b2cf535f27731c974343645a3985328&quot;</ETag>
+        <Size>48213377</Size>
+        <StorageClass>STANDARD</StorageClass>
+      </Contents>
+      <Contents>
+        <Key>db/R&amp;D notes.txt</Key>
+        <LastModified>2026-10-12T02:00:03.000Z</LastModified>
+        <ETag>&quot;d41d8cd98f00b204e9800998ecf8427e-2&quot;</ETag>
+        <Size>0</Size>
+        <StorageClass>STANDARD_IA</StorageClass>
+      </Contents>
+      <NextContinuationToken>1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=</NextContinuationToken>
+    </ListBucketResult>
+"""
+
+test.case("S3 ListObjectsV2: objects, sizes and ETags", fn() {
+    doc = xml.parse(S3)
+    objects = map(
+        xml.find(doc, "Contents"),
+        fn(c) {
+            key: xml.text(c, "Key"),
+            size: int(xml.text(c, "Size")),
+            etag: xml.text(c, "ETag"),
+        },
+    )
+    test.eq(len(objects), 2)
+    test.eq(objects[0].key, "db/2026-10-11.sql.gz")
+    test.eq(objects[0].size, 48213377)
+    test.eq(objects[0].etag, "\"9b2cf535f27731c974343645a3985328\"")
+    test.eq(objects[1].key, "db/R&D notes.txt")
+    test.eq(objects[1].etag, "\"d41d8cd98f00b204e9800998ecf8427e-2\"")
+})
+
+test.case("S3 ListObjectsV2: pagination fields", fn() {
+    doc = xml.parse(S3)
+    test.eq(xml.text(doc, "IsTruncated"), "true")
+    test.eq(xml.text(doc, "NextContinuationToken"), "1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=")
+    test.eq(xml.text(doc, "ContinuationToken"), null)
+    test.eq(
+        xml.attr(xml.find_one(doc, "ListBucketResult"), "xmlns"),
+        "http://s3.amazonaws.com/doc/2006-03-01/",
+    )
+    test.eq(len(xml.find(doc, "ListBucketResult/Contents/Key")), 2)
+})
+
+test.case("find_one and find_all", fn() {
+    doc = xml.parse(RSS)
+    test.eq(xml.text(xml.find_one(doc, "title")), "News")
+    test.eq(xml.text(xml.find_one(doc, "item/title")), "A")
+    test.eq(xml.find_one(doc, "missing"), null)
+    test.eq(xml.find_all(doc, "title"), xml.find(doc, "title"))
+    test.eq(xml.find(doc, "missing"), [])
+})
+
+# ---- entities, CDATA, comments -----------------------------------------------
+
+test.case("predefined entities and numeric references decode", fn() {
+    doc = xml.parse("<a>&lt;&gt;&amp;&quot;&apos; &#65;&#x42;&#x1F980;</a>")
+    test.eq(xml.text(doc), "<>&\"' AB🦀")
+})
+
+test.case("entities in attribute values decode", fn() {
+    doc = xml.parse("<a title='Tom &amp; &quot;Jerry&quot;'/>")
+    test.eq(xml.attr(xml.find_one(doc, "a"), "title"), "Tom & \"Jerry\"")
+})
+
+test.case("an attribute value may contain '>'", fn() {
+    doc = xml.parse("<a cmp=\"x > y\">t</a>")
+    test.eq(xml.attr(xml.find_one(doc, "a"), "cmp"), "x > y")
+})
+
+test.case("CDATA is literal text", fn() {
+    doc = xml.parse("<a>x <![CDATA[1 < 2 && <b>not a tag</b>]]></a>")
+    test.eq(xml.find_one(doc, "b"), null)
+    test.eq(xml.text(doc), "x 1 < 2 && <b>not a tag</b>")
+    test.eq(xml.find_one(doc, "a").children, [tx("x "), tx("1 < 2 && <b>not a tag</b>")])
+})
+
+test.case("comments and processing instructions are skipped, even with markup inside", fn() {
+    doc = xml.parse("<a><!-- <b>x</b> --><?php echo 1 ?>y</a>")
+    test.eq(xml.find_one(doc, "a").children, [tx("y")])
+})
+
+test.case("build escapes what parse decoded, so it round-trips", fn() {
+    src = "<a q=\"say &quot;hi&quot; &amp; &lt;go&gt;\">1 &lt; 2 &amp; 3</a>"
+    once = xml.parse(src)
+    test.eq(xml.build(once), src)
+    test.eq(xml.parse(xml.build(once)), once)
+})
+
+test.case("escape and unescape", fn() {
+    test.eq(xml.escape("a&b<c>\"d'"), "a&amp;b&lt;c&gt;&quot;d&apos;")
+    test.eq(xml.escape("plain"), "plain")
+    test.eq(xml.unescape(xml.escape("a&b<c>\"d'")), "a&b<c>\"d'")
+    test.eq(xml.unescape("&#x41;&#66;"), "AB")
+    test.eq(caught(fn() xml.unescape("&nope;")).reason, "unknown_entity")
+})
+
+# ---- errors ------------------------------------------------------------------
+
+fn reason(src) {
+    e = caught(fn() xml.parse(src))
+    if e == null { null } else {
+        test.eq(e.kind, "parse")
+        test.eq(e.format, "xml")
+        e.reason
+    }
+}
+
+test.case("errors carry offset, line and column", fn() {
+    e = caught(fn() xml.parse("<a>\n  <b>x</c>\n</a>"))
+    test.eq(e.kind, "parse")
+    test.eq(e.reason, "mismatched_tag")
+    test.eq(e.offset, 10)
+    test.eq(e.line, 2)
+    test.eq(e.column, 7)
+    test.ok(contains(e.message, "</c> does not match <b>"), e.message)
+})
+
+test.case("unterminated constructs", fn() {
+    test.eq(reason("<a><!-- never closed</a>"), "unterminated")
+    test.eq(reason("<a><![CDATA[never closed</a>"), "unterminated")
+    test.eq(reason("<?xml version=\"1.0\"<a/>"), "unterminated")
+    test.eq(reason("<a>1 < 2</a>"), "unterminated")
+    test.eq(reason("<a><b"), "unterminated")
+    test.eq(reason("<a x=\"open></a>"), "unterminated")
+})
+
+test.case("tag structure errors", fn() {
+    test.eq(reason("<a><b>x</c></a>"), "mismatched_tag")
+    test.eq(reason("<a></a></b>"), "unexpected_close")
+    test.eq(reason("<a><b>x</b>"), "unclosed")
+    test.eq(reason("<a x=1/>"), "bad_tag")
+    test.eq(reason("<a checked/>"), "bad_tag")
+    test.eq(reason("<a></ a>"), "bad_tag")
+    test.eq(reason("<a x='1' x='2'/>"), "duplicate_attribute")
+})
+
+test.case("entity errors", fn() {
+    test.eq(reason("<a>&bogus;</a>"), "unknown_entity")
+    test.eq(reason("<a>fish & chips</a>"), "bad_entity")
+    test.eq(reason("<a>&amp</a>"), "bad_entity")
+    test.eq(reason("<a v='&nbsp;'/>"), "unknown_entity")
+    test.eq(reason("<a>&#;</a>"), "bad_char_ref")
+    test.eq(reason("<a>&#xZZ;</a>"), "bad_char_ref")
+    test.eq(reason("<a>&#0;</a>"), "bad_char_ref")
+    test.eq(reason("<a>&#xD800;</a>"), "bad_char_ref")
+    test.eq(reason("<a>&#x110000;</a>"), "bad_char_ref")
+})
+
+test.case("declarations: an internal DTD subset is refused", fn() {
+    test.eq(reason("<!DOCTYPE a [<!ENTITY lol \"lol\">]><a>&lol;</a>"), "doctype_subset")
+    test.eq(reason("<!ELEMENT a ANY><a/>"), "bad_declaration")
+    test.eq(reason("<a/><!DOCTYPE a>"), "bad_declaration")
+})
+
+test.case("document-level errors", fn() {
+    test.eq(reason(""), "no_root")
+    test.eq(reason("  <!-- only a comment -->  "), "no_root")
+    test.eq(reason("Service Unavailable"), "text_outside_root")
+    test.eq(reason("<a/>trailing"), "text_outside_root")
+    test.eq(reason("<![CDATA[x]]><a/>"), "text_outside_root")
+})
+
+test.case("limits throw kind 'limit'", fn() {
+    deep = caught(fn() xml.parse("<a><a><a></a></a></a>", max_depth: 2))
+    test.eq(deep.kind, "limit")
+    test.eq(deep.limit, "max_depth")
+    test.eq(deep.max, 2)
+    test.eq(len(xml.find(xml.parse("<a><a></a></a>", max_depth: 2), "a")), 2)
+    big = caught(fn() xml.parse("<a>xyz</a>", max_size: 5))
+    test.eq(big.kind, "limit")
+    test.eq(big.limit, "max_size")
+})
+
+test.case("a non-string argument is a bug, not a parse error", fn() {
+    test.eq(caught(fn() xml.parse(42)).kind, "bug")
+})

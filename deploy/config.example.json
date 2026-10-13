@@ -1,6 +1,7 @@
 {
   "state_dir": "/var/lib/bit-by-bit",
   "log": { "level": "info", "file": "/var/log/bit-by-bit/bit-by-bit.log" },
+  "dashboard": { "listen": "127.0.0.1:8484" },
 
   "destinations": {
     "aws-main": {

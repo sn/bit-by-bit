@@ -1,7 +1,6 @@
 import std.fs
 import std.io
 import std.hash
-import std.proc
 import std.encoding
 import "./s3.ecko"
 import "./sync.ecko"
@@ -10,7 +9,7 @@ import "./util.ecko"
 fn wanted(path, sub) = sub == null or path == sub or starts_with(path, sub + "/")
 
 # Split a job's remote listing into current objects and version copies:
-# { current: {path: [{ path, key }]}, versions: {path: [{ path, ts, key }]} }
+# { current: {path: { path, key }}, versions: {path: [{ path, ts, key }]} }
 fn catalogue(c, job) {
     vprefix = job.prefix + "/_versions/"
     mut current = []
@@ -25,7 +24,7 @@ fn catalogue(c, job) {
             current = push(current, { path: o.key[len(job.prefix)..], key: o.key })
         }
     }
-    { current: util.index_by(current, fn(x) x.path), versions: util.index_by(versions, fn(x) x.path) }
+    { current: util.index_by(current, fn(x) x.path), versions: group_by(versions, fn(x) x.path) }
 }
 
 fn run_ms_of(c, key) {
@@ -41,12 +40,12 @@ export fn select(c, job, opts) {
     sub = get(opts, "path")
     at = get(opts, "at_ms")
     if at == null {
-        return map(filter(sort(keys(cat.current)), fn(p) wanted(p, sub)), fn(p) util.lookup(cat.current, p))
+        return map(filter(sort(keys(cat.current)), fn(p) wanted(p, sub)), fn(p) get(cat.current, p))
     }
     paths = unique(keys(cat.current) + keys(cat.versions)) |> filter(fn(p) wanted(p, sub)) |> sort
     mut out = []
     for p in paths {
-        cur = util.lookup(cat.current, p)
+        cur = get(cat.current, p)
         if cur != null {
             ms = run_ms_of(c, cur.key)
             if ms != null and ms <= at {
@@ -97,11 +96,7 @@ fn restore_one(c, item, to, overwrite) {
     }
     fs.rename(partial, target)
     if has(meta, "mode") { fs.chmod(target, meta.mode) }
-    if has(meta, "mtime") {
-        # Ecko has no way to set an mtime, so use touch(1).
-        secs = string(int(meta.mtime) / 1000)
-        proc.run("touch", ["-m", "-d", "@" + secs, target])
-    }
+    if has(meta, "mtime") { fs.set_modified(target, int(meta.mtime)) }
     { status: "restored" }
 }
 

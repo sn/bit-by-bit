@@ -24,8 +24,8 @@ export fn close(db) = sql.close(db)
 
 # ---- file index ----------------------------------------------------------------
 
-## Every indexed file of a job, as a util.index_by index keyed by path:
-## read rows with util.lookup(idx, path) -> { path, size, mtime, sha256, kind }.
+## Every indexed file of a job, keyed by path:
+## read rows with get(idx, path) -> { path, size, mtime, sha256, kind }.
 export fn index(db, job) = util.index_by(sql.query(db, "select path, size, mtime, sha256, kind from files where job = ? order by path", [job]), fn(r) r.path)
 
 ## Insert or replace one index row. row: { path, size, mtime, sha256, kind }.

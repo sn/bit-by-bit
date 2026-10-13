@@ -137,8 +137,7 @@ fn upload_file(ctx, action, replacing) {
 fn upload_link(ctx, action, replacing) {
     e = action.entry
     if replacing { version_aside(ctx, e.path, prev_size(action)) }
-    # Percent-encoded: header values must be ASCII, and Ecko drops non-ASCII
-    # response headers (docs/ecko-notes.md F10).
+    # Percent-encoded: S3 user metadata values must be US-ASCII.
     s3.put_object(ctx.client, current_key(ctx.job, e.path), bytes(""), { symlink: sigv4.uri_encode(e.target, false), run: ctx.run_ts })
     row = { path: e.path, size: 0, mtime: 0, sha256: planner.link_sha(e.target), kind: "symlink" }
     { op: if replacing { "replace" } else { "upload" }, path: e.path, row: row, bytes: 0 }

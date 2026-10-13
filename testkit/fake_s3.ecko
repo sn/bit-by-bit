@@ -6,6 +6,9 @@ import std.hash
 import std.encoding
 import std.re
 import "../src/sigv4.ecko"
+# By path rather than `import xml`: in a built binary, a package import from
+# a file below the project root can't find ecko.json (docs/feedback.md #1).
+import "../vendor/github.com/ecko-lang/xml/main.ecko" as xml
 
 export let ACCESS_KEY = "AKIDTEST"
 export let SECRET_KEY = "test-secret-key"
@@ -19,9 +22,8 @@ let page_size = cell(1000)
 let next_id = cell(0)
 let copy_limit = cell(0)     # >0: plain CopyObject of a larger source fails, like S3 over 5 GiB
 
-fn xml_error(status, code) = http.response(status, "<Error><Code>{code}</Code><Message>{code}</Message></Error>", { "content-type": "application/xml" })
+fn xml_error(status, code) = http.response(status, "<Error><Code>{code}</Code><Message>{code}</Message></Error>", headers: { "content-type": "application/xml" })
 
-fn xml_escape(s) = s |> replace("&", "&amp;") |> replace("<", "&lt;") |> replace(">", "&gt;")
 
 fn etag_of(body) = "\"" + hash.sha256(body)[..32] + "\""
 
@@ -64,10 +66,10 @@ fn list_bucket(req) {
     page = slice(all_keys, offset, offset + size)
     truncated = offset + size < len(all_keys)
     store = cell_get(objects)
-    items = join(map(page, fn(k) "<Contents><Key>" + xml_escape(k) + "</Key><Size>" + string(len(store[k].body)) + "</Size></Contents>"), "")
+    items = join(map(page, fn(k) "<Contents><Key>" + xml.escape(k) + "</Key><Size>" + string(len(store[k].body)) + "</Size></Contents>"), "")
     next = if truncated { "<NextContinuationToken>" + string(offset + size) + "</NextContinuationToken>" } else { "" }
     flag = if truncated { "true" } else { "false" }
-    http.response(200, "<ListBucketResult>" + items + "<IsTruncated>" + flag + "</IsTruncated>" + next + "</ListBucketResult>", { "content-type": "application/xml" })
+    http.response(200, "<ListBucketResult>" + items + "<IsTruncated>" + flag + "</IsTruncated>" + next + "</ListBucketResult>", headers: { "content-type": "application/xml" })
 }
 
 fn handle(req) {
@@ -94,16 +96,16 @@ fn handle(req) {
             if has(params, "uploads") {
                 id = "up" + string(cell_update(next_id, fn(n) n + 1))
                 cell_update(uploads, fn(u) set(u, id, { key: key, meta: meta_from(req), parts: {} }))
-                return http.response(200, "<InitiateMultipartUploadResult><UploadId>{id}</UploadId></InitiateMultipartUploadResult>", {})
+                return http.response(200, "<InitiateMultipartUploadResult><UploadId>{id}</UploadId></InitiateMultipartUploadResult>")
             }
             id = get(params, "uploadId") ?? ""
             up = get(cell_get(uploads), id)
             if up == null { return xml_error(404, "NoSuchUpload") }
-            ns = map(re.captures_all(r"<PartNumber>(\d+)</PartNumber>", string(body)), fn(m) m[1])
+            ns = map(xml.find(xml.parse(string(body)), "Part/PartNumber"), fn(n) xml.text(n))
             joined = reduce(ns, fn(acc, n) acc + up.parts[n], bytes(""))
             cell_update(objects, fn(o) set(o, key, { body: joined, meta: up.meta }))
             cell_update(uploads, fn(u) remove(u, id))
-            http.response(200, "<CompleteMultipartUploadResult><Key>{key}</Key></CompleteMultipartUploadResult>", {})
+            http.response(200, "<CompleteMultipartUploadResult><Key>{key}</Key></CompleteMultipartUploadResult>")
         }
         "PUT" => {
             src = get(req.headers, "x-amz-copy-source")
@@ -118,10 +120,10 @@ fn handle(req) {
                     rng = re.captures(r"^bytes=(\d+)-(\d+)$", get(req.headers, "x-amz-copy-source-range") ?? "")
                     piece = if rng == null { so.body } else { so.body[int(rng[1])..int(rng[2]) + 1] }
                     cell_update(uploads, fn(u) set(u, id, set(u[id], "parts", set(u[id].parts, params.partNumber, piece))))
-                    return http.response(200, "<CopyPartResult><ETag>" + xml_escape(etag_of(piece)) + "</ETag></CopyPartResult>", {})
+                    return http.response(200, "<CopyPartResult><ETag>" + xml.escape(etag_of(piece)) + "</ETag></CopyPartResult>")
                 }
                 cell_update(uploads, fn(u) set(u, id, set(u[id], "parts", set(u[id].parts, params.partNumber, body))))
-                return http.response(200, "", { etag: etag_of(body) })
+                return http.response(200, "", headers: { etag: etag_of(body) })
             }
             if src_key != null {
                 o = get(cell_get(objects), src_key)
@@ -129,28 +131,28 @@ fn handle(req) {
                 lim = cell_get(copy_limit)
                 if lim > 0 and len(o.body) > lim { return xml_error(400, "InvalidRequest") }
                 cell_update(objects, fn(m) set(m, key, o))
-                return http.response(200, "<CopyObjectResult></CopyObjectResult>", {})
+                return http.response(200, "<CopyObjectResult></CopyObjectResult>")
             }
             cell_update(objects, fn(o) set(o, key, { body: body, meta: meta_from(req) }))
-            http.response(200, "", { etag: etag_of(body) })
+            http.response(200, "", headers: { etag: etag_of(body) })
         }
         "GET" => {
             o = get(cell_get(objects), key)
             if o == null { return xml_error(404, "NoSuchKey") }
-            http.response(200, o.body, merge(meta_headers(o.meta), { etag: etag_of(o.body) }))
+            http.response(200, o.body, headers: merge(meta_headers(o.meta), { etag: etag_of(o.body) }))
         }
         "HEAD" => {
             o = get(cell_get(objects), key)
-            if o == null { return http.response(404, "", {}) }
-            http.response(200, "", meta_headers(o.meta))
+            if o == null { return http.response(404, "") }
+            http.response(200, "", headers: meta_headers(o.meta))
         }
         "DELETE" => {
             if has(params, "uploadId") {
                 cell_update(uploads, fn(u) remove(u, params.uploadId))
-                return http.response(204, "", {})
+                return http.response(204, "")
             }
             cell_update(objects, fn(o) remove(o, key))
-            http.response(204, "", {})
+            http.response(204, "")
         }
         _ => xml_error(405, "MethodNotAllowed")
     }

@@ -1,0 +1,119 @@
+import std.test
+import std.fs
+import std.http
+import std.json
+import std.sql
+import std.time
+import "../src/config.ecko"
+import "../src/state.ecko"
+import "../src/dashboard.ecko"
+
+let H = 3600000
+let STATE_DIR = fs.join(fs.temp_dir(), "dash-state")
+# The test's own connection writes runs; the dashboard reads through its own.
+let DB = state.open(STATE_DIR)
+
+fn cfg() = config.validate({
+    state_dir: STATE_DIR,
+    destinations: { d: { provider: "gcs", bucket: "b", credentials_file: "/x" } },
+    jobs: [
+        { name: "home", destination: "d", prefix: "p1", paths: ["/tmp"], schedule: { every: "6h" } },
+        { name: "dev", destination: "d", prefix: "p2", paths: ["/var"], schedule: { daily_at: "02:30" } },
+    ],
+    dashboard: { listen: "127.0.0.1:0" },
+}).config
+
+fn record(job, id, started, status, problems, err) {
+    state.start_run(DB, job, id, started)
+    state.finish_run(DB, id, {
+        status: status, finished_at: started + 60000, uploaded: 3, replaced: 1, deleted: 0,
+        touched: 0, pruned: 2, bytes: 2048, error: err, problems: problems,
+    })
+}
+
+fn reset() = sql.exec(DB, "delete from runs")
+
+let STARTED = time.now()
+port = dashboard.start(cell(cfg()), STATE_DIR, STARTED)
+fn url(path) = "http://127.0.0.1:{port}{path}"
+
+test.case("binds to the configured host", fn() {
+    test.ok(port > 0, "port {port}")
+})
+
+test.case("GET / renders an auto-refreshing page with every job", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    r = http.get(url("/"))
+    test.eq(r.status, 200)
+    test.ok(starts_with(get(r.headers, "content-type") ?? "", "text/html"), string(r.headers))
+    test.ok(contains(r.body, "http-equiv=\"refresh\" content=\"30\""), "auto refresh")
+    test.ok(contains(r.body, "home") and contains(r.body, "dev"), "both jobs")
+    test.ok(contains(r.body, "never run"), "dev has not run")
+})
+
+test.case("GET /api/status returns the snapshot as JSON", fn() {
+    reset()
+    record("home", "r1", time.now() - 2 * H, "ok", [], null)
+    record("home", "r2", time.now() - H, "partial", ["/tmp/x: vanished"], null)
+    r = http.get(url("/api/status"))
+    test.eq(r.status, 200)
+    s = json.decode(r.body)
+    test.eq(s.healthy, true)
+    test.eq(s.daemon.started_at, STARTED)
+    home = s.jobs[0]
+    test.eq([home.job, home.status, home.pruned, home.overdue], ["home", "partial", 2, false])
+    test.eq(map(home.runs, fn(x) x.id), ["r2", "r1"])
+    test.eq(home.runs[0].duration_ms, 60000)
+    test.eq(s.jobs[1].status, "never run")
+})
+
+test.case("/healthz is 200 when all is well", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    r = http.get(url("/healthz"))
+    test.eq([r.status, trim(r.body)], [200, "ok"])
+})
+
+test.case("/healthz is 503 when a job's last run failed", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "failed", [], "HTTP 403")
+    r = http.get(url("/healthz"))
+    test.eq(r.status, 503)
+    test.ok(contains(r.body, "home: last run failed"), r.body)
+})
+
+test.case("/healthz is 503 when a job is overdue", fn() {
+    reset()
+    record("home", "r1", time.now() - 13 * H, "ok", [], null)
+    r = http.get(url("/healthz"))
+    test.eq(r.status, 503)
+    test.ok(contains(r.body, "home: overdue"), r.body)
+})
+
+test.case("everything shown is HTML-escaped", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "partial", ["/tmp/<script>alert(1)</script>.txt: vanished"], "<b>boom</b>")
+    body = http.get(url("/")).body
+    test.ok(not contains(body, "<script>alert(1)"), "raw script tag")
+    test.ok(contains(body, "&lt;script&gt;alert(1)"), "escaped problem")
+    test.ok(contains(body, "&lt;b&gt;boom"), "escaped error")
+})
+
+test.case("unknown paths are 404", fn() {
+    test.eq(http.get(url("/nope")).status, 404)
+})
+
+test.case("the dashboard's connection refuses writes", fn() {
+    ro = dashboard.open_readonly(STATE_DIR)
+    test.err(fn() sql.exec(ro, "delete from runs"), "readonly")
+    sql.close(ro)
+})
+
+test.case("health: a never-run job is not unhealthy", fn() {
+    reset()
+    s = dashboard.snapshot(cfg(), DB, time.now(), STARTED)
+    test.eq(dashboard.health(s), { ok: true, reasons: [] })
+})
+
+http.stop()

@@ -1,0 +1,521 @@
+# xml - an XML parser for Ecko.
+#
+#   import xml
+#
+#   doc = xml.parse(rss_source)
+#   xml.find(doc, "channel/item")   # path query (child navigation)
+#   xml.find(doc, "title")          # every <title> descendant
+#   xml.find_one(doc, "title")      # the first one, or null
+#   xml.text(node)                  # concatenated text
+#   xml.text(doc, "Key")            # text of the first <Key>, or null
+#   xml.attr(node, "id")            # attribute value (case-sensitive)
+#   xml.build(node)                 # recompose to an XML string
+#
+# A node is a map: elements are { tag, attrs, children }, text is
+# { tag: "#text", text }, root is { tag: "#root", ... }. Pure; no capabilities.
+# (Exports `find`, which shadows the builtin - but never calls it.)
+#
+# How it parses. Ecko is interpreted, so walking a document one character at a
+# time is slow, and slicing a long string by character index costs time in
+# proportion to the index. The parser therefore makes one native pass with
+# `re.find_all`, which splits the document into tokens - a tag, a run of text,
+# a comment, a CDATA section, a declaration - that cover every character. A
+# token's position is the running total of the lengths before it, so no
+# position is ever looked up by index; line and column are worked out only
+# when an error is raised.
+#
+# The tree is built without copying lists: the open elements' children live in
+# lists indexed by depth, updated in place (`xs[i] = v`), and a child list is
+# swapped out of its slot before it is pushed to, so it is never shared at the
+# moment it grows. `pop` and `take` are avoided because on Ecko 0.65 they copy
+# the whole list.
+
+import std.re
+import std.str
+
+# One alternative per token shape, in priority order. Each construct that can
+# be left open (a comment, CDATA, a processing instruction, a tag) has a
+# fallback alternative matching just its opening, so an unterminated one
+# becomes a token of its own instead of being swallowed by a later rule. The
+# last two alternatives - a text run and a lone `<` - guarantee every
+# character lands in some token.
+let TOKEN = r"""<!--(?s:.*?)-->|<!--|<!\[CDATA\[(?s:.*?)\]\]>|<!\[CDATA\[|<\?(?s:.*?)\?>|<\?|<![^>]*>|<(?:[^<>"']|"[^"]*"|'[^']*')*>|[^<]+|<"""
+
+# A start tag: name, the attribute run, and an optional self-closing slash.
+let OPEN = r"""^<([^\s/>="'<!?]+)((?:\s+[^\s/>="'<]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(/?)>$"""
+
+let CLOSE = r"""^</([^\s/>="'<]+)\s*>$"""
+
+let ATTR = r"""([^\s=]+)\s*=\s*(?:"([^"]*)"|'([^']*)')"""
+
+let HEX = "0123456789abcdef"
+
+# ---- errors ----------------------------------------------------------------
+
+# Line and column (both 1-based) of a character offset in `src`.
+fn position(src, offset) {
+    prefix = src[..offset]
+    nl = str.last_index_of(prefix, "\n")
+    [str.count(prefix, "\n") + 1, offset - nl]
+}
+
+# Raise a malformed-input error. `reason` is a stable code for programs to
+# branch on; `message` is for people.
+fn fail(src, offset, reason, message) {
+    let (line, column) = position(src, offset)
+    error(
+        {
+            kind: "parse",
+            format: "xml",
+            reason: reason,
+            offset: offset,
+            line: line,
+            column: column,
+            message: "xml: {message} (line {line}, column {column})",
+        },
+    )
+}
+
+# Raise a configured-ceiling error. `limit` names the option that was hit.
+fn over_limit(src, offset, limit, max, message) {
+    let (line, column) = position(src, offset)
+    error(
+        {
+            kind: "limit",
+            format: "xml",
+            limit: limit,
+            max: max,
+            offset: offset,
+            line: line,
+            column: column,
+            message: "xml: {message} (line {line}, column {column})",
+        },
+    )
+}
+
+# ---- entities --------------------------------------------------------------
+
+# A numeric character reference body: "65" or "x41".
+fn char_ref(body, src, at) {
+    hex = starts_with(body, "x")
+    digits = if hex { body[1..] } else { body }
+    base = if hex { 16 } else { 10 }
+    if digits == "" { fail(src, at, "bad_char_ref", "'&#{body};' has no digits") }
+    mut v = 0
+    for c in chars(digits) {
+        d = index_of(HEX, lower(c))
+        if d < 0 or d >= base {
+            fail(src, at, "bad_char_ref", "'&#{body};' is not a valid character reference")
+        }
+        v = v * base + d
+        if v > 1114111 { fail(src, at, "bad_char_ref", "'&#{body};' is past U+10FFFF") }
+    }
+    if v == 0 or v >= 55296 and v <= 57343 {
+        fail(src, at, "bad_char_ref", "'&#{body};' is not a character XML allows")
+    }
+    str.chr(v)
+}
+
+fn entity(name, src, at) {
+    match name {
+        "amp" => "&"
+        "lt" => "<"
+        "gt" => ">"
+        "quot" => "\""
+        "apos" => "'"
+        _ => if starts_with(name, "#") { char_ref(name[1..], src, at) } else {
+            fail(
+                src,
+                at,
+                "unknown_entity",
+                "unknown entity '&{name};' - only the five predefined entities and numeric references are supported",
+            )
+        }
+    }
+}
+
+# Decode the entities in `s`, a piece of `src` starting at offset `at`, so an
+# error points at the offending `&`.
+fn unescape_in(s, src, at) {
+    if not contains(s, "&") { return s }
+    pieces = split(s, "&")
+    mut out = [pieces[0]]
+    mut k = len(pieces[0])
+    for p in drop(pieces, 1) {
+        amp = at + k
+        semi = index_of(p, ";")
+        if semi < 0 {
+            fail(
+                src,
+                amp,
+                "bad_entity",
+                "'&' must begin an entity such as '&amp;', and no ';' follows it",
+            )
+        }
+        name = p[..semi]
+        if name == "" or contains(name, " ") or contains(name, "\n") or contains(name, "\t") {
+            fail(src, amp, "bad_entity", "'&' must begin an entity such as '&amp;'")
+        }
+        out = push(out, entity(name, src, amp))
+        out = push(out, p[semi + 1..])
+        k += 1 + len(p)
+    }
+    join(out, "")
+}
+
+# ---- parsing ---------------------------------------------------------------
+
+fn parse_attrs(run, src, at) {
+    mut m = {}
+    if run == "" { return m }
+    for p in re.captures_all(ATTR, run) {
+        name = p[1]
+        if has(m, name) { fail(src, at, "duplicate_attribute", "attribute '{name}' appears twice") }
+        # Only one of the two quote groups took part; the other is "".
+        m = insert(m, name, unescape_in(p[2] + p[3], src, at))
+    }
+    m
+}
+
+fn unterminated(t, src, at) {
+    what = if t == "<!--" {
+        "comment '<!--' is never closed by '-->'"
+    } else if t == "<![CDATA[" {
+        "CDATA section is never closed by ']]>'"
+    } else if t == "<?" {
+        "processing instruction '<?' is never closed by '?>'"
+    } else {
+        "'<' does not start a complete tag (write '&lt;' for a literal '<')"
+    }
+    fail(src, at, "unterminated", what)
+}
+
+## Parse an XML document into a node tree. The root is a `#root` node whose
+## children are the top-level elements; text becomes `#text` nodes, with the
+## five predefined entities (`&amp;` `&lt;` `&gt;` `&quot;` `&apos;`) and
+## numeric references (`&#65;`, `&#x41;`) decoded. CDATA content becomes a
+## `#text` node verbatim. Comments, processing instructions, the `<?xml ?>`
+## declaration and a plain `<!DOCTYPE>` are skipped.
+##
+## Malformed input throws `{ kind: "parse", format: "xml", reason, message,
+## offset, line, column }`; `reason` is one of `unterminated`, `bad_tag`,
+## `mismatched_tag`, `unexpected_close`, `unclosed`, `duplicate_attribute`,
+## `bad_entity`, `unknown_entity`, `bad_char_ref`, `doctype_subset`,
+## `bad_declaration`, `text_outside_root` or `no_root`. A DOCTYPE with an
+## internal subset (`[...]`) is refused rather than expanded.
+##
+## Input over `max_size` characters, or nesting deeper than `max_depth`
+## elements, throws `{ kind: "limit", limit: "max_size" | "max_depth", max, ... }`.
+##
+## example:
+##   doc = xml.parse("<a><b>x &amp; y</b></a>")
+##   xml.text(doc, "b")   # "x & y"
+export fn parse(src, max_depth = 256, max_size = 16777216) {
+    if not is_string(src) {
+        error({ kind: "bug", message: "xml.parse expects a string, got {type_of(src)}" })
+    }
+    size = len(src)
+    if size > max_size {
+        error(
+            {
+                kind: "limit",
+                format: "xml",
+                limit: "max_size",
+                max: max_size,
+                size: size,
+                message: "xml: the document is {size} characters, over max_size {max_size}",
+            },
+        )
+    }
+    mut levels = [[]]
+    mut names = ["#root"]
+    mut attrs_at = [{}]
+    mut opened = [0]
+    mut depth = 0
+    mut pos = 0
+    mut elements = 0
+    for t in re.find_all(TOKEN, src) {
+        at = pos
+        pos += len(t)
+        mut node = null
+        if t[0] != "<" {
+            if depth == 0 and not str.is_blank(t) {
+                fail(src, at, "text_outside_root", "text outside any element")
+            }
+            node = { tag: "#text", text: unescape_in(t, src, at) }
+        } else if t == "<" or t == "<!--" or t == "<![CDATA[" or t == "<?" {
+            unterminated(t, src, at)
+        } else if starts_with(t, "<!--") or starts_with(t, "<?") {
+            node = null
+        } else if starts_with(t, "<![CDATA[") {
+            if depth == 0 { fail(src, at, "text_outside_root", "CDATA outside any element") }
+            node = { tag: "#text", text: t[9..-3] }
+        } else if starts_with(t, "<!") {
+            if not starts_with(t, "<!DOCTYPE") {
+                fail(
+                    src,
+                    at,
+                    "bad_declaration",
+                    "unsupported markup declaration - only <!DOCTYPE>, comments and CDATA are allowed",
+                )
+            }
+            if contains(t, "[") {
+                fail(
+                    src,
+                    at,
+                    "doctype_subset",
+                    "a DOCTYPE with an internal subset is refused: entity definitions are not supported",
+                )
+            }
+            if depth > 0 or elements > 0 {
+                fail(src, at, "bad_declaration", "<!DOCTYPE> must come before the root element")
+            }
+        } else if t[1] == "/" {
+            m = re.captures(CLOSE, t)
+            if m == null { fail(src, at, "bad_tag", "malformed closing tag") }
+            name = m[1]
+            if depth == 0 { fail(src, at, "unexpected_close", "</{name}> closes nothing") }
+            if name != names[depth] {
+                let (ol, oc) = position(src, opened[depth])
+                fail(
+                    src,
+                    at,
+                    "mismatched_tag",
+                    "</{name}> does not match <{names[depth]}> opened at line {ol}, column {oc}",
+                )
+            }
+            kids = levels[depth]
+            levels[depth] = []
+            node = { tag: name, attrs: attrs_at[depth], children: kids }
+            depth -= 1
+        } else {
+            m = re.captures(OPEN, t)
+            if m == null {
+                fail(
+                    src,
+                    at,
+                    "bad_tag",
+                    "malformed tag - attributes need a name, '=' and a quoted value",
+                )
+            }
+            name = m[1]
+            attrs = parse_attrs(m[2], src, at)
+            elements += 1
+            if m[3] == "/" { node = { tag: name, attrs: attrs, children: [] } } else {
+                depth += 1
+                if depth > max_depth {
+                    over_limit(
+                        src,
+                        at,
+                        "max_depth",
+                        max_depth,
+                        "elements nest deeper than max_depth {max_depth}",
+                    )
+                }
+                if depth == len(levels) {
+                    levels = push(levels, [])
+                    names = push(names, name)
+                    attrs_at = push(attrs_at, attrs)
+                    opened = push(opened, at)
+                } else {
+                    names[depth] = name
+                    attrs_at[depth] = attrs
+                    opened[depth] = at
+                }
+            }
+        }
+        if node != null {
+            # Swap the list out of its slot so it is not shared while it grows.
+            mut siblings = levels[depth]
+            levels[depth] = []
+            siblings = push(siblings, node)
+            levels[depth] = siblings
+        }
+    }
+    if depth > 0 { fail(src, opened[depth], "unclosed", "<{names[depth]}> is never closed") }
+    if elements == 0 { fail(src, size, "no_root", "no element found") }
+    { tag: "#root", attrs: {}, children: levels[0] }
+}
+
+# ---- queries ---------------------------------------------------------------
+
+# Descendant elements of `node` with tag `tag`, in document order (pre-order),
+# walked with an explicit stack so depth costs no recursion. Stops after the
+# first match when `only_first`.
+fn descendants(node, tag, only_first) {
+    mut out = []
+    top_kids = get(node, "children")
+    if top_kids == null { return out }
+    mut stack = [top_kids]
+    mut idx = [0]
+    mut top = 0
+    while top >= 0 {
+        kids = stack[top]
+        i = idx[top]
+        if i >= len(kids) { top -= 1 } else {
+            idx[top] = i + 1
+            c = kids[i]
+            if get(c, "tag") == tag {
+                out = push(out, c)
+                if only_first { return out }
+            }
+            ck = get(c, "children")
+            if ck != null and len(ck) > 0 {
+                top += 1
+                if top == len(stack) {
+                    stack = push(stack, ck)
+                    idx = push(idx, 0)
+                } else {
+                    stack[top] = ck
+                    idx[top] = 0
+                }
+            }
+        }
+    }
+    out
+}
+
+# Every `#text` value under `node`, in document order.
+fn text_of(node) {
+    if get(node, "tag") == "#text" { return get(node, "text") }
+    top_kids = get(node, "children")
+    if top_kids == null { return "" }
+    mut parts = []
+    mut stack = [top_kids]
+    mut idx = [0]
+    mut top = 0
+    while top >= 0 {
+        kids = stack[top]
+        i = idx[top]
+        if i >= len(kids) { top -= 1 } else {
+            idx[top] = i + 1
+            c = kids[i]
+            if get(c, "tag") == "#text" { parts = push(parts, get(c, "text")) } else {
+                ck = get(c, "children")
+                if ck != null and len(ck) > 0 {
+                    top += 1
+                    if top == len(stack) {
+                        stack = push(stack, ck)
+                        idx = push(idx, 0)
+                    } else {
+                        stack[top] = ck
+                        idx[top] = 0
+                    }
+                }
+            }
+        }
+    }
+    join(parts, "")
+}
+
+## find(node, path) - a single tag matches descendants; "a/b/c" navigates:
+## the first segment matches descendants, each further segment its children.
+## Always returns a list, in document order; `[]` when nothing matches.
+## Tags compare exactly, namespace prefix included (`s3:Key` is not `Key`).
+export fn find(node, path) {
+    if not contains(path, "/") { return descendants(node, path, false) }
+    segs = split(path, "/")
+    mut current = descendants(node, segs[0], false)
+    for seg in drop(segs, 1) {
+        mut next = []
+        for n in current {
+            for child in get(n, "children") ?? [] {
+                if get(child, "tag") == seg { next = push(next, child) }
+            }
+        }
+        current = next
+    }
+    current
+}
+
+## find_all(node, path) - the same list `find` returns, under the name that
+## reads clearly beside `find_one`.
+export fn find_all(node, path) = find(node, path)
+
+## find_one(node, path) - the first match of `find(node, path)`, or null.
+## A bare tag stops at the first match instead of collecting them all.
+##
+## example:
+##   token = xml.find_one(doc, "NextContinuationToken")
+export fn find_one(node, path) {
+    if not contains(path, "/") { return first(descendants(node, path, true)) }
+    first(find(node, path))
+}
+
+## text(node) - all text under a node, concatenated: the element's own text
+## plus every descendant's, in document order. Returns "" for an element
+## with no text.
+##
+## text(node, path) - the text of `find_one(node, path)`, or null when
+## nothing matches. This is the S3 shape: `xml.text(item, "Key")`.
+export fn text(node, path = null) {
+    if path == null { return text_of(node) }
+    hit = find_one(node, path)
+    if hit == null { null } else { text_of(hit) }
+}
+
+## One attribute's value, or null when the node has no such attribute.
+export fn attr(node, name) {
+    a = get(node, "attrs")
+    if a == null { null } else { get(a, name) }
+}
+
+# ---- escaping and building -------------------------------------------------
+
+## escape(s) - replace `&`, `<`, `>`, `"` and `'` with their entities, so `s`
+## is safe as element text or as a quoted attribute value.
+##
+## example:
+##   "<Key>" + xml.escape("a&b.txt") + "</Key>"   # "<Key>a&amp;b.txt</Key>"
+export fn escape(s) {
+    if not (contains(s, "&") or contains(s, "<") or contains(s, ">") or contains(s, "\"") or contains(s, "'")) {
+        return s
+    }
+    replace(
+        replace(
+            replace(replace(replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"),
+            "\"",
+            "&quot;",
+        ),
+        "'",
+        "&apos;",
+    )
+}
+
+## unescape(s) - decode the five predefined entities and numeric character
+## references in `s`. An unknown or unterminated entity throws the same
+## `{ kind: "parse", format: "xml", ... }` error `parse` does, with the
+## offset into `s`.
+export fn unescape(s) = unescape_in(s, s, 0)
+
+fn escape_text(s) = if contains(s, "&") or contains(s, "<") or contains(s, ">") {
+    replace(replace(replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")
+} else {
+    s
+}
+
+fn escape_attr(s) = replace(escape_text(s), "\"", "&quot;")
+
+## build(node) -> an XML string (attrs sorted; empty elements self-close).
+## Text is escaped (`&`, `<`, `>`) and attribute values also escape `"`, so
+## the output parses back to the same tree.
+export fn build(node) {
+    tag = get(node, "tag")
+    if tag == "#text" { escape_text(get(node, "text")) } else {
+        kids = get(node, "children") ?? []
+        mut parts = []
+        for c in kids {
+            parts = push(parts, build(c))
+        }
+        inner = join(parts, "")
+        if tag == "#root" { inner } else {
+            mut attrs = []
+            a = get(node, "attrs") ?? {}
+            for k in sort(keys(a)) {
+                attrs = push(attrs, " " + k + "=\"" + escape_attr(a[k]) + "\"")
+            }
+            open = "<" + tag + join(attrs, "")
+            if len(kids) == 0 { open + "/>" } else { open + ">" + inner + "</" + tag + ">" }
+        }
+    }
+}

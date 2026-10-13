@@ -20,8 +20,9 @@ systemd service. Written in [Ecko](https://ecko.sh).
 
 ## Install
 
-Requires Ecko 0.65 or later, with binary HTTP request bodies and `http.head`
-(see `docs/ecko-notes.md`, items F1 and A1).
+Requires Ecko 0.66 or later. The one dependency, the
+[`xml`](https://github.com/ecko-lang/xml) package, is vendored in `vendor/` and
+pinned in `ecko.lock`; `ecko install` restores it if it's missing.
 
 ```bash
 ecko build main.ecko -o bit-by-bit
@@ -88,6 +89,27 @@ and modification time.
 If the state database is lost, `bit-by-bit run home --rebuild-state` rebuilds
 it from the bucket.
 
+## Dashboard
+
+The daemon can serve a read-only status page. It's off unless the config has:
+
+```json
+"dashboard": { "listen": "127.0.0.1:8484" }
+```
+
+| URL | What |
+|---|---|
+| `http://127.0.0.1:8484/` | Each job's status, last and next run, counts, errors, problems and recent runs. Refreshes every 30 seconds. |
+| `/api/status` | The same data as JSON. |
+| `/healthz` | `200 ok`, or `503` listing why: a job's last run failed, or it hasn't run for more than twice its interval. Point an uptime monitor at it. |
+
+The page has no login, so it only binds to loopback addresses (`127.0.0.1`,
+`localhost`, `::1`). To reach it from elsewhere, use an SSH tunnel
+(`ssh -L 8484:127.0.0.1:8484 host`), or set `"allow_remote": true` deliberately.
+The page has no buttons and can't change anything. If the port is taken, the
+daemon logs an error and keeps backing up. Changing `listen` needs a service
+restart.
+
 ## Remote layout
 
 ```
@@ -101,8 +123,8 @@ are stored as empty objects with `x-amz-meta-bbb-symlink`.
 ## Develop
 
 ```bash
-./scripts/test.sh                 # every test file, each in its own process
-./scripts/test.sh tests/sync_test.ecko
+ecko test --jobs 4                # every test file, each in its own process
+ecko test tests/sync_test.ecko
 ecko check --strict main.ecko src/*.ecko tests/*.ecko testkit/*.ecko
 ```
 

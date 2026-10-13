@@ -1,0 +1,22 @@
+# Ecko package - generated / build artifacts
+
+# `ecko pack` output
+*.zip
+
+# AI response cache (`ecko --cache` / $ECKO_AI_CACHE)
+.ecko-cache/
+
+# Legacy `ecko publish` output (command removed in package v2)
+.ecko-publish/
+
+# Package-extraction staging dirs (ecko get/install)
+vendor/.staging-*/
+
+# Dev-workflow scratch (not part of the shipped package)
+.superpowers/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~

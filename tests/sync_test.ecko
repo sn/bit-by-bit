@@ -5,7 +5,6 @@ import std.hash
 import "../src/s3.ecko"
 import "../src/state.ecko"
 import "../src/sync.ecko"
-import "../src/util.ecko"
 import "../testkit/fake_s3.ecko"
 
 port = fake_s3.start()
@@ -149,7 +148,7 @@ test.case("crash between version copy and upload is repaired next run", fn() {
     fake_s3.fail_next("PUT", "pc" + env.root + "/a.txt", 403, "AccessDenied", 1)
     o = run(env)
     test.eq(o.status, "failed")
-    test.eq(util.lookup(state.index(env.db, "t"), env.root + "/a.txt").size, 5)
+    test.eq(get(state.index(env.db, "t"), env.root + "/a.txt").size, 5)
     o2 = run(env)
     test.eq(o2.status, "ok")
     test.eq(remote(env, "a.txt").body, bytes("alpha v2"))

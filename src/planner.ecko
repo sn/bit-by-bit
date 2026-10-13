@@ -26,7 +26,7 @@ export fn guard_empty_roots(scan, index, roots) {
 
 ## Decide what a run must do. Pure: no I/O.
 ##   scan:  the result of scanner.scan
-##   index: state.index for the job (util.index_by keyed by path)
+##   index: state.index for the job ({path: row})
 ## Returns {
 ##   actions:   [{ op: "upload" | "check" | "replace" | "delete", path, entry, prev }]
 ##   unchanged: Int
@@ -38,7 +38,7 @@ export fn plan(scan, index) {
     mut unchanged = 0
     present = util.index_by(scan.entries, fn(e) e.path)
     for e in scan.entries {
-        prev = util.lookup(index, e.path)
+        prev = get(index, e.path)
         if prev == null {
             actions = push(actions, { op: "upload", path: e.path, entry: e, prev: null })
         } else if prev.kind != e.kind {
@@ -57,7 +57,7 @@ export fn plan(scan, index) {
     }
     for path in sort(keys(index)) {
         if has(present, path) or scanner.under_any(path, scan.protected) { continue }
-        actions = push(actions, { op: "delete", path: path, entry: null, prev: util.lookup(index, path) })
+        actions = push(actions, { op: "delete", path: path, entry: null, prev: get(index, path) })
     }
     { actions: actions, unchanged: unchanged }
 }

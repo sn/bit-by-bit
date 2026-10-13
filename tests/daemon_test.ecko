@@ -5,6 +5,8 @@ import std.proc
 import std.json
 import std.time
 import std.io
+import std.re
+import std.http
 import "../src/state.ecko"
 import "../testkit/fake_s3.ecko"
 
@@ -78,9 +80,7 @@ test.case("daemon runs a due job and stops cleanly on SIGTERM", fn() {
     # A second daemon refuses to start while the first holds the lock.
     second = cli(["daemon", "--config", env.config])
     test.eq(second.code, 1)
-    # proc.kill reaps the child and frees its handle, which loses the exit
-    # code, so send SIGTERM with kill(1) and then wait.
-    proc.run("kill", ["-TERM", string(proc.pid(p))])
+    proc.kill(p, "term")
     res = proc.wait(p, 30000)
     test.eq(res.code, 0)
     test.ok(not fs.exists(fs.join(env.state_dir, "daemon.lock")), "lock released")
@@ -100,15 +100,58 @@ test.case("SIGHUP reloads, and an invalid config is rejected", fn() {
         }
     }
     test.ok(wait_line("daemon started"), "started")
-    hup = fn() proc.run("kill", ["-HUP", string(proc.pid(p))])
+    hup = fn() proc.kill(p, "hup")
     hup()
     test.ok(wait_line("config reloaded"), "valid config reloaded")
     fs.write(env.config, r"""{"jobs": "nope"}""")
     hup()
     test.ok(wait_line("config reload rejected"), "invalid config rejected")
     test.eq(proc.wait(p), null)
-    proc.run("kill", ["-TERM", string(proc.pid(p))])
+    proc.kill(p, "term")
     test.eq(proc.wait(p, 30000).code, 0)
+})
+
+fn with_dashboard(env, listen) {
+    c = json.read(env.config)
+    json.write(env.config, set(c, "dashboard", { listen: listen }))
+}
+
+# Read the daemon's stderr until a line contains `needle`; return the line or null.
+fn wait_stderr(p, needle) {
+    err = io.timeout(proc.stderr(p), 20000)
+    while true {
+        line = io.read_line(err)
+        if line == null { return null }
+        if contains(line, needle) { return line }
+    }
+}
+
+fn stop_daemon(p) {
+    proc.kill(p, "term")
+    proc.wait(p, 30000).code
+}
+
+test.case("dashboard: served by the daemon, and stops with it", fn() {
+    env = setup()
+    with_dashboard(env, "127.0.0.1:0")
+    p = proc.spawn("ecko", [MAIN, "daemon", "--config", env.config])
+    line = wait_stderr(p, "dashboard listening")
+    test.ok(line != null, "dashboard started")
+    dport = int(re.captures(r"port=(\d+)", line)[1])
+    test.ok(wait_for(fn() fake_s3.object("pc" + env.root + "/a.txt") != null, 20000), "job ran")
+    test.ok(wait_for(fn() http.get("http://127.0.0.1:{dport}/healthz").status == 200, 10000), "healthy")
+    page = http.get("http://127.0.0.1:{dport}/")
+    test.ok(contains(page.body, "home"), "job on page")
+    test.eq(stop_daemon(p), 0)
+})
+
+test.case("dashboard: a taken port is logged and backups still run", fn() {
+    env = setup()
+    with_dashboard(env, "127.0.0.1:{port}")
+    p = proc.spawn("ecko", [MAIN, "daemon", "--config", env.config])
+    test.ok(wait_stderr(p, "dashboard could not start") != null, "error logged")
+    test.ok(wait_for(fn() fake_s3.object("pc" + env.root + "/a.txt") != null, 20000), "job still ran")
+    test.eq(stop_daemon(p), 0)
 })
 
 fake_s3.stop()

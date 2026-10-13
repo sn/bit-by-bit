@@ -1,0 +1,143 @@
+name: Release
+
+# Publish a package version by pushing a tag that matches ecko.json:
+#
+#   git tag v0.9.4 && git push origin v0.9.4
+#
+# The tag is the source of truth for the version, and the first job of this
+# workflow is to refuse a tag that disagrees with the manifest.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the tag matches ecko.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(jq -r .version ecko.json)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag does not match ecko.json version $version"
+            exit 1
+          fi
+
+      # Packages are Ecko source, so the toolchain is the released binary. It
+      # has no libssl dependency and a glibc 2.35 floor, so it runs here
+      # unmodified.
+      - name: Install Ecko
+        run: |
+          curl -fSL --retry 3 --retry-delay 2 \
+            https://ecko.sh/dl/latest/ecko-x86_64-linux.tar.gz -o /tmp/ecko.tar.gz
+          mkdir -p /tmp/ecko-extract
+          tar -xzf /tmp/ecko.tar.gz -C /tmp/ecko-extract
+          bin="$(find /tmp/ecko-extract -type f -name ecko | head -1)"
+          test -n "$bin" || { echo "::error::archive has no 'ecko' binary"; exit 1; }
+          sudo install -m 0755 "$bin" /usr/local/bin/ecko
+          ecko --version
+
+      # The toolchain has to be new enough for the line this tag belongs to.
+      #
+      # `dl/latest` is whatever core released last, which is not necessarily
+      # the core this package was written against. Tag a package before that
+      # release lands and the step below installs an older binary, the gate
+      # refuses source using a verb that does not exist yet, and the error
+      # names the verb rather than the cause. mysql-client and redis-client
+      # v0.23.0 both died exactly that way - tagged sixteen hours before core
+      # 0.23.0, refused for `io.close`, and left unpublished for eight days
+      # with nothing saying why. The git install path kept working, so nothing
+      # looked broken; only `releases/latest/download` silently served a
+      # thirteen-release-old zip.
+      #
+      # Compared on MAJOR.MINOR, so a package-only patch is not falsely
+      # refused: mime v0.10.2 against core 0.10.1 is fine, because it targets
+      # the 0.10 line and that line is out. `"ecko"` in ecko.json overrides the
+      # floor for a package that needs a different one from its own version.
+      - name: Toolchain is new enough for this version
+        run: |
+          have=$(ecko --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          want=$(jq -r '.ecko // .version' ecko.json)
+          hm=${have%.*}
+          wm=${want%.*}
+          if [ "$(printf '%s\n%s\n' "$wm" "$hm" | sort -V | head -1)" != "$wm" ]; then
+            echo "::error::this package targets ecko $wm, but dl/latest is $have"
+            echo "::error::if core $wm is not released yet, publish it first and re-tag"
+            exit 1
+          fi
+          echo "toolchain $have satisfies the $wm line"
+
+      # A published package that does not pass its own tests is worse than an
+      # unpublished one: it goes out under a version number people will pin.
+      - name: Check and test
+        run: |
+          # Recursive: tests/ and demo/ are sources too, and a non-recursive
+          # glob let four packages drift out of format unnoticed.
+          find . -name '*.ecko' -not -path './vendor/*' -print0 > /tmp/sources
+          xargs -0 -a /tmp/sources ecko fmt --check
+          xargs -0 -a /tmp/sources ecko check
+          ecko test
+
+      # Every export should carry a `##` doc comment. The generated reference is
+      # part of the package's surface, and a hole in it ships to every reader.
+      - name: Require documented exports
+        run: |
+          undocumented=$(ecko doc main.ecko | grep -c 'Undocumented' || true)
+          if [ "$undocumented" != "0" ]; then
+            echo "::error::$undocumented export(s) have no ## doc comment"
+            ecko doc main.ecko | grep -B2 'Undocumented' | grep '^## `' || true
+            exit 1
+          fi
+
+      - name: Pack
+        run: |
+          # Named after the repository so `ecko get github.com/<owner>/<repo>`
+          # resolves to it. The archive is the manifest, the sources at the
+          # root, and - when this package declares dependencies - the vendored
+          # copies of them plus the lock/sum files that pin them. A consumer's
+          # `ecko get` never fetches transitively, so a dependency left out of
+          # this zip is a dependency missing at the consumer's import time, no
+          # matter that it works in this checkout. tests/ and docs/ still stay
+          # out; they are not needed to use the package. -X keeps the archive
+          # byte-identical across repeated packs of the same sources.
+          name="${GITHUB_REPOSITORY##*/}"
+
+          deps=$(jq -r '.dependencies // {} | keys | length' ecko.json)
+          if [ "$deps" != "0" ]; then
+            if [ ! -d vendor ]; then
+              echo "::error::ecko.json declares $deps dependency(ies) but there is no vendor/ directory - run 'ecko get' and commit the result before tagging"
+              exit 1
+            fi
+            missing=0
+            while IFS= read -r path; do
+              if [ ! -f "vendor/$path/ecko.json" ]; then
+                echo "::error::dependency '$path' is not vendored at vendor/$path/ecko.json - run 'ecko get' before tagging"
+                missing=1
+              fi
+            done < <(jq -r '.dependencies | to_entries[] | (.value | if type == "object" then .path else (split("@")[0]) end)' ecko.json)
+            [ "$missing" = "0" ] || exit 1
+          fi
+
+          extra=""
+          [ -f ecko.lock ] && extra="$extra ecko.lock"
+          [ -f ecko.sum ] && extra="$extra ecko.sum"
+          [ -d vendor ] && extra="$extra vendor"
+
+          zip -X -r "$name.zip" ecko.json *.ecko $extra
+          unzip -l "$name.zip"
+          echo "PKG_ZIP=$name.zip" >> "$GITHUB_ENV"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "$PKG_ZIP"

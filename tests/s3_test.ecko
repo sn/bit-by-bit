@@ -137,6 +137,23 @@ test.case("classify", fn() {
     test.eq(s3.classify(404, "<Error><Code>NoSuchBucket</Code></Error>"), "fail")
 })
 
+test.case("listing decodes numeric character references", fn() {
+    page = s3.parse_listing("<ListBucketResult><Contents><Key>a&#9;b&#x41;&amp;</Key><Size>3</Size></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>t&amp;1</NextContinuationToken></ListBucketResult>")
+    test.eq(page, { objects: [{ key: "a\tbA&", size: 3 }], truncated: true, token: "t&1" })
+})
+
+test.case("a truncated listing raises instead of answering short", fn() {
+    body = "<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><Contents><Key>b"
+    test.err(fn() s3.parse_listing(body), "malformed")
+    try { s3.parse_listing(body) } catch (e) { test.eq(get(e, "kind"), "s3_retry") }
+})
+
+test.case("classify copes with a body that is not XML", fn() {
+    test.eq(s3.classify(502, "<html><body>Bad gateway</html>"), "retry")
+    test.eq(s3.classify(400, "<html><body>nope"), "fail")
+    test.eq(s3.classify(200, "<html>"), "ok")
+})
+
 test.case("backoff stays under the cap", fn() {
     r = { attempts: 10, base_delay_ms: 100, max_delay_ms: 1000 }
     for a in 1..10 { test.ok(s3.backoff_ms(r, a) <= 1000, "cap") }

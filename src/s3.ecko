@@ -5,6 +5,9 @@ import std.random
 import std.re
 import std.time
 import "./sigv4.ecko"
+# By path rather than `import xml`: in a built binary, a package import from
+# a file below the project root can't find ecko.json (docs/feedback.md #1).
+import "../vendor/github.com/ecko-lang/xml/main.ecko" as xml
 
 let REQUEST_TIMEOUT_MS = 300000
 ## User metadata travels as x-amz-meta-bbb-<name> headers.
@@ -49,25 +52,29 @@ fn query_string(query) {
 
 # ---- Errors ----------------------------------------------------------------
 
-fn xml_tag(body, tag) {
-    caps = re.captures("(?s)<" + tag + ">(.*?)</" + tag + ">", body)
-    if caps == null { null } else { xml_unescape(caps[1]) }
+# An error body, or null when it isn't XML (a proxy's HTML page, an empty
+# body). Only used to read error codes, so a bad body is not itself an error.
+fn error_doc(body) = try { xml.parse(body) } catch (e) { null }
+
+fn error_field(body, field) {
+    doc = error_doc(body)
+    if doc == null { null } else { xml.text(doc, "Error/" + field) }
 }
 
-export fn xml_unescape(s) = s
-    |> replace("&lt;", "<")
-    |> replace("&gt;", ">")
-    |> replace("&quot;", "\"")
-    |> replace("&apos;", "'")
-    |> replace("&#13;", "\r")
-    |> replace("&amp;", "&")
+# A successful response's XML. A body that doesn't parse (cut off, or not
+# XML) raises s3_retry: answering short could make a listing look empty.
+fn response_doc(body, what) {
+    try { xml.parse(body) } catch (e) {
+        error({ kind: "s3_retry", message: "{what}: malformed XML response ({get(e, "message") ?? e})" })
+    }
+}
 
 ## Classify a finished response: "ok", "retry", "auth", "not_found" or "fail".
 export fn classify(status, body) {
-    code = xml_tag(body, "Code")
+    code = error_field(body, "Code")
     if status >= 200 and status < 300 {
         # CompleteMultipartUpload can answer 200 with an error in the body.
-        if code != null and contains(body, "<Error>") {
+        if code != null {
             return if contains(RETRY_CODES, code) { "retry" } else { "fail" }
         }
         return "ok"
@@ -80,8 +87,8 @@ export fn classify(status, body) {
 }
 
 fn fail_for(cls, method, key, status, body) {
-    code = string(xml_tag(body, "Code"))
-    msg = string(xml_tag(body, "Message"))
+    code = string(error_field(body, "Code"))
+    msg = string(error_field(body, "Message"))
     text = "{method} {key}: HTTP {status} {code} {msg}"
     match cls {
         "retry" => error({ kind: "s3_retry", message: text, status: status })
@@ -213,6 +220,14 @@ export fn delete_object(c, key) {
     null
 }
 
+## One ListObjectsV2 page: { objects: [{ key, size }], truncated, token }.
+## Raises s3_retry when the body isn't well-formed XML.
+export fn parse_listing(body) {
+    doc = response_doc(body, "ListObjectsV2")
+    objects = map(xml.find(doc, "Contents"), fn(o) { key: xml.text(o, "Key"), size: int(xml.text(o, "Size") ?? "0") })
+    { objects: objects, truncated: xml.text(doc, "IsTruncated") == "true", token: xml.text(doc, "NextContinuationToken") }
+}
+
 ## Every object under `prefix`: [{ key, size }], following continuation tokens.
 export fn list_objects(c, prefix) {
     mut out = []
@@ -220,12 +235,10 @@ export fn list_objects(c, prefix) {
     while true {
         mut query = { "list-type": "2", prefix: prefix }
         if token != null { query = set(query, "continuation-token", token) }
-        body = request(c, "GET", "", { query: query }).body
-        for m in re.captures_all(r"(?s)<Contents>(.*?)</Contents>", body) {
-            out = push(out, { key: xml_tag(m[1], "Key"), size: int(xml_tag(m[1], "Size") ?? "0") })
-        }
-        if xml_tag(body, "IsTruncated") != "true" { break }
-        token = xml_tag(body, "NextContinuationToken")
+        page = parse_listing(request(c, "GET", "", { query: query }).body)
+        out = out + page.objects
+        unless page.truncated { break }
+        token = page.token
         if token == null { break }
     }
     out
@@ -236,7 +249,7 @@ export fn list_objects(c, prefix) {
 export fn create_multipart(c, key, meta) {
     headers = merge(merge(meta_headers(meta), sse_headers(c)), { "content-type": "application/octet-stream" })
     body = request(c, "POST", key, { query: { uploads: "" }, headers: headers }).body
-    id = xml_tag(body, "UploadId")
+    id = xml.text(response_doc(body, "CreateMultipartUpload for {key}"), "UploadId")
     if id == null { error({ kind: "s3_config", message: "CreateMultipartUpload for {key} returned no UploadId" }) }
     id
 }
@@ -253,16 +266,16 @@ export fn upload_part_copy(c, key, upload_id, n, src_key, first, last) {
     source = "/" + c.dest.bucket + "/" + sigv4.uri_encode(src_key, false)
     headers = { "x-amz-copy-source": source, "x-amz-copy-source-range": "bytes={first}-{last}" }
     body = request(c, "PUT", key, { query: { partNumber: string(n), uploadId: upload_id }, headers: headers }).body
-    etag = xml_tag(body, "ETag")
+    etag = xml.text(response_doc(body, "UploadPartCopy for {key}"), "ETag")
     if etag == null { error({ kind: "s3_rejected", message: "UploadPartCopy for {key} returned no ETag" }) }
     etag
 }
 
 ## parts: [{ n, etag }] in order.
 export fn complete_multipart(c, key, upload_id, parts) {
-    items = join(map(parts, fn(p) "<Part><PartNumber>{p.n}</PartNumber><ETag>{p.etag}</ETag></Part>"), "")
-    xml = "<CompleteMultipartUpload>" + items + "</CompleteMultipartUpload>"
-    request(c, "POST", key, { query: { uploadId: upload_id }, body: bytes(xml), headers: { "content-type": "application/xml" } })
+    items = join(map(parts, fn(p) "<Part><PartNumber>{p.n}</PartNumber><ETag>" + xml.escape(p.etag) + "</ETag></Part>"), "")
+    payload = "<CompleteMultipartUpload>" + items + "</CompleteMultipartUpload>"
+    request(c, "POST", key, { query: { uploadId: upload_id }, body: bytes(payload), headers: { "content-type": "application/xml" } })
     null
 }
 

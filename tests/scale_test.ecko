@@ -5,8 +5,8 @@ import "../src/planner.ecko"
 import "../src/scanner.ecko"
 import "../src/util.ecko"
 
-# Guards against quadratic list/map building: in Ecko, set() on a map and
-# pop()/take() on a list copy the whole collection.
+# Guards against quadratic list/map building: before Ecko 0.66, set() on a map
+# and pop()/take() on a list copied the whole collection.
 let N = 100000
 
 test.case("planning 100k files is fast", fn() {

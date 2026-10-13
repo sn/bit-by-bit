@@ -2,12 +2,14 @@ import std.fs
 import std.time
 import std.signal
 import std.bg
+import std.http
 import "./config.ecko"
 import "./state.ecko"
 import "./scheduler.ecko"
 import "./runner.ecko"
 import "./logging.ecko"
 import "./lock.ecko"
+import "./dashboard.ecko"
 
 let DRAIN_MS = 60000
 
@@ -31,6 +33,20 @@ export fn run(config_path) {
     db = state.open(cfg.state_dir)
     stale = state.mark_interrupted(db, time.now())
     if stale > 0 { logging.emit("warn", "marked runs interrupted by the last shutdown as failed", { count: stale }) }
+    started = time.now()
+    # The dashboard reads the live config through this cell, so a reload shows up there too.
+    cfg_cell = cell(cfg)
+    mut dashboard_up = false
+    if cfg.dashboard != null {
+        try {
+            dport = dashboard.start(cfg_cell, cfg.state_dir, started)
+            dashboard_up = true
+            logging.emit("info", "dashboard listening", { host: cfg.dashboard.host, port: dport })
+        } catch (e) {
+            # Backups matter more than the dashboard: log it and carry on.
+            logging.emit("error", string(get(e, "message") ?? e), {})
+        }
+    }
     sigs = signal.on(["term", "int", "hup"])
     stopping = cell(false)
     should_stop = fn() cell_get(stopping)
@@ -62,6 +78,7 @@ export fn run(config_path) {
         if sig == "hup" {
             try {
                 cfg = config.load(config_path)
+                cell_set(cfg_cell, cfg)
                 logging.setup(cfg.log)
                 logging.emit("info", "config reloaded", { jobs: len(cfg.jobs) })
             } catch (e) {
@@ -79,6 +96,7 @@ export fn run(config_path) {
     for t in values(tasks) {
         if bg.status(t) == "running" { bg.cancel(t) }
     }
+    if dashboard_up { http.stop() }
     signal.close(sigs)
     state.close(db)
     lock.release(lock_path)

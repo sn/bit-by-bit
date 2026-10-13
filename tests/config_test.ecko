@@ -110,6 +110,31 @@ test.case("credentials file with CRLF line endings", fn() {
     test.eq(reveal(c.secret_key), "s3cr3t")
 })
 
+test.case("dashboard is off unless configured", fn() {
+    test.eq(config.validate(base()).config.dashboard, null)
+})
+
+test.case("dashboard listen parses host and port", fn() {
+    r = config.validate(merge(base(), { dashboard: { listen: "127.0.0.1:8484" } }))
+    test.eq(r.errors, [])
+    test.eq(r.config.dashboard, { host: "127.0.0.1", port: 8484, allow_remote: false })
+    test.eq(config.validate(merge(base(), { dashboard: { listen: "localhost:0" } })).config.dashboard.port, 0)
+})
+
+test.case("dashboard refuses non-loopback unless allow_remote", fn() {
+    r = config.validate(merge(base(), { dashboard: { listen: "0.0.0.0:8484" } }))
+    test.ok(has_error(r, "$.dashboard.listen: 0.0.0.0 is not a loopback address"), string(r.errors))
+    r2 = config.validate(merge(base(), { dashboard: { listen: "0.0.0.0:8484", allow_remote: true } }))
+    test.eq(r2.errors, [])
+})
+
+test.case("dashboard config errors", fn() {
+    test.ok(has_error(config.validate(merge(base(), { dashboard: { listen: "8484" } })), "$.dashboard.listen: must be host:port"), "format")
+    test.ok(has_error(config.validate(merge(base(), { dashboard: { listen: "127.0.0.1:70000" } })), "$.dashboard.listen: port must be 0-65535"), "range")
+    test.ok(has_error(config.validate(merge(base(), { dashboard: { listen: "127.0.0.1:1", lisen: 1 } })), "$.dashboard.lisen: unknown key"), "unknown")
+    test.ok(has_error(config.validate(merge(base(), { dashboard: "on" })), "$.dashboard: must be an object"), "type")
+})
+
 test.case("not an object", fn() {
     test.eq(config.validate([1]).errors, ["$: config must be a JSON object"])
 })

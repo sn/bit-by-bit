@@ -1,0 +1,36 @@
+# xml demo: read an RSS-style feed, then an S3 ListObjectsV2 page.
+import "./main.ecko"
+xml = main
+
+feed = "<rss><channel><title>Ecko News</title><item><title>Release</title><link>https://ecko.sh/1</link></item><item><title>Docs &amp; guides</title><link>https://ecko.sh/2</link></item></channel></rss>"
+doc = xml.parse(feed)
+
+print("feed:  {xml.text(doc, "channel/title")}")
+items = xml.find(doc, "channel/item")
+print("items: {len(items)}")
+for it in items {
+    print("  - {xml.text(it, "title")} -> {xml.text(it, "link")}")
+}
+
+page = """
+    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <IsTruncated>true</IsTruncated>
+      <Contents><Key>db/a.sql.gz</Key><ETag>&quot;9b2cf535&quot;</ETag><Size>1024</Size></Contents>
+      <Contents><Key>db/b.sql.gz</Key><ETag>&quot;d41d8cd9&quot;</ETag><Size>2048</Size></Contents>
+      <NextContinuationToken>1ueGcxLPRx1Tr</NextContinuationToken>
+    </ListBucketResult>
+"""
+listing = xml.parse(page)
+for c in xml.find(listing, "Contents") {
+    print("{xml.text(c, "Key")}  {xml.text(c, "Size")} bytes  etag {xml.text(c, "ETag")}")
+}
+if xml.text(listing, "IsTruncated") == "true" {
+    print("next page: {xml.text(listing, "NextContinuationToken")}")
+}
+
+try { xml.parse("<a><b>oops</a>") } catch (e) {
+    match get(e, "kind") {
+        "parse" => print("refused ({e.reason}) at line {e.line}, column {e.column}")
+        _ => error(e)
+    }
+}
