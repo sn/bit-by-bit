@@ -16,6 +16,14 @@ test.case("put and get round-trip binary bytes", fn() {
     test.eq(s3.get_object(c, "dir/a b.bin"), BINARY)
 })
 
+test.case("an empty body still sends content-length", fn() {
+    fake_s3.reset()
+    s3.put_object(c, "empty", bytes(""), { run: "r1" })
+    test.eq(fake_s3.object("empty").body, bytes(""))
+    s3.copy_object(c, "empty", "_versions/r2/empty")
+    test.eq(fake_s3.object("_versions/r2/empty").body, bytes(""))
+})
+
 test.case("head returns metadata or null", fn() {
     fake_s3.reset()
     s3.put_object(c, "k", bytes("hi"), { sha256: "abc", mtime: "123" })

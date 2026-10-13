@@ -80,6 +80,10 @@ fn handle(req) {
     cell_update(log_, fn(l) push(l, req.method + " " + key))
     f = take_fault(req.method, key)
     if f != null { return xml_error(f.status, f.code) }
+    # Real S3 refuses a PUT or POST without content-length, even an empty one.
+    if (req.method == "PUT" or req.method == "POST") and get(req.headers, "content-length") == null {
+        return xml_error(411, "MissingContentLength")
+    }
     unless signature_ok(req, path) { return xml_error(403, "SignatureDoesNotMatch") }
     body = req.body_bytes
     if len(body) > 0 and hash.sha256(body) != get(req.headers, "x-amz-content-sha256") {
