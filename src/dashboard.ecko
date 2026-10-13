@@ -36,6 +36,11 @@ fn job_view(job, db, now) {
     overdue = last != null and last.status != "running" and now - last.started_at > 2 * interval_ms(job.schedule)
     {
         job: job.name,
+        schedule: job.schedule,
+        destination: job.destination,
+        prefix: job.prefix,
+        paths: job.paths,
+        last_good_at: state.last_good_at(db, job.name),
         status: if last == null { "never run" } else { last.status },
         started_at: last_ms,
         finished_at: if last == null { null } else { last.finished_at },
@@ -84,12 +89,33 @@ fn dur_text(ms) {
     if secs < 60 { "{secs}s" } else if secs < 3600 { string(int(secs / 60)) + "m " + string(secs % 60) + "s" } else { string(int(secs / 3600)) + "h " + string(int(secs % 3600 / 60)) + "m" }
 }
 
-fn badge(s) {
-    cls = match s { "ok" => "ok" "partial" => "warn" "running" => "info" "never run" => "muted" _ => "bad" }
-    "<span class=\"badge " + cls + "\">" + esc(s) + "</span>"
+# "3h ago", "in 21h": the age of a time at a glance. The exact time sits next to it.
+fn span_text(ms) {
+    mins = (ms + 30000) // 60000
+    if mins < 1 { "under a minute" } else if mins < 60 { "{mins}m" } else if mins < 2880 { string((mins + 30) // 60) + "h" } else { string((mins + 720) // 1440) + "d" }
 }
 
-fn stat(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(value) + "</dd></div>"
+fn ago_text(ms, now) = if ms == null { "never" } else if now - ms < 60000 { "just now" } else { span_text(now - ms) + " ago" }
+
+fn until_text(ms, now) = if ms <= now { "due now" } else { "in " + span_text(ms - now) }
+
+fn schedule_text(s) {
+    if s.kind == "every" {
+        mins = s.ms // 60000
+        if mins >= 2880 and mins % 1440 == 0 { "every " + string(mins // 1440) + "d" } else if mins % 60 == 0 { "every " + string(mins // 60) + "h" } else { "every {mins}m" }
+    } else {
+        "daily at " + pad2(s.hour) + ":" + pad2(s.minute)
+    }
+}
+
+fn pad2(n) = if n < 10 { "0" + string(n) } else { string(n) }
+
+let GLYPHS = { ok: "✓", partial: "!", running: "…", failed: "×", "never run": "–" }
+
+fn tone(s) = match s { "ok" => "ok" "partial" => "warn" "running" => "info" "never run" => "muted" _ => "bad" }
+
+# A status is always its word; the colour and glyph only repeat it.
+fn badge(s) = "<span class=\"badge " + tone(s) + "\"><span aria-hidden=\"true\">" + (get(GLYPHS, s) ?? "×") + "</span> " + esc(s) + "</span>"
 
 fn li(p) = "<li>" + esc(p) + "</li>"
 
@@ -105,58 +131,141 @@ fn problems_html(j) {
         "<details id=\"problems-" + j.job + "\"><summary id=\"problems-" + j.job + "-more\">Show " + string(rest) + " more " + word + "</summary><ul class=\"problems\">" +
             join(map(drop(j.problems, SHOWN_PROBLEMS), li), "") + "</ul></details>"
     }
-    "<h3>problems (" + string(n) + ")</h3><ul class=\"problems\">" + join(map(take(j.problems, SHOWN_PROBLEMS), li), "") + "</ul>" + more
+    "<section class=\"block\"><h3>problems <span class=\"count warn\">" + string(n) + "</span></h3><ul class=\"problems\">" +
+        join(map(take(j.problems, SHOWN_PROBLEMS), li), "") + "</ul>" + more + "</section>"
 }
 
 fn run_row(r) = "<tr><td>" + esc(at_text(r.started_at)) + "</td><td>" + badge(r.status) + "</td><td>" + esc(dur_text(r.duration_ms)) +
     "</td><td class=\"num\">" + esc(r.uploaded) + "</td><td class=\"num\">" + esc(r.replaced) + "</td><td class=\"num\">" + esc(r.deleted) +
     "</td><td class=\"num\">" + esc(status.size_text(r.bytes)) + "</td><td class=\"num\">" + esc(r.problem_count) + "</td></tr>"
 
+# The recent runs as a strip, oldest first: a glance at the pattern. The table
+# below carries the same facts as text, so the strip is hidden from assistive tech.
+fn history(j) {
+    if len(j.runs) == 0 { return "" }
+    ticks = join(map(reverse(j.runs), fn(r) "<li class=\"tick " + tone(r.status) + "\" title=\"" + esc(at_text(r.started_at) + " · " + r.status) + "\">" +
+        (get(GLYPHS, r.status) ?? "×") + "</li>"), "")
+    "<ol class=\"history\" aria-hidden=\"true\">" + ticks + "</ol>"
+}
+
+fn kpi(label, value, detail) = "<div class=\"kpi\"><dt>" + label + "</dt><dd><span class=\"value\">" + esc(value) + "</span><span class=\"when\">" + esc(detail) + "</span></dd></div>"
+
+fn stat(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(value) + "</dd></div>"
+
 fn job_card(j, now) {
-    due = if j.next_due <= now { "due now" } else { at_text(j.next_due) }
-    overdue = if j.overdue { " <span class=\"badge bad\">overdue</span>" } else { "" }
-    stats = "<dl class=\"stats\">" + stat("last run", at_text(j.started_at)) + stat("next run", due) +
-        stat("uploaded", j.uploaded) + stat("replaced", j.replaced) + stat("deleted", j.deleted) + stat("pruned", j.pruned) +
-        stat("data", status.size_text(j.bytes)) + "</dl>"
-    err = if j.error == null { "" } else { "<p class=\"error\"><strong>error:</strong> " + esc(j.error) + "</p>" }
-    table = if len(j.runs) == 0 { "" } else {
-        "<h3>recent runs</h3><div class=\"table-wrap\" id=\"runs-" + j.job + "\" role=\"region\" aria-label=\"recent runs of " + esc(j.job) + "\" tabindex=\"0\"><table>" +
+    overdue = if j.overdue { " <span class=\"badge bad\"><span aria-hidden=\"true\">!</span> overdue</span>" } else { "" }
+    meta = "<p class=\"job-meta\"><span>" + esc(schedule_text(j.schedule)) + "</span><span>" + esc(j.destination + "/" + j.prefix) +
+        "</span><span class=\"paths\">" + esc(join(j.paths, ", ")) + "</span></p>"
+    took = if j.started_at == null { "" } else if j.finished_at == null { "running for " + span_text(now - j.started_at) } else { "took " + dur_text(j.finished_at - j.started_at) }
+    kpis = "<dl class=\"kpis\">" +
+        kpi("last good backup", ago_text(j.last_good_at, now), if j.last_good_at == null { "no run has worked yet" } else { at_text(j.last_good_at) }) +
+        kpi("next run", until_text(j.next_due, now), if j.next_due <= now { "" } else { at_text(j.next_due) }) +
+        kpi("last run", ago_text(j.started_at, now), if j.started_at == null { "" } else { at_text(j.started_at) + " · " + took }) +
+        "</dl>"
+    stats = if j.finished_at == null { "" } else {
+        "<section class=\"block\"><h3>changes in the last run</h3><dl class=\"stats\">" + stat("uploaded", j.uploaded) + stat("replaced", j.replaced) +
+            stat("deleted", j.deleted) + stat("pruned", j.pruned) + stat("data", status.size_text(j.bytes)) + "</dl></section>"
+    }
+    err = if j.error == null { "" } else { "<div class=\"callout\"><strong>last run failed</strong><p>" + esc(j.error) + "</p></div>" }
+    runs = if len(j.runs) == 0 {
+        due = if j.next_due <= now { "as soon as the daemon is free" } else { at_text(j.next_due) }
+        "<div class=\"empty\"><p><strong>No runs yet.</strong> The first run starts " + esc(due) + ". To start it now: <code>sudo bit-by-bit run " + esc(j.job) + "</code></p></div>"
+    } else {
+        "<section class=\"block\"><div class=\"block-head\"><h3>recent runs</h3>" + history(j) + "</div>" +
+            "<div class=\"table-wrap\" id=\"runs-" + j.job + "\" role=\"region\" aria-label=\"recent runs of " + esc(j.job) + "\" tabindex=\"0\"><table>" +
             "<thead><tr><th>started</th><th>status</th><th>took</th><th class=\"num\">uploaded</th><th class=\"num\">replaced</th>" +
             "<th class=\"num\">deleted</th><th class=\"num\">data</th><th class=\"num\">problems</th></tr></thead><tbody>" +
-            join(map(j.runs, run_row), "") + "</tbody></table></div>"
+            join(map(j.runs, run_row), "") + "</tbody></table></div></section>"
     }
-    "<section class=\"card\" aria-labelledby=\"job-" + j.job + "\"><h2 id=\"job-" + j.job + "\">" + esc(j.job) + " " + badge(j.status) + overdue + "</h2>" +
-        stats + err + problems_html(j) + table + "</section>"
+    "<section class=\"job " + tone(j.status) + "\" aria-labelledby=\"job-" + j.job + "\">" +
+        "<header class=\"job-head\"><h2 id=\"job-" + j.job + "\">" + esc(j.job) + "</h2>" + badge(j.status) + overdue + meta + "</header>" +
+        "<div class=\"job-body\"><div class=\"facts\">" + kpis + stats + "</div><div class=\"detail\">" + err + problems_html(j) + runs + "</div></div></section>"
 }
 
 let CSS = r"""
-    :root { color-scheme: light; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
-    body { font: 0.9375rem/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 60rem; padding: 1.5rem 1rem; color: #1f2328; background: #f6f8fa; }
-    header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; margin-bottom: 1.25rem; }
-    h1 { font-size: 1.375rem; line-height: 1.25; margin: 0 0 0.25rem; }
-    h2 { font-size: 1.125rem; line-height: 1.3; margin: 0 0 0.75rem; }
-    h3 { font-size: 0.8125rem; line-height: 1.3; font-weight: 600; color: #59636e; margin: 1rem 0 0.25rem; }
-    .sub { color: #59636e; margin: 0; }
-    button { font: inherit; font-size: 0.875rem; padding: 0.25rem 0.75rem; border: 1px solid #d1d9e0; border-radius: 6px; background: #fff; color: #1f2328; cursor: pointer; }
-    .card, .alert { background: #fff; border: 1px solid #d1d9e0; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
-    .alert { border-color: #ff8182; border-inline-start-width: 4px; }
-    .alert h2 { color: #cf222e; font-size: 1rem; margin-bottom: 0.25rem; }
-    .alert ul { margin: 0; padding-inline-start: 1.25rem; }
-    .badge { display: inline-block; font-size: 0.75rem; font-weight: 600; line-height: 1.5; padding: 0 0.5rem; border-radius: 10px; vertical-align: middle; white-space: nowrap; }
-    .ok { background: #dafbe1; color: #1a7f37; } .warn { background: #fff8c5; color: #9a6700; }
-    .bad { background: #ffebe9; color: #cf222e; } .info { background: #ddf4ff; color: #0969da; } .muted { background: #eff2f5; color: #59636e; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 7rem), 1fr)); gap: 0.5rem 1rem; margin: 0; }
-    .stats dt { font-size: 0.8125rem; color: #59636e; }
-    .stats dd { margin: 0; font-variant-numeric: tabular-nums; }
-    .error { color: #cf222e; margin: 1rem 0 0; overflow-wrap: anywhere; }
-    .problems { margin: 0; padding-inline-start: 1.25rem; color: #9a6700; overflow-wrap: anywhere; }
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f8fa; --surface: #ffffff; --surface-sunk: #f6f8fa; --border: #d1d9e0; --border-muted: #e6eaef;
+      --text: #1f2328; --text-muted: #59636e; --link: #0969da;
+      --ok-fg: #1a7f37; --ok-bg: #dafbe1; --warn-fg: #9a6700; --warn-bg: #fff8c5;
+      --bad-fg: #cf222e; --bad-bg: #ffebe9; --info-fg: #0969da; --info-bg: #ddf4ff; --muted-fg: #59636e; --muted-bg: #eff2f5;
+      --radius: 8px; --gutter: clamp(1rem, 3vw, 2.5rem);
+      -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117; --surface: #151b23; --surface-sunk: #0d1117; --border: #3d444d; --border-muted: #262c36;
+        --text: #f0f6fc; --text-muted: #9198a1; --link: #58a6ff;
+        --ok-fg: #3fb950; --ok-bg: #12261e; --warn-fg: #d29922; --warn-bg: #2b2111;
+        --bad-fg: #f85149; --bad-bg: #2d1416; --info-fg: #58a6ff; --info-bg: #0f2540; --muted-fg: #9198a1; --muted-bg: #262c36;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 0.9375rem/1.5 system-ui, sans-serif; color: var(--text); background: var(--bg); }
+    h1, h2, h3, p, dl, dd, ol, ul { margin: 0; }
+    code { font: 0.8125rem ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--muted-bg); padding: 0.125rem 0.375rem; border-radius: 4px; }
+
+    .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.5rem; padding: 0.875rem var(--gutter); background: var(--surface); border-bottom: 1px solid var(--border); }
+    .brand { display: flex; align-items: center; gap: 0.75rem; }
+    h1 { font-size: 1.125rem; line-height: 1.3; }
+    .sub { color: var(--text-muted); font-size: 0.875rem; flex: 1 1 20rem; }
+    button { font: inherit; font-size: 0.875rem; padding: 0.375rem 0.875rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); cursor: pointer; }
+
+    main { display: grid; gap: 1.25rem; padding: 1.5rem var(--gutter) 3rem; }
+
+    .badge { display: inline-flex; align-items: center; gap: 0.25rem; font-size: 0.75rem; font-weight: 600; line-height: 1.5; padding: 0 0.5rem; border-radius: 999px; white-space: nowrap; }
+    .ok { --tone-fg: var(--ok-fg); --tone-bg: var(--ok-bg); } .warn { --tone-fg: var(--warn-fg); --tone-bg: var(--warn-bg); }
+    .bad { --tone-fg: var(--bad-fg); --tone-bg: var(--bad-bg); } .info { --tone-fg: var(--info-fg); --tone-bg: var(--info-bg); }
+    .muted { --tone-fg: var(--muted-fg); --tone-bg: var(--muted-bg); }
+    .badge, .tick, .count { color: var(--tone-fg); background: var(--tone-bg); }
+
+    .alert { background: var(--surface); border: 1px solid var(--border); border-inline-start: 4px solid var(--bad-fg); border-radius: var(--radius); padding: 1rem 1.25rem; }
+    .alert h2 { color: var(--bad-fg); font-size: 1rem; margin-bottom: 0.25rem; }
+    .alert ul { padding-inline-start: 1.25rem; }
+
+    .job { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .job-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; padding: 1rem 1.25rem; border-bottom: 1px solid var(--border-muted); border-inline-start: 4px solid var(--tone-fg); }
+    .job-head h2 { font-size: 1.25rem; line-height: 1.3; }
+    .job-meta { display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; margin-inline-start: auto; color: var(--text-muted); font-size: 0.875rem; }
+    .job-meta .paths { overflow-wrap: anywhere; }
+    .job-body { display: grid; grid-template-columns: minmax(0, 1fr); }
+    .facts, .detail { padding: 1.25rem; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem; align-content: start; min-width: 0; }
+    .facts { background: var(--surface-sunk); }
+    @media (min-width: 60rem) {
+      .job-body { grid-template-columns: minmax(17rem, 22rem) minmax(0, 1fr); }
+      .facts { border-inline-end: 1px solid var(--border-muted); }
+    }
+
+    .kpis { display: grid; gap: 1rem; }
+    .kpi dt, .stats dt, h3 { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); letter-spacing: 0.04em; text-transform: uppercase; }
+    .kpi dd { display: grid; }
+    .kpi .value { font-size: 1.5rem; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+    .kpi .when { color: var(--text-muted); font-size: 0.8125rem; font-variant-numeric: tabular-nums; }
+    h3 { margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+    .count { font-size: 0.75rem; padding: 0 0.4rem; border-radius: 999px; letter-spacing: 0; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr)); gap: 0.75rem 1rem; }
+    .stats dd { font-size: 1.0625rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    .callout { border-inline-start: 4px solid var(--bad-fg); background: var(--bad-bg); border-radius: 6px; padding: 0.75rem 1rem; }
+    .callout strong { color: var(--bad-fg); }
+    .callout p { margin-top: 0.25rem; overflow-wrap: anywhere; font-size: 0.875rem; }
+    .problems { padding-inline-start: 1.25rem; font: 0.8125rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .problems li::marker { color: var(--warn-fg); }
     details { margin-top: 0.25rem; }
-    summary { cursor: pointer; color: #0969da; width: fit-content; }
-    .table-wrap { overflow-x: auto; }
-    table { border-collapse: collapse; width: 100%; font-size: 0.8125rem; }
-    th, td { text-align: start; padding: 0.25rem 0.5rem; border-top: 1px solid #eff2f5; white-space: nowrap; }
-    th:first-child, td:first-child { padding-inline-start: 0; }
-    th { color: #59636e; font-weight: 600; }
+    summary { cursor: pointer; color: var(--link); width: fit-content; font-size: 0.875rem; }
+    .empty { border: 1px dashed var(--border); border-radius: var(--radius); padding: 1.25rem; color: var(--text-muted); }
+    .empty strong { color: var(--text); }
+
+    .block-head { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+    .block-head h3 { margin: 0; }
+    .history { display: flex; gap: 0.25rem; padding: 0; list-style: none; }
+    .tick { display: grid; place-items: center; width: 1.25rem; height: 1.25rem; border-radius: 4px; font-size: 0.6875rem; font-weight: 700; }
+
+    .table-wrap { overflow-x: auto; width: fit-content; max-width: 100%; border: 1px solid var(--border-muted); border-radius: 6px; }
+    table { border-collapse: collapse; font-size: 0.8125rem; }
+    th, td { text-align: start; padding: 0.5rem 1rem; white-space: nowrap; }
+    th { color: var(--text-muted); font-weight: 600; background: var(--surface-sunk); border-bottom: 1px solid var(--border-muted); }
+    tbody tr + tr td { border-top: 1px solid var(--border-muted); }
     .num { text-align: end; font-variant-numeric: tabular-nums; }
 """
 
@@ -197,7 +306,7 @@ let SCRIPT = r"""
 export fn render_html(snap) {
     now = snap.daemon.now
     health_text = if snap.healthy { "ok" } else { "needs attention" }
-    overall = if snap.healthy { badge("ok") } else { "<span class=\"badge bad\">needs attention</span>" }
+    overall = if snap.healthy { "<span class=\"badge ok\"><span aria-hidden=\"true\">✓</span> all backups healthy</span>" } else { "<span class=\"badge bad\"><span aria-hidden=\"true\">!</span> needs attention</span>" }
     alert = if snap.healthy { "" } else {
         "<section class=\"alert\" aria-labelledby=\"attention\"><h2 id=\"attention\">needs attention</h2><ul>" + join(map(snap.reasons, li), "") + "</ul></section>"
     }
@@ -206,9 +315,9 @@ export fn render_html(snap) {
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
         "<title>bit-by-bit: " + health_text + "</title><style>" + CSS + "</style></head><body>" +
-        "<header><div><h1>bit-by-bit " + overall + "</h1>" +
+        "<header class=\"topbar\"><div class=\"brand\"><h1>bit-by-bit</h1>" + overall + "</div>" +
         "<p class=\"sub\"><span id=\"updated\">daemon up " + esc(dur_text(snap.daemon.uptime_ms)) + " (since " + esc(at_text(snap.daemon.started_at)) +
-        ") &middot; updated " + esc(at_text(now)) + "</span><span id=\"conn\" role=\"status\"></span></p></div>" +
+        ") &middot; updated " + esc(at_text(now)) + "</span><span id=\"conn\" role=\"status\"></span></p>" +
         "<button type=\"button\" id=\"pause\">Pause updates</button></header>" +
         "<main id=\"main\">" + alert + cards + "</main><script>" + script + "</script></body></html>"
 }

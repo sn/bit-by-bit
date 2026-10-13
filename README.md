@@ -194,7 +194,7 @@ The daemon can serve a read-only status page. It's off unless the config has:
 
 | URL | What |
 |---|---|
-| `http://127.0.0.1:8484/` | Each job's status, last and next run, counts, errors, problems and recent runs. Updates in place every 30 seconds (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
+| `http://127.0.0.1:8484/` | Each job's status, how long ago its last good backup finished, when it runs next, its schedule and destination, the last run's changes, errors, problems and recent runs. Full-width, and follows the system light or dark theme. Updates in place every 30 seconds (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
 | `/api/status` | The same data as JSON. |
 | `/healthz` | `200 ok`, or `503` listing why: a job's last run failed, or it hasn't run for more than twice its interval. Point an uptime monitor at it. |
 

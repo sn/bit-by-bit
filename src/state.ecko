@@ -70,6 +70,12 @@ fn decode_run(r) = if r == null { null } else { set(r, "problem_list", if r.prob
 ## The most recent run of a job (any status), or null.
 export fn last_run(db, job) = decode_run(sql.query_one(db, "select * from runs where job = ? order by started_at desc, id desc limit 1", [job]))
 
+## When the job's newest run that worked (ok or partial) finished, or null.
+export fn last_good_at(db, job) {
+    row = sql.query_one(db, "select max(finished_at) as at from runs where job = ? and status in ('ok', 'partial')", [job])
+    if row == null { null } else { row.at }
+}
+
 ## The most recent runs of a job, newest first.
 export fn recent_runs(db, job, n) = map(sql.query(db, "select * from runs where job = ? order by started_at desc, id desc limit ?", [job, n]), decode_run)
 

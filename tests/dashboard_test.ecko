@@ -53,7 +53,33 @@ test.case("GET / renders every job and updates in place, with a pause control", 
     test.ok(contains(r.body, "<main id=\"main\">"), "main landmark")
     test.ok(contains(r.body, "home") and contains(r.body, "dev"), "both jobs")
     test.ok(contains(r.body, "never run"), "dev has not run")
-    test.ok(contains(r.body, "<dt>last run</dt><dd>never</dd>"), "a missing time is a word, not a dash")
+    test.ok(contains(r.body, "No runs yet"), "a job that never ran says so")
+})
+
+# The question a backup dashboard answers first: how old is the newest
+# backup that worked? A failed run after it doesn't make it newer.
+test.case("each job shows how fresh its last good backup is", fn() {
+    reset()
+    record("home", "r1", time.now() - 3 * H, "ok", [], null)
+    record("home", "r2", time.now() - H, "failed", [], "boom")
+    body = http.get(url("/")).body
+    test.ok(contains(body, "last good backup"), "label")
+    test.ok(contains(body, "<span class=\"value\">3h ago</span>"), "fresh from the ok run, not the failed one")
+    s = json.decode(http.get(url("/api/status")).body)
+    test.eq(s.jobs[0].last_good_at, s.jobs[0].runs[1].finished_at)
+    test.eq(s.jobs[1].last_good_at, null)
+})
+
+test.case("each job shows its schedule, destination and paths", fn() {
+    reset()
+    body = http.get(url("/")).body
+    test.ok(contains(body, "every 6h") and contains(body, "daily at 02:30"), "schedules")
+    test.ok(contains(body, "d/p1") and contains(body, "/tmp"), "destination, prefix and path")
+})
+
+test.case("the page uses the full width", fn() {
+    reset()
+    test.ok(not contains(http.get(url("/")).body, "max-width: 60rem"), "no narrow column")
 })
 
 test.case("the tab title carries the overall health", fn() {
