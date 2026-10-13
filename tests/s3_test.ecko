@@ -1,5 +1,7 @@
 import std.test
 import std.encoding
+import std.fs
+import std.hash
 import "../src/s3.ecko"
 import "../testkit/fake_s3.ecko"
 
@@ -30,6 +32,27 @@ test.case("a misconfigured destination says how to fix it", fn() {
     msg = try { s3.put_object(c, "k", bytes("x"), {}) null } catch (e) { e.message }
     fake_s3.reset_faults()
     test.ok(contains(msg, "PermanentRedirect") and contains(msg, "set endpoint and region to the bucket's region"), msg)
+})
+
+# A file is sent as a stream with the hash the caller already computed, so
+# it is never held in memory or hashed again. The body is a function so a
+# retry gets a fresh stream.
+test.case("put_object streams a file with a precomputed hash, retries included", fn() {
+    fake_s3.reset()
+    p = fs.join(fs.temp_dir(), "stream.bin")
+    fs.write(p, BINARY)
+    fake_s3.fail_next("PUT", "streamed", 503, "SlowDown", 1)
+    s3.put_object(c, "streamed", fn() fs.open(p), { run: "r1" }, sha256: hash.sha256(BINARY))
+    fake_s3.reset_faults()
+    test.eq(fake_s3.object("streamed").body, BINARY)
+})
+
+test.case("a body that doesn't match its hash is refused", fn() {
+    fake_s3.reset()
+    p = fs.join(fs.temp_dir(), "changed.bin")
+    fs.write(p, "now different")
+    test.err(fn() s3.put_object(c, "changed", fn() fs.open(p), {}, sha256: hash.sha256("what was hashed")), "XAmzContentSHA256Mismatch")
+    test.eq(fake_s3.object("changed"), null)
 })
 
 test.case("head returns metadata or null", fn() {

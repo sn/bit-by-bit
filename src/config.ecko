@@ -270,7 +270,7 @@ export fn validate(raw) {
         destinations: dests,
         jobs: jobs,
         retry: retry_cfg,
-        concurrency: want_int(raw, "concurrency", "$", 4, 1, 32),
+        concurrency: want_int(raw, "concurrency", "$", 4, 1, 128),
         multipart_threshold: parsed("$.multipart_threshold", fn() duration.parse_size(opt(raw, "multipart_threshold", "64MiB")), 67108864),
         multipart_part_size: part_size,
         dashboard: dashboard,

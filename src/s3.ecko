@@ -159,21 +159,28 @@ export fn request(c, method, key, opts) {
     body = get(opts, "body")
     want_stream = get(opts, "stream") ?? false
     loc = locate(c, key)
-    payload_hash = if body == null { sigv4.EMPTY_SHA256 } else { hash.sha256(body) }
+    # A function body makes a fresh stream for each attempt; it needs the
+    # payload hash up front, since reading the stream to hash it would use it up.
+    lazy = type_of(body) == "function"
+    given_hash = get(opts, "payload_hash")
+    if lazy and given_hash == null { error("s3.request: a function body needs payload_hash") }
+    payload_hash = given_hash ?? (if body == null { sigv4.EMPTY_SHA256 } else { hash.sha256(body) })
     with_retry(c.retry, fn() {
+        send_body = if lazy { body() } else { body }
         base_headers = merge(extra, { host: loc.host, "x-amz-content-sha256": payload_hash })
         req = { method: method, path: loc.path, query: query, headers: base_headers, payload_hash: payload_hash }
         signed = sigv4.sign(req, c.creds, c.dest.region, "s3", amz_now())
-        # Ecko sends no content-length for an empty body, and S3 answers a PUT
-        # or POST without one with 411 (empty files, symlinks, copies).
-        empty = body == null or (type_of(body) == "bytes" and len(body) == 0)
+        # Ecko sends no content-length for an empty bytes body, and S3 answers
+        # a PUT or POST without one with 411 (empty files, symlinks, copies).
+        # A stream carries its own length.
+        empty = send_body == null or (type_of(send_body) == "bytes" and len(send_body) == 0)
         send_headers = merge(remove(signed, "host"), if empty and (method == "PUT" or method == "POST") { { "content-length": "0" } } else { {} })
         url = loc.url + query_string(query)
         resp = match method {
             "GET" => http.get(url, headers: send_headers, timeout: REQUEST_TIMEOUT_MS, stream: want_stream)
             "HEAD" => http.head(url, headers: send_headers, timeout: REQUEST_TIMEOUT_MS)
-            "PUT" => http.put(url, headers: send_headers, body: body ?? bytes(""), timeout: REQUEST_TIMEOUT_MS)
-            "POST" => http.post(url, headers: send_headers, body: body ?? bytes(""), timeout: REQUEST_TIMEOUT_MS)
+            "PUT" => http.put(url, headers: send_headers, body: send_body ?? bytes(""), timeout: REQUEST_TIMEOUT_MS)
+            "POST" => http.post(url, headers: send_headers, body: send_body ?? bytes(""), timeout: REQUEST_TIMEOUT_MS)
             "DELETE" => http.delete(url, headers: send_headers, timeout: REQUEST_TIMEOUT_MS)
             _ => error("s3.request: unsupported method {method}")
         }
@@ -190,12 +197,15 @@ fn meta_headers(meta) = reduce(keys(meta), fn(acc, k) set(acc, META_PREFIX + k, 
 
 fn sse_headers(c) = if c.dest.provider == "s3" and c.dest.server_side_encryption { { "x-amz-server-side-encryption": "AES256" } } else { {} }
 
-## Upload `body` (bytes) to `key` with user metadata `meta` ({name: value}).
-## Returns the ETag.
-export fn put_object(c, key, body, meta) {
-    checksum = if c.dest.provider == "s3" { { "x-amz-checksum-sha256": encoding.base64_encode(hash.sha256_bytes(body)) } } else { {} }
+## Upload `body` to `key` with user metadata `meta` ({name: value}).
+## `body` is bytes, or a function returning a fresh stream (called once per
+## attempt). `sha256` is the body's hex SHA-256 when the caller already has
+## it, and is required for a function body. Returns the ETag.
+export fn put_object(c, key, body, meta, sha256 = null) {
+    sha = sha256 ?? hash.sha256(body)
+    checksum = if c.dest.provider == "s3" { { "x-amz-checksum-sha256": encoding.base64_encode(encoding.hex_decode(sha)) } } else { {} }
     headers = merge(merge(merge(meta_headers(meta), sse_headers(c)), checksum), { "content-type": "application/octet-stream" })
-    resp = request(c, "PUT", key, { headers: headers, body: body })
+    resp = request(c, "PUT", key, { headers: headers, body: body, payload_hash: sha })
     get(resp.headers, "etag")
 }
 
@@ -271,8 +281,10 @@ export fn create_multipart(c, key, meta) {
 }
 
 ## Upload part `n` (1-based) and return its ETag.
-export fn upload_part(c, key, upload_id, n, body) {
-    resp = request(c, "PUT", key, { query: { partNumber: string(n), uploadId: upload_id }, body: body })
+## Upload part `n` of a multipart upload. `body` is bytes, or a function
+## returning a fresh stream with `sha256` its hex hash. Returns the ETag.
+export fn upload_part(c, key, upload_id, n, body, sha256 = null) {
+    resp = request(c, "PUT", key, { query: { partNumber: string(n), uploadId: upload_id }, body: body, payload_hash: sha256 })
     get(resp.headers, "etag")
 }
 

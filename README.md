@@ -86,10 +86,14 @@ See `deploy/config.example.json`. The full field reference is in
 - **Changing `prefix` or the destination** uploads everything to the new place.
   Objects under the old prefix are left alone; delete them yourself if you no
   longer want them.
-- **Concurrency:** `concurrency` workers (default 4, up to 32) each take the
+- **Concurrency:** `concurrency` workers (default 4, up to 128) each take the
   next file as soon as they finish one, so a large file holds up only its own
-  worker. Raise it for trees of many small files. The scan before the uploads
-  also runs in parallel for large trees (except with `follow_symlinks`).
+  worker. Small files are limited by round trips to the provider, not by
+  bandwidth: at 150 ms per request, 16 workers upload about 100 files a
+  second, 64 about 370 and 128 about 530. Use 32-64 for a distant region.
+  Large files go up in parts, 4 at a time, streamed from disk; no file is
+  held in memory. The scan before the uploads also runs in parallel for
+  large trees (except with `follow_symlinks`).
 
 ### AWS S3 setup
 

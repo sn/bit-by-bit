@@ -182,6 +182,45 @@ test.case("a slow upload doesn't hold up the files after it", fn() {
     test.ok(held[0] >= 4, "requests that started during the slow upload: {held[0]}")
 })
 
+test.case("a file that changes after it was hashed is a problem, not a backup", fn() {
+    env = setup()
+    # The provider refuses a body whose hash doesn't match the one signed.
+    fake_s3.fail_next("PUT", "a.txt", 400, "XAmzContentSHA256Mismatch", 1)
+    o = run(env)
+    test.eq(o.status, "partial")
+    test.ok(contains(o.problems, env.root + "/a.txt: changed during upload"), string(o.problems))
+    test.eq(has(state.index(env.db, "t"), env.root + "/a.txt"), false)
+    test.eq(run(env).uploaded, 1)
+})
+
+# Index rows are written in batches. Whatever reached the bucket before a
+# fatal error must still be recorded, or the next run uploads it again.
+test.case("a fatal error mid-run still records every upload that finished", fn() {
+    env = setup()
+    for i in 0..12 { fs.write(fs.join(env.root, "f{i}.txt"), "file {i}") }
+    fake_s3.fail_next("PUT", "f9.txt", 403, "AccessDenied", 1)
+    o = run(env)
+    test.eq(o.status, "failed")
+    stored = filter(keys(fake_s3.objects_()), fn(k) not contains(k, "/_versions/"))
+    indexed = map(keys(state.index(env.db, "t")), fn(p) "pc" + p)
+    test.eq(sort(indexed), sort(stored))
+    test.ok(len(stored) > 0, "some uploads finished before the error")
+})
+
+test.case("a large file streams its parts, several at a time", fn() {
+    env = setup()
+    data = bytes("0123456789abcdef" * 1024)   # 16 KiB: 4 parts of 4 KiB
+    fs.write(fs.join(env.root, "big.bin"), data)
+    fake_s3.delay("big.bin", 300)
+    cfg = merge(CFG, { multipart_threshold: 1000, multipart_part_size: 4096 })
+    o = sync.run(ctx(env, { cfg: cfg }))
+    test.eq(o.status, "ok")
+    test.eq(remote(env, "big.bin").body, data)
+    # create, 4 parts, complete are held. With parts sent one at a time,
+    # at most the two small files can arrive during a held request.
+    test.ok(max(fake_s3.overlaps_()) >= 3, "requests arriving during a held part: {fake_s3.overlaps_()}")
+})
+
 test.case("dry run changes nothing", fn() {
     env = setup()
     o = sync.run(ctx(env, { dry_run: true }))

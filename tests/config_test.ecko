@@ -171,3 +171,10 @@ test.case("credentials from file, env wins", fn() {
     os.unset_env("BBB_MY_DEST_ACCESS_KEY_ID")
     os.unset_env("BBB_MY_DEST_SECRET_ACCESS_KEY")
 })
+
+# Small files are bound by round trips, so high concurrency is the main lever
+# for a first upload over a long link.
+test.case("concurrency goes up to 128", fn() {
+    test.eq(config.validate(merge(base(), { concurrency: 128 })).config.concurrency, 128)
+    test.ok(has_error(config.validate(merge(base(), { concurrency: 129 })), "$.concurrency: must be an integer from 1 to 128"), "129 rejected")
+})

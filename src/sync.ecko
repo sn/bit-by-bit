@@ -2,6 +2,7 @@ import std.fs
 import std.io
 import std.hash
 import std.time
+import std.sql
 import "./s3.ecko"
 import "./state.ecko"
 import "./scanner.ecko"
@@ -10,6 +11,9 @@ import "./sigv4.ecko"
 
 let FATAL_KINDS = ["s3_auth", "s3_config", "s3_retry", "net", "timeout"]
 let MAX_PARTS = 10000
+let RECORD_BATCH = 500
+let PART_PARALLEL = 4
+let RECORD_EVERY_MS = 1000
 let MIB = 1048576
 # S3 refuses a single CopyObject from a source over 5 GiB.
 let COPY_LIMIT = 5368709120
@@ -28,17 +32,6 @@ export fn run_ts_of(ms) = time.format(ms, "%Y%m%dT%H%M%S%.3fZ")
 export fn run_ts_ms(ts) = time.parse_format(ts, "%Y%m%dT%H%M%S%.3fZ")
 
 fn stat(path) = { size: fs.size(path), mtime: fs.modified(path) }
-
-# Read up to n bytes, looping because io.read may return less than asked.
-fn read_up_to(s, n) {
-    mut buf = bytes("")
-    while len(buf) < n {
-        piece = io.read(s, n - len(buf))
-        if piece == null { break }
-        buf = buf + piece
-    }
-    buf
-}
 
 ## The part size for a file of `size` bytes: the configured size, raised (in
 ## whole MiB) when the file would otherwise need more than 10,000 parts.
@@ -86,23 +79,29 @@ fn version_aside(ctx, path, size) {
 
 fn prev_size(action) = if action.prev == null { 0 } else { action.prev.size }
 
-fn upload_multipart(ctx, path, key, meta) {
+# A large file goes up in parts, PART_PARALLEL at a time. Each part is
+# streamed straight from its offset in the file: hashed in one pass, sent in
+# a second, never held in memory.
+fn upload_multipart(ctx, path, key, meta, size) {
     c = ctx.client
     id = s3.create_multipart(c, key, meta)
     state.add_multipart(ctx.db, ctx.job.name, key, id)
-    ps = part_size_for(fs.size(path), ctx.cfg.multipart_part_size)
-    s = fs.open(path)
-    mut parts = []
-    mut n = 1
-    while true {
-        chunk_ = read_up_to(s, ps)
-        if len(chunk_) == 0 and n > 1 { break }
-        etag = s3.upload_part(c, key, id, n, chunk_)
-        parts = push(parts, { n: n, etag: etag })
-        if len(chunk_) < ps { break }
-        n = n + 1
+    ps = part_size_for(size, ctx.cfg.multipart_part_size)
+    count = max([1, int((size + ps - 1) / ps)])
+    fn send_part(n) {
+        first = (n - 1) * ps
+        length = min([ps, size - first])
+        fn open_part() {
+            s = fs.open(path)
+            io.seek(s, first)
+            io.limit(s, length)
+        }
+        { n: n, etag: s3.upload_part(c, key, id, n, open_part, sha256: hash.sha256(open_part())) }
     }
-    io.close(s)
+    mut parts = []
+    for group in chunk(range(1, count + 1), PART_PARALLEL) {
+        parts = parts + (if len(group) == 1 { [send_part(group[0])] } else { pmap(group, send_part) })
+    }
     s3.complete_multipart(c, key, id, parts)
     state.remove_multipart(ctx.db, ctx.job.name, key, id)
 }
@@ -117,15 +116,22 @@ fn upload_file(ctx, action, replacing) {
     if replacing { version_aside(ctx, path, prev_size(action)) }
     key = current_key(ctx.job, path)
     meta = { sha256: sha, mtime: string(before.mtime), mode: fs.mode(path), run: ctx.run_ts }
-    if before.size >= ctx.cfg.multipart_threshold {
-        upload_multipart(ctx, path, key, meta)
-    } else {
-        body = fs.read_bytes(path)
-        if len(body) != before.size or hash.sha256(body) != sha {
-            return { op: "problem", path: path, message: "{path}: changed during upload" }
+    # Streamed from disk with the hash computed above: one more read, no copy
+    # in memory and no second hash. If the file changed since it was hashed,
+    # the provider refuses the mismatched body.
+    refused = try {
+        if before.size >= ctx.cfg.multipart_threshold {
+            upload_multipart(ctx, path, key, meta, before.size)
+        } else {
+            s3.put_object(ctx.client, key, fn() fs.open(path), meta, sha256: sha)
         }
-        s3.put_object(ctx.client, key, body, meta)
+        false
+    } catch (e) {
+        msg = string(get(e, "message") ?? e)
+        unless contains(msg, "XAmzContentSHA256Mismatch") or contains(msg, "BadDigest") { error(e) }
+        true
     }
+    if refused { return { op: "problem", path: path, message: "{path}: changed during upload" } }
     after = stat(path)
     if after != before {
         return { op: "problem", path: path, message: "{path}: changed during upload" }
@@ -282,14 +288,31 @@ export fn run_job(ctx) {
         close(results)
     }
     closer = close_when_done()
+    # Index rows are written in one transaction per RECORD_BATCH results or
+    # per RECORD_EVERY_MS, whichever comes first: a commit per file costs about
+    # 100x more. A crash loses at most one batch of rows, and those files are
+    # uploaded again next run.
     mut done = 0
+    mut buffered = []
+    mut flushed_at = time.now()
+    fn flush() {
+        if len(buffered) == 0 { return null }
+        sql.transaction(ctx.db, fn(tx) {
+            in_tx = set(ctx, "db", tx)
+            for b in buffered { totals = record(in_tx, totals, b) }
+        })
+        buffered = []
+        flushed_at = time.now()
+    }
     for r in results {
         done = done + 1
-        totals = record(ctx, totals, r)
+        buffered = push(buffered, r)
+        if len(buffered) >= RECORD_BATCH or time.now() - flushed_at >= RECORD_EVERY_MS { flush() }
         if r.op == "fatal" and fatal == null { fatal = r }
         if fatal != null or ctx.should_stop() { cell_set(halt, true) }
     }
     await closer
+    flush()
     if fatal != null { error({ kind: "job_fatal", message: fatal.message, totals: totals }) }
     stopped = done < len(p.actions)
     if stopped {
