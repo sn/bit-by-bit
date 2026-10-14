@@ -106,6 +106,8 @@ fn cmd_restore(a) {
         overwrite: args.flag(a, "overwrite", false),
         oldest_ms: now - job.keep_versions_days * 86400000,
         concurrency: cfg.concurrency,
+        # null: the default, set owners when running as root.
+        chown: if args.flag(a, "no-chown", false) { false } else { null },
     })
     print("restored {r.restored} file(s) to {to}")
     for s in r.skipped { print("  skipped: " + s) }

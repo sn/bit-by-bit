@@ -22,6 +22,12 @@ test.case("--flag=value form and default config", fn() {
     test.eq(args.flag(a, "overwrite", false), false)
 })
 
+test.case("restore can be told not to set owners", fn() {
+    test.eq(args.flag(args.parse(["restore", "home", "--no-chown"]), "no-chown", false), true)
+    test.eq(args.flag(args.parse(["restore", "home"]), "no-chown", false), false)
+    test.ok(contains(args.USAGE, "--no-chown"), "listed in the usage")
+})
+
 test.case("usage errors", fn() {
     test.err(fn() args.parse(["frobnicate"]), "unknown command")
     test.err(fn() args.parse(["run", "--bogus"]), "unknown option")

@@ -132,11 +132,36 @@ test.case("owners are set when chown is on, and left alone when it is off", fn()
     r = restore.restore(CLIENT, env.job, off)
     test.eq([r.restored, r.failed], [1, []])
     test.eq(fs.owner(off.to + p), me)
+    # Root may give a file to anyone: the root-only case below covers that.
+    if restore.as_root() { return null }
     on = opts({ to: fs.join(fs.temp_dir(), "out-chown"), chown: true })
     r2 = restore.restore(CLIENT, env.job, on)
     test.eq(r2.restored, 0)
     test.ok(any(r2.failed, fn(f) contains(f, "can't set owner 0:0")), string(r2.failed))
     test.ok(not fs.exists(on.to + p) and not fs.exists(on.to + p + ".bbb-partial"), "nothing left behind")
+})
+
+# Runs for real only as root (CI and normal test runs skip it): see
+# tests/root/run.sh, which runs it in a container.
+test.case("as root, files get their backed-up owner, and then their mode", fn() {
+    unless restore.as_root() { return null }
+    env = setup()
+    p = fs.join(env.root, "a.txt")
+    fs.write(p, "v1")
+    # setuid: a chown after the chmod would clear it.
+    fs.chmod(p, "4755")
+    run_at(env, T0)
+    k = "pc" + p
+    fake_s3.put_raw(k, bytes("v1"), merge(fake_s3.object(k).meta, { "bbb-owner": "4321:4322" }))
+    o = opts({ to: fs.join(fs.temp_dir(), "out-root") })
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, r.failed], [1, []])
+    owner = fs.owner(o.to + p)
+    test.eq([owner.uid, owner.gid], [4321, 4322])
+    test.eq(fs.mode(o.to + p), "4755")
+    no = opts({ to: fs.join(fs.temp_dir(), "out-root-nochown"), chown: false })
+    restore.restore(CLIENT, env.job, no)
+    test.eq(fs.owner(no.to + p).uid, 0)
 })
 
 test.case("chown defaults to whether the restore runs as root", fn() {

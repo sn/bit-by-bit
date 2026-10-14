@@ -133,8 +133,8 @@ fn restore_file(c, item, to, overwrite, chown) {
     partial = target + ".bbb-partial"
     try {
         out = fs.open(partial, "w")
-        for piece in got.body { io.write(out, piece) }
-        io.close(out)
+        # Closed even when a write fails, so a full disk doesn't leak a handle per file.
+        try { for piece in got.body { io.write(out, piece) } } catch (e) { error(e) } finally { io.close(out) }
         if has(meta, "sha256") and not digest.matches(partial, meta.sha256) {
             fs.remove(partial)
             return { status: "failed", message: "{target}: checksum mismatch, download discarded" }

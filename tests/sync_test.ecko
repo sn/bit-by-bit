@@ -298,6 +298,8 @@ test.case("progress is saved while the run is still going", fn() {
 # A tree full of unreadable folders must not make a run's problem list, its
 # progress saves or the dashboard grow without bound.
 test.case("problems are counted in full but only the first 1,000 are kept", fn() {
+    # Root reads a mode-000 directory anyway, so it makes no problems to count.
+    if fs.owner("/proc/self").uid == 0 { return null }
     env = setup()
     for i in 0..1050 {
         d = fs.join(env.root, "locked/d{i}")
@@ -333,8 +335,9 @@ test.case("an owner change alone updates the object's owner without uploading it
     run(env)
     a = fs.join(env.root, "a.txt")
     k = key(env, "a.txt")
-    fake_s3.put_raw(k, bytes("alpha"), set(remote(env, "a.txt").meta, "bbb-owner", "0:0"))
-    sql.exec(env.db, "update files set owner = '0:0' where path = ?", [a])
+    # An owner nobody here has, so it differs from the real one even as root.
+    fake_s3.put_raw(k, bytes("alpha"), set(remote(env, "a.txt").meta, "bbb-owner", "4321:4321"))
+    sql.exec(env.db, "update files set owner = '4321:4321' where path = ?", [a])
     fake_s3.reset_log()
     o = run(env)
     test.eq([o.status, o.uploaded, o.replaced, o.touched], ["ok", 0, 0, 1])

@@ -1,6 +1,6 @@
 let COMMANDS = ["daemon", "run", "status", "ls", "restore", "check-config", "help"]
 let VALUE_FLAGS = ["config", "path", "at", "to"]
-let BOOL_FLAGS = ["dry-run", "rebuild-state", "json", "overwrite", "help"]
+let BOOL_FLAGS = ["dry-run", "rebuild-state", "json", "overwrite", "no-chown", "help"]
 
 export let DEFAULT_CONFIG = "/etc/bit-by-bit/config.json"
 
@@ -12,11 +12,13 @@ export let USAGE = """
       bit-by-bit run [job...]  [--config P] [--dry-run] [--rebuild-state]
       bit-by-bit status        [--config P] [--json]         last run per job, next due, problems
       bit-by-bit ls <job>      [--path SUB] [--at TS]        list what a restore would produce
-      bit-by-bit restore <job> [--path SUB] [--at TS] [--to DIR] [--overwrite]
+      bit-by-bit restore <job> [--path SUB] [--at TS] [--to DIR] [--overwrite] [--no-chown]
       bit-by-bit check-config  [--config P]
 
     --config defaults to /etc/bit-by-bit/config.json. --at takes an RFC 3339
     time such as 2026-10-12T14:00:00Z or 2026-10-12T16:00:00+02:00.
+    Run as root, restore gives files their backed-up owners (by number);
+    --no-chown leaves them owned by root.
 
     exit codes: 0 ok, 1 failed, 2 partial, 64 usage or config error
 """

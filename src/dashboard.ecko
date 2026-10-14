@@ -29,13 +29,24 @@ fn run_view(r) = {
     duration_ms: duration(r), uploaded: r.uploaded, replaced: r.replaced, deleted: r.deleted,
     pruned: r.pruned, bytes: r.bytes, problem_count: r.problems, error: r.error,
     planned: get(r, "planned"), done: get(r, "done") ?? 0,
+    planned_at: get(r, "planned_at"), progress_at: get(r, "progress_at"),
 }
+
+# When a running run last showed signs of life: a file finished, planning
+# finished, or it started.
+fn last_activity(r) = get(r, "progress_at") ?? get(r, "planned_at") ?? r.started_at
 
 fn job_view(job, db, now) {
     runs = state.recent_runs(db, job.name, RECENT_RUNS)
     last = first(runs)
     last_ms = if last == null { null } else { last.started_at }
-    overdue = last != null and last.status != "running" and now - last.started_at > 2 * interval_ms(job.schedule)
+    # Overdue: no run has started for twice the interval. Stalled: the run
+    # going now has finished no file for that long. A long run that keeps
+    # finishing files, like a first backup of a big disk, is neither.
+    limit = 2 * interval_ms(job.schedule)
+    running = last != null and last.status == "running"
+    overdue = last != null and not running and now - last.started_at > limit
+    stalled = running and now - last_activity(last) > limit
     {
         job: job.name,
         schedule: job.schedule,
@@ -48,6 +59,8 @@ fn job_view(job, db, now) {
         finished_at: if last == null { null } else { last.finished_at },
         next_due: scheduler.next_run(job.schedule, runs, now, scheduler.local_offset_ms),
         overdue: overdue,
+        stalled: stalled,
+        planned_at: if last == null { null } else { get(last, "planned_at") },
         uploaded: if last == null { 0 } else { last.uploaded },
         replaced: if last == null { 0 } else { last.replaced },
         deleted: if last == null { 0 } else { last.deleted },
@@ -63,13 +76,15 @@ fn job_view(job, db, now) {
 }
 
 ## Why the backups are unhealthy: { ok: Bool, reasons: [String] }. A job is
-## unhealthy when its last run failed, or when it has not started a run for
-## more than twice its interval.
+## unhealthy when its last run failed, when it has not started a run for
+## more than twice its interval, or when its running backup has finished no
+## file for that long.
 export fn health(snap) {
     mut reasons = []
     for j in snap.jobs {
         if j.status == "failed" { reasons = push(reasons, "{j.job}: last run failed") }
         if j.overdue { reasons = push(reasons, "{j.job}: overdue (no run for more than twice its interval)") }
+        if j.stalled { reasons = push(reasons, "{j.job}: stalled (the running backup has finished no file for more than twice its interval)") }
     }
     { ok: len(reasons) == 0, reasons: reasons }
 }
@@ -179,7 +194,8 @@ fn progress_html(j, now) {
         return "<section class=\"block\"><h3>in progress</h3><progress id=\"progress-" + j.job + "\" aria-label=\"" + bar_label + "\"></progress>" +
             "<p class=\"progress-text\">scanning files…</p></section>"
     }
-    elapsed_s = max([1, (now - j.started_at) // 1000])
+    # From the end of planning: the scan before it moves no files.
+    elapsed_s = max([1, (now - (j.planned_at ?? j.started_at)) // 1000])
     rate = j.done / elapsed_s
     pace = if j.done == 0 { "starting uploads" } else {
         left = if rate > 0 { (j.planned - j.done) / rate * 1000 } else { 0 }
@@ -195,7 +211,7 @@ fn progress_html(j, now) {
 fn meta_item(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(value) + "</dd></div>"
 
 fn job_card(j, now) {
-    overdue = if j.overdue { " <span class=\"badge bad\"><span aria-hidden=\"true\">!</span> overdue</span>" } else { "" }
+    overdue = if j.overdue { " <span class=\"badge bad\"><span aria-hidden=\"true\">!</span> overdue</span>" } else if j.stalled { " <span class=\"badge bad\"><span aria-hidden=\"true\">!</span> stalled</span>" } else { "" }
     meta = "<dl class=\"job-meta\">" + meta_item("from", join(j.paths, ", ")) + meta_item("to", j.destination + "/" + j.prefix) +
         meta_item("runs", schedule_text(j.schedule)) + "</dl>"
     took = if j.started_at == null { "" } else if j.finished_at == null { "running for " + span_text(now - j.started_at) } else { "took " + dur_text(j.finished_at - j.started_at) }
@@ -441,7 +457,7 @@ fn favicon(healthy) {
     arrow = "<path d='M16 3.5 L27 14.5 L20 14.5 L20 19 L12 19 L12 14.5 L5 14.5 Z' stroke-linejoin='round'/>" +
         join(map(ICON_BITS, fn(b) "<rect x='{b[0]}' y='{b[1]}' width='3.4' height='3.4' rx='0.7' fill-opacity='{b[2]}'/>"), "")
     svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs>" +
-        "<radialGradient id='t' cx='0.5' cy='0.25' r='0.8'><stop offset='0' stop-color='#1d2b55'/><stop offset='1' stop-color='#070b16'/></radialGradient>" +
+        "<radialGradient id='t' cx='0.5' cy='0.25' r='0.8'><stop offset='0' stop-color='#143a21'/><stop offset='1' stop-color='#040a06'/></radialGradient>" +
         "<linearGradient id='a' x1='0' y1='3.5' x2='0' y2='31' gradientUnits='userSpaceOnUse'><stop offset='0' stop-color='" + top + "'/><stop offset='1' stop-color='" + bottom + "'/></linearGradient>" +
         "<filter id='g' x='-50%' y='-50%' width='200%' height='200%'><feGaussianBlur stdDeviation='1.6'/></filter></defs>" +
         "<rect width='32' height='32' rx='8' fill='url(#t)'/>" +
@@ -456,7 +472,13 @@ export fn render_html(snap) {
     now = snap.daemon.now
     health_text = if snap.healthy { "ok" } else { "needs attention" }
     icon = favicon(snap.healthy)
-    overall = if snap.healthy { "<span class=\"badge ok\"><span aria-hidden=\"true\">✓</span> all backups healthy</span>" } else { "<span class=\"badge bad\"><span aria-hidden=\"true\">!</span> needs attention</span>" }
+    # Problems in a run that worked don't make a job unhealthy, but say so
+    # beside the healthy badge so the two never seem to disagree.
+    with_problems = len(filter(snap.jobs, fn(j) j.status == "partial"))
+    noted = if with_problems == 0 { "" } else {
+        " <span class=\"badge warn\"><span aria-hidden=\"true\">!</span> " + string(with_problems) + (if with_problems == 1 { " job" } else { " jobs" }) + " with problems</span>"
+    }
+    overall = if snap.healthy { "<span class=\"badge ok\"><span aria-hidden=\"true\">✓</span> all backups healthy</span>" + noted } else { "<span class=\"badge bad\"><span aria-hidden=\"true\">!</span> needs attention</span>" }
     alert = if snap.healthy { "" } else {
         "<section class=\"alert\" aria-labelledby=\"attention\"><h2 id=\"attention\">needs attention</h2><ul>" + join(map(snap.reasons, li), "") + "</ul></section>"
     }

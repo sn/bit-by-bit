@@ -245,7 +245,8 @@ Restore never overwrites existing files unless you pass `--overwrite`. It
 checks every file against its stored fingerprint, and puts back each file's
 mode and modification time. Run as root, it also puts back each file's owner
 and group, by number: on another machine the same numbers may belong to
-different users. Run as anyone else, restored files belong to that user.
+different users; `--no-chown` leaves them owned by root. Run as anyone else,
+restored files belong to that user.
 Files download several at a time; symlinks are
 created after every file, and nothing is ever written through a symlink, so a
 tampered bucket can't make a restore write outside `--to`.
@@ -280,9 +281,9 @@ The daemon can serve a read-only status page. It's off unless the config has:
 
 | URL | What |
 |---|---|
-| `http://127.0.0.1:8484/` | Each job's status, live progress of a running backup (files done of planned, data, files/s and time left, saved about once a second), how long ago its last good backup finished, when it runs next, its schedule and destination, the last run's changes, errors, problems and recent runs. Full-width, styled like a green-phosphor CRT terminal (scanlines and glow drop away when the system asks for more contrast). The tab icon, an upload arrow whose shaft breaks into bits, glows green when every backup is healthy and orange to red when one needs attention. Updates in place every 3 seconds while a backup runs and every 30 seconds otherwise (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
+| `http://127.0.0.1:8484/` | Each job's status, live progress of a running backup (files done of planned, data, files/s since the scan finished and time left, saved about once a second), how long ago its last good backup finished, when it runs next, its schedule and destination, the last run's changes, errors, problems and recent runs. Full-width, styled like a green-phosphor CRT terminal (scanlines and glow drop away when the system asks for more contrast). The tab icon, an upload arrow whose shaft breaks into bits, glows green when every backup is healthy and orange to red when one needs attention or the daemon can't be reached; a job whose last run had problems is noted beside the healthy badge without counting as unhealthy. Updates in place every 3 seconds while a backup runs and every 30 seconds otherwise (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
 | `/api/status` | The same data as JSON. |
-| `/healthz` | `200 ok`, or `503` listing why: a job's last run failed, or it hasn't run for more than twice its interval. Point an uptime monitor at it. |
+| `/healthz` | `200 ok`, or `503` listing why: a job's last run failed, it hasn't run for more than twice its interval, or its running backup has finished no file for that long (stalled). A long run that keeps finishing files, like a first backup, stays healthy. Point an uptime monitor at it. |
 
 The page has no login, so it only binds to loopback addresses (`127.0.0.1`,
 `localhost`, `::1`). To reach it from elsewhere, use an SSH tunnel
@@ -315,6 +316,10 @@ ecko test --jobs 4                # every test file, each in its own process
 ecko test tests/sync_test.ecko
 ecko check --strict main.ecko src/*.ecko tests/*.ecko testkit/*.ecko
 ```
+
+A few checks only root can make, like restoring files to other owners, run
+in a throwaway container: `tests/root/run.sh` (needs Docker; builds a
+`scratch` image from your `ecko` and its libraries, downloads nothing).
 
 Tests run offline against `testkit/fake_s3.ecko`, an in-memory S3 server that
 checks signatures, payload hashes and `content-length` (S3 refuses a PUT or

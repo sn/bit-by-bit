@@ -120,9 +120,11 @@ test.case("open migrates an older runs table", fn() {
 test.case("a running run's progress is visible before it finishes", fn() {
     db = fresh()
     state.start_run(db, "home", "r1", 100)
-    state.set_planned(db, "r1", 50)
-    state.save_progress(db, "r1", 7, { uploaded: 5, replaced: 1, deleted: 0, touched: 1, bytes: 4096, problems: ["/x: vanished"] })
+    state.set_planned(db, "r1", 50, 150)
+    state.save_progress(db, "r1", 7, { uploaded: 5, replaced: 1, deleted: 0, touched: 1, bytes: 4096, problems: ["/x: vanished"] }, 160)
     r = state.last_run(db, "home")
     test.eq([r.status, r.planned, r.done, r.uploaded, r.replaced, r.touched, r.bytes, r.problems, r.problem_list],
         ["running", 50, 7, 5, 1, 1, 4096, 1, ["/x: vanished"]])
+    # When uploads began and when a file last finished: the dashboard's rate and stall check.
+    test.eq([r.planned_at, r.progress_at], [150, 160])
 })

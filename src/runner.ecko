@@ -35,7 +35,6 @@ export fn run_job(cfg, job, db, opts) {
     try { run_job_unguarded(cfg, job, db, opts) } catch (e) {
         msg = string(get(e, "message") ?? e)
         logging.emit("error", "job failed outside the run: " + msg, { job: job.name })
-        try { lock.release(job_lock_path(cfg, job)) } catch (e2) { null }
         empty_outcome("failed", msg)
     }
 }
@@ -49,6 +48,12 @@ fn run_job_unguarded(cfg, job, db, opts) {
         log_("warn", "skipped: another run of this job is still in progress", {})
         return empty_outcome("skipped", "another run of this job is still in progress")
     }
+    # The lock goes however the run ends, and only once it was taken.
+    # (`catch` rethrows: without one, Ecko 0.68's `finally` swallows the error.)
+    try { run_locked(cfg, job, db, opts, run_id, log_, now) } catch (e) { error(e) } finally { lock.release(lp) }
+}
+
+fn run_locked(cfg, job, db, opts, run_id, log_, now) {
     client = try { make_client(cfg, job) } catch (e) {
         msg = string(get(e, "message") ?? e)
         log_("error", "job failed: " + msg, {})
@@ -56,7 +61,6 @@ fn run_job_unguarded(cfg, job, db, opts) {
             state.start_run(db, job.name, run_id, now)
             state.finish_run(db, run_id, empty_outcome("failed", msg))
         }
-        lock.release(lp)
         return empty_outcome("failed", msg)
     }
     log_("info", "run started", { dry_run: opts.dry_run })
@@ -66,7 +70,6 @@ fn run_job_unguarded(cfg, job, db, opts) {
         should_stop: opts.should_stop, log: log_,
     }
     o = sync.run(ctx)
-    lock.release(lp)
     level = match o.status { "ok" => "info" "partial" => "warn" _ => "error" }
     log_(level, "run finished", {
         status: o.status, uploaded: o.uploaded, replaced: o.replaced, deleted: o.deleted,

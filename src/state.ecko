@@ -1,6 +1,7 @@
 import std.sql
 import std.fs
 import std.json
+import std.time
 import "./util.ecko"
 
 let SCHEMA = [
@@ -23,7 +24,10 @@ export fn open(state_dir) {
 
 # Columns added after the first release. `create table if not exists` leaves
 # an existing table alone, so older databases get them here.
-let ADDED_COLUMNS = [["runs", "planned", "integer"], ["runs", "done", "integer not null default 0"], ["files", "mode", "text"], ["files", "owner", "text"]]
+let ADDED_COLUMNS = [
+    ["runs", "planned", "integer"], ["runs", "done", "integer not null default 0"], ["files", "mode", "text"], ["files", "owner", "text"],
+    ["runs", "planned_at", "integer"], ["runs", "progress_at", "integer"],
+]
 
 fn migrate(db) {
     for (table, name, decl) in ADDED_COLUMNS {
@@ -83,8 +87,9 @@ export fn set_target(db, job, fingerprint) =
 export fn start_run(db, job, run_id, started_at) =
     sql.exec(db, "insert into runs (id, job, started_at, status) values (?, ?, ?, 'running')", [run_id, job, started_at])
 
-## How many actions the run will carry out, known once it has planned.
-export fn set_planned(db, run_id, n) = sql.exec(db, "update runs set planned = ? where id = ?", [n, run_id])
+## How many actions the run will carry out, known once it has planned, and
+## when planning finished (`at`, default now): uploads start from there.
+export fn set_planned(db, run_id, n, at = null) = sql.exec(db, "update runs set planned = ?, planned_at = ? where id = ?", [n, at ?? time.now(), run_id])
 
 # How many problems a run had: problem_count when the totals carry one (the
 # text list is capped), else the list's length.
@@ -92,9 +97,11 @@ fn problem_total(t) = get(t, "problem_count") ?? len(t.problems)
 
 ## Save a running run's counts so far: `done` actions finished, and the
 ## running totals { uploaded, replaced, deleted, touched, bytes, problems: [String], problem_count }.
-export fn save_progress(db, run_id, done, t) =
-    sql.exec(db, "update runs set done = ?, uploaded = ?, replaced = ?, deleted = ?, touched = ?, bytes = ?, problems = ?, problem_list = ? where id = ? and status = 'running'",
-        [done, t.uploaded, t.replaced, t.deleted, t.touched, t.bytes, problem_total(t), json.encode(t.problems), run_id])
+## Saved only when actions have finished, so `at` (default now) is when the
+## run last made progress.
+export fn save_progress(db, run_id, done, t, at = null) =
+    sql.exec(db, "update runs set done = ?, uploaded = ?, replaced = ?, deleted = ?, touched = ?, bytes = ?, problems = ?, problem_list = ?, progress_at = ? where id = ? and status = 'running'",
+        [done, t.uploaded, t.replaced, t.deleted, t.touched, t.bytes, problem_total(t), json.encode(t.problems), at ?? time.now(), run_id])
 
 ## outcome: { status, finished_at, uploaded, replaced, deleted, touched, pruned, bytes, error, problems: [String] }
 export fn finish_run(db, run_id, o) =

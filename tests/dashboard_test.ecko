@@ -82,11 +82,59 @@ test.case("the page uses the full width", fn() {
     test.ok(not contains(http.get(url("/")).body, "max-width: 60rem"), "no narrow column")
 })
 
-fn running(job, id, started, planned, done, uploaded) {
+fn running(job, id, started, planned, done, uploaded) = running_at(job, id, started, planned, done, uploaded, time.now(), time.now())
+
+# A run that finished planning at planned_at and last finished a file at progress_at.
+fn running_at(job, id, started, planned, done, uploaded, planned_at, progress_at) {
     state.start_run(DB, job, id, started)
-    if planned != null { state.set_planned(DB, id, planned) }
-    state.save_progress(DB, id, done, { uploaded: uploaded, replaced: 0, deleted: 0, touched: 0, bytes: 75000000, problems: [] })
+    if planned != null { state.set_planned(DB, id, planned, planned_at) }
+    if progress_at != null { state.save_progress(DB, id, done, { uploaded: uploaded, replaced: 0, deleted: 0, touched: 0, bytes: 75000000, problems: [] }, progress_at) }
 }
+
+test.case("files/s counts from when uploads began, not from the scan", fn() {
+    reset()
+    now = time.now()
+    # An hour of scanning, then 1,000 files in the 10 seconds since.
+    running_at("home", "r1", now - H, 5000, 1000, 1000, now - 10000, now)
+    test.ok(contains(http.get(url("/")).body, "100 files/s"), "rate since planning")
+})
+
+test.case("a run with no file finished for twice its interval is stalled", fn() {
+    reset()
+    now = time.now()
+    running_at("home", "r1", now - 14 * H, 10, 1, 1, now - 14 * H, now - 13 * H)
+    r = http.get(url("/healthz"))
+    test.eq(r.status, 503)
+    test.ok(contains(r.body, "home: stalled"), r.body)
+    test.ok(contains(http.get(url("/")).body, "</span> stalled</span>"), "badge")
+})
+
+test.case("a long run that keeps finishing files stays healthy", fn() {
+    reset()
+    now = time.now()
+    # A first backup of a big disk: running for 14h, last file a minute ago.
+    running_at("home", "r1", now - 14 * H, 900000, 400000, 400000, now - 14 * H + 60000, now - 60000)
+    test.eq(http.get(url("/healthz")).status, 200)
+})
+
+test.case("a run still scanning after twice its interval is stalled", fn() {
+    reset()
+    running_at("home", "r1", time.now() - 13 * H, null, 0, 0, null, null)
+    test.ok(contains(http.get(url("/healthz")).body, "home: stalled"), "no planning yet")
+})
+
+test.case("the top bar notes jobs with problems without calling them unhealthy", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "partial", ["/a: vanished"], null)
+    body = http.get(url("/")).body
+    test.ok(contains(body, "all backups healthy"), "still healthy")
+    test.ok(contains(body, "<span class=\"badge warn\"><span aria-hidden=\"true\">!</span> 1 job with problems</span>"), "noted")
+    record("dev", "r2", time.now() - H, "partial", ["/b: vanished"], null)
+    test.ok(contains(http.get(url("/")).body, "2 jobs with problems"), "plural")
+    reset()
+    record("home", "r3", time.now() - H, "ok", [], null)
+    test.ok(not contains(http.get(url("/")).body, "with problems"), "absent when there are none")
+})
 
 test.case("a running job shows live progress", fn() {
     reset()
