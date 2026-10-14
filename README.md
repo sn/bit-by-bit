@@ -26,7 +26,7 @@ Each [release](https://github.com/sn/bit-by-bit/releases) has a prebuilt
 binary for x86-64 and arm64 Linux, with a `.sha256` beside it. No Ecko needed:
 
 ```bash
-v=v0.1.0 arch=x86_64   # or aarch64
+v=v0.5.0 arch=x86_64   # or aarch64
 f=bit-by-bit-$v-$arch-linux.tar.gz
 curl -fsSLO https://github.com/sn/bit-by-bit/releases/download/$v/$f
 curl -fsSLO https://github.com/sn/bit-by-bit/releases/download/$v/$f.sha256
@@ -248,8 +248,7 @@ POST without one, even an empty one) and can be told to fail requests.
 
 ## Release
 
-Bump `version` in `ecko.json`, commit, then publish a GitHub release tagged
-`v` plus that version (`v0.2.0`). The release workflow checks the tag matches,
+Publish a GitHub release with a tag such as `v0.6.0`. The release workflow
 runs the checks and tests, builds on native x86-64 and arm64 Linux runners
 with the Ecko version pinned in `.github/workflows/release.yml`, and attaches
 `bit-by-bit-<tag>-<arch>-linux.tar.gz` and its `.sha256` to the release.

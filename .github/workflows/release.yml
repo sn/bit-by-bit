@@ -35,14 +35,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Tag matches ecko.json version
-        run: |
-          want="v$(jq -r .version ecko.json)"
-          if [ "$TAG" != "$want" ]; then
-            echo "::error::release tag $TAG does not match ecko.json version $want - bump ecko.json or retag"
-            exit 1
-          fi
-
       - name: Install Ecko ${{ env.ECKO_VERSION }}
         run: |
           archive="ecko-${{ matrix.name }}.tar.gz"
