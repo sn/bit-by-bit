@@ -20,9 +20,22 @@ systemd service. Written in [Ecko](https://ecko.sh).
 
 ## Install
 
-Requires Ecko 0.66 or later. The one dependency, the
-[`xml`](https://github.com/ecko-lang/xml) package, is vendored in `vendor/` and
-pinned in `ecko.lock`; `ecko install` restores it if it's missing.
+Each [release](https://github.com/sn/bit-by-bit/releases) has a prebuilt
+binary for x86-64 and arm64 Linux, with a `.sha256` beside it. No Ecko needed:
+
+```bash
+v=v0.1.0 arch=x86_64   # or aarch64
+f=bit-by-bit-$v-$arch-linux.tar.gz
+curl -fsSLO https://github.com/sn/bit-by-bit/releases/download/$v/$f
+curl -fsSLO https://github.com/sn/bit-by-bit/releases/download/$v/$f.sha256
+sha256sum -c $f.sha256 && tar -xzf $f && cd bit-by-bit-$v-$arch-linux
+sudo ./deploy/install.sh
+```
+
+To build from source instead, you need Ecko 0.66 or later. The one
+dependency, the [`xml`](https://github.com/ecko-lang/xml) package, is vendored
+in `vendor/` and pinned in `ecko.lock`; `ecko install` restores it if it's
+missing.
 
 ```bash
 ecko build main.ecko -o bit-by-bit
@@ -196,6 +209,8 @@ The daemon can serve a read-only status page. It's off unless the config has:
 "dashboard": { "listen": "127.0.0.1:8484" }
 ```
 
+![The dashboard: three backup jobs, each with its last good backup, next run, the last run's changes, any problems and its recent runs](.github/dashboard.png)
+
 | URL | What |
 |---|---|
 | `http://127.0.0.1:8484/` | Each job's status, live progress of a running backup (files done of planned, data, files/s and time left, saved about once a second), how long ago its last good backup finished, when it runs next, its schedule and destination, the last run's changes, errors, problems and recent runs. Full-width, styled like a green-phosphor CRT terminal (scanlines and glow drop away when the system asks for more contrast). The tab icon, an upload arrow whose shaft breaks into bits, glows cyan to violet when every backup is healthy and orange to red when one needs attention. Updates in place every 3 seconds while a backup runs and every 30 seconds otherwise (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
@@ -230,3 +245,11 @@ ecko check --strict main.ecko src/*.ecko tests/*.ecko testkit/*.ecko
 Tests run offline against `testkit/fake_s3.ecko`, an in-memory S3 server that
 checks signatures, payload hashes and `content-length` (S3 refuses a PUT or
 POST without one, even an empty one) and can be told to fail requests.
+
+## Release
+
+Bump `version` in `ecko.json`, commit, then publish a GitHub release tagged
+`v` plus that version (`v0.2.0`). The release workflow checks the tag matches,
+runs the checks and tests, builds on native x86-64 and arm64 Linux runners
+with the Ecko version pinned in `.github/workflows/release.yml`, and attaches
+`bit-by-bit-<tag>-<arch>-linux.tar.gz` and its `.sha256` to the release.

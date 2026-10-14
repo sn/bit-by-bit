@@ -1,0 +1,87 @@
+name: Release
+
+# Publishing a GitHub release builds bit-by-bit for Linux and attaches the
+# archives to that release. Each archive holds the binary, deploy/ and the
+# README, so installing is: unpack, cd in, sudo ./deploy/install.sh.
+#
+# Each architecture is built on its own native runner: `ecko build` packs the
+# program into a copy of the Ecko runtime, so the output runs where that
+# runtime runs. Ecko's Linux builds target an old glibc, and Ubuntu 22.04 keeps
+# the runner close to that.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # upload the archives to the release
+
+env:
+  # The Ecko release to build with. Raise it deliberately, after the tests
+  # pass locally on the new version.
+  ECKO_VERSION: v0.67.0
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: x86_64-linux, os: ubuntu-22.04 }
+          - { name: aarch64-linux, os: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches ecko.json version
+        run: |
+          want="v$(jq -r .version ecko.json)"
+          if [ "$TAG" != "$want" ]; then
+            echo "::error::release tag $TAG does not match ecko.json version $want - bump ecko.json or retag"
+            exit 1
+          fi
+
+      - name: Install Ecko ${{ env.ECKO_VERSION }}
+        run: |
+          archive="ecko-${{ matrix.name }}.tar.gz"
+          base="https://ecko.sh/dl/$ECKO_VERSION"
+          mkdir -p "$RUNNER_TEMP/ecko" && cd "$RUNNER_TEMP/ecko"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/$archive.sha256"
+          sha256sum -c "$archive.sha256"
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/ecko/ecko" >> "$GITHUB_PATH"
+
+      - name: Check
+        run: |
+          ecko --version
+          ecko check --strict main.ecko src/*.ecko tests/*.ecko testkit/*.ecko
+
+      - name: Test
+        run: ecko test --jobs 4
+
+      - name: Build
+        run: ecko build main.ecko -o bit-by-bit
+
+      # A binary that cannot start is worse than none at all.
+      - name: Smoke test
+        run: |
+          ./bit-by-bit help > /dev/null
+          ./bit-by-bit check-config --config deploy/config.example.json
+
+      - name: Package
+        run: |
+          name="bit-by-bit-$TAG-${{ matrix.name }}"
+          mkdir -p "dist/$name"
+          cp bit-by-bit README.md "dist/$name/"
+          cp -r deploy "dist/$name/deploy"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "ARCHIVE=dist/$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
