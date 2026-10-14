@@ -217,91 +217,132 @@ fn job_card(j, now) {
 
 let CSS = r"""
     :root {
-      color-scheme: light dark;
-      --bg: #f6f8fa; --surface: #ffffff; --surface-sunk: #f6f8fa; --border: #d1d9e0; --border-muted: #e6eaef;
-      --text: #1f2328; --text-muted: #59636e; --link: #0969da;
-      --ok-fg: #1a7f37; --ok-bg: #dafbe1; --warn-fg: #9a6700; --warn-bg: #fff8c5;
-      --bad-fg: #cf222e; --bad-bg: #ffebe9; --info-fg: #0969da; --info-bg: #ddf4ff; --muted-fg: #59636e; --muted-bg: #eff2f5;
-      --radius: 8px; --gutter: clamp(1rem, 3vw, 2.5rem);
+      color-scheme: dark;
+      --bg: #050a06; --surface: #08110a; --surface-sunk: #040805; --line: #2f6b3e;
+      --text: #b5f5c3; --text-bright: #4dff88; --text-muted: #6aae7b; --link: #5ad8ff; --focus: #ffb53d;
+      --ok-fg: #4dff88; --ok-bg: #0d2a15; --warn-fg: #ffb53d; --warn-bg: #2a1d05;
+      --bad-fg: #ff6a5c; --bad-bg: #2d0d0b; --info-fg: #5ad8ff; --info-bg: #06222b; --muted-fg: #7fa889; --muted-bg: #0f1a12;
+      --mono: "IBM Plex Mono", "JetBrains Mono", "Cascadia Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+      --glow: 0 0 6px color-mix(in srgb, currentColor 40%, transparent);
+      --gutter: clamp(1rem, 3vw, 2.5rem);
       -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
     }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #0d1117; --surface: #151b23; --surface-sunk: #0d1117; --border: #3d444d; --border-muted: #262c36;
-        --text: #f0f6fc; --text-muted: #9198a1; --link: #58a6ff;
-        --ok-fg: #3fb950; --ok-bg: #12261e; --warn-fg: #d29922; --warn-bg: #2b2111;
-        --bad-fg: #f85149; --bad-bg: #2d1416; --info-fg: #58a6ff; --info-bg: #0f2540; --muted-fg: #9198a1; --muted-bg: #262c36;
-      }
-    }
     * { box-sizing: border-box; }
-    body { margin: 0; font: 0.9375rem/1.5 system-ui, sans-serif; color: var(--text); background: var(--bg); }
+    body {
+      margin: 0; min-height: 100vh; font: 0.9375rem/1.5 var(--mono); color: var(--text); text-shadow: var(--glow);
+      background: radial-gradient(ellipse at 50% 30%, #0b1a0f 0%, var(--bg) 70%) fixed, var(--bg);
+    }
+    /* Scanlines and a vignette over everything, never in the way of a click. */
+    body::after {
+      content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 10;
+      background: repeating-linear-gradient(to bottom, transparent 0 2px, rgb(0 0 0 / 0.22) 2px 3px),
+                  radial-gradient(ellipse at center, transparent 60%, rgb(0 0 0 / 0.45) 100%);
+    }
+    @media (prefers-contrast: more), (forced-colors: active) {
+      body { text-shadow: none; }
+      body::after { display: none; }
+    }
     h1, h2, h3, p, dl, dd, ol, ul { margin: 0; }
-    code { font: 0.8125rem ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--muted-bg); padding: 0.125rem 0.375rem; border-radius: 4px; }
+    code { font: inherit; font-size: 0.875rem; color: var(--text-bright); background: var(--ok-bg); padding: 0 0.375rem; }
+    :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
-    .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.5rem; padding: 0.875rem var(--gutter); background: var(--surface); border-bottom: 1px solid var(--border); }
-    .brand { display: flex; align-items: center; gap: 0.75rem; }
-    .logo { display: block; flex: none; border-radius: 7px; }
-    h1 { font-size: 1.125rem; line-height: 1.3; }
+    .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.5rem; padding: 0.875rem var(--gutter); border-bottom: 3px double var(--line); }
+    .brand { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
+    .logo { display: block; flex: none; }
+    h1 { font-size: 1.25rem; line-height: 1.2; color: var(--text-bright); letter-spacing: 0.02em; text-shadow: 0 0 8px color-mix(in srgb, currentColor 60%, transparent); }
+    h1::after { content: "_"; content: "_" / ""; margin-inline-start: 0.1em; }
+    @media (prefers-reduced-motion: no-preference) {
+      /* Blinks for five seconds after the page loads, then stays lit. */
+      h1::after { animation: blink 1s steps(1) 5; }
+    }
+    @keyframes blink { 50% { opacity: 0; } }
     .sub { color: var(--text-muted); font-size: 0.875rem; flex: 1 1 20rem; }
-    button { font: inherit; font-size: 0.875rem; padding: 0.375rem 0.875rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); cursor: pointer; }
+    button {
+      font: inherit; font-size: 0.8125rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.375rem 0.875rem;
+      border: 1px solid var(--text-bright); border-radius: 0; background: transparent; color: var(--text-bright); text-shadow: inherit; cursor: pointer;
+      transition-property: background-color, color; transition-duration: 150ms; transition-timing-function: ease-out;
+    }
+    button::before { content: "[ "; content: "[ " / ""; }
+    button::after { content: " ]"; content: " ]" / ""; }
+    @media (hover: hover) { button:hover { background: var(--text-bright); color: var(--bg); text-shadow: none; } }
 
-    main { display: grid; gap: 1.25rem; padding: 1.5rem var(--gutter) 3rem; }
+    main { display: grid; gap: 1.5rem; padding: 1.5rem var(--gutter) 3rem; }
 
-    .badge { display: inline-flex; align-items: center; gap: 0.25rem; font-size: 0.75rem; font-weight: 600; line-height: 1.5; padding: 0 0.5rem; border-radius: 999px; white-space: nowrap; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 0.375rem; font-size: 0.75rem; font-weight: 600; line-height: 1.5; padding: 0 0.5rem;
+      text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; border: 1px solid currentColor;
+    }
     .ok { --tone-fg: var(--ok-fg); --tone-bg: var(--ok-bg); } .warn { --tone-fg: var(--warn-fg); --tone-bg: var(--warn-bg); }
     .bad { --tone-fg: var(--bad-fg); --tone-bg: var(--bad-bg); } .info { --tone-fg: var(--info-fg); --tone-bg: var(--info-bg); }
     .muted { --tone-fg: var(--muted-fg); --tone-bg: var(--muted-bg); }
     .badge, .tick, .count { color: var(--tone-fg); background: var(--tone-bg); }
+    /* A failure is shown in inverse video, the loudest thing a terminal can do. */
+    .badge.bad, .tick.bad { color: var(--bg); background: var(--bad-fg); border-color: var(--bad-fg); text-shadow: none; }
 
-    .alert { background: var(--surface); border: 1px solid var(--border); border-inline-start: 4px solid var(--bad-fg); border-radius: var(--radius); padding: 1rem 1.25rem; }
-    .alert h2 { color: var(--bad-fg); font-size: 1rem; margin-bottom: 0.25rem; }
-    .alert ul { padding-inline-start: 1.25rem; }
+    .alert { border: 1px solid var(--bad-fg); background: var(--bad-bg); }
+    .alert h2 { color: var(--bg); background: var(--bad-fg); text-shadow: none; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.25rem 1rem; }
+    .alert h2::before { content: "!! "; content: "!! " / ""; }
+    .alert ul { padding: 0.75rem 1rem 0.75rem 2.25rem; color: var(--bad-fg); }
 
-    .job { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-    .job-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; padding: 1rem 1.25rem; border-bottom: 1px solid var(--border-muted); border-inline-start: 4px solid var(--tone-fg); }
-    .job-head h2 { font-size: 1.25rem; line-height: 1.3; }
-    .job-meta { display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; margin-inline-start: auto; color: var(--text-muted); font-size: 0.875rem; }
+    .job { background: var(--surface); border: 1px solid var(--line); box-shadow: 0 0 24px rgb(77 255 136 / 0.06), inset 0 0 40px rgb(77 255 136 / 0.03); }
+    .job-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; padding: 0.875rem 1.25rem; border-bottom: 1px dashed var(--line); border-inline-start: 4px solid var(--tone-fg); }
+    .job-head h2 { font-size: 1.25rem; line-height: 1.3; color: var(--text-bright); }
+    .job-head h2::before { content: "> "; content: "> " / ""; color: var(--text-muted); }
+    .job-meta { display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; margin-inline-start: auto; color: var(--text-muted); font-size: 0.8125rem; }
     .job-meta .paths { overflow-wrap: anywhere; }
     .job-body { display: grid; grid-template-columns: minmax(0, 1fr); }
     .facts, .detail { padding: 1.25rem; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem; align-content: start; min-width: 0; }
     .facts { background: var(--surface-sunk); }
     @media (min-width: 60rem) {
       .job-body { grid-template-columns: minmax(17rem, 22rem) minmax(0, 1fr); }
-      .facts { border-inline-end: 1px solid var(--border-muted); }
+      .facts { border-inline-end: 1px dashed var(--line); }
     }
 
     .kpis { display: grid; gap: 1rem; }
-    .kpi dt, .stats dt, h3 { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); letter-spacing: 0.04em; text-transform: uppercase; }
+    .kpi dt, .stats dt, h3 { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); letter-spacing: 0.05em; text-transform: uppercase; }
     .kpi dd { display: grid; }
-    .kpi .value { font-size: 1.5rem; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+    .kpi .value { font-size: 1.5rem; font-weight: 600; line-height: 1.2; color: var(--text-bright); font-variant-numeric: tabular-nums; }
     .kpi .when { color: var(--text-muted); font-size: 0.8125rem; font-variant-numeric: tabular-nums; }
     h3 { margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
-    .count { font-size: 0.75rem; padding: 0 0.4rem; border-radius: 999px; letter-spacing: 0; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr)); gap: 0.75rem 1rem; }
-    .stats dd { font-size: 1.0625rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+    h3::before { content: "//"; content: "//" / ""; color: var(--line); }
+    .count { font-size: 0.75rem; padding: 0 0.4rem; letter-spacing: 0; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr)); gap: 0.75rem 1rem; }
+    .stats dd { font-size: 1.0625rem; font-weight: 600; color: var(--text-bright); font-variant-numeric: tabular-nums; }
 
-    .callout { border-inline-start: 4px solid var(--bad-fg); background: var(--bad-bg); border-radius: 6px; padding: 0.75rem 1rem; }
-    .callout strong { color: var(--bad-fg); }
+    .callout { border: 1px solid var(--bad-fg); border-inline-start-width: 4px; background: var(--bad-bg); padding: 0.75rem 1rem; }
+    .callout strong { color: var(--bad-fg); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.875rem; }
     .callout p { margin-top: 0.25rem; overflow-wrap: anywhere; font-size: 0.875rem; }
-    .problems { padding-inline-start: 1.25rem; font: 0.8125rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
-    .problems li::marker { color: var(--warn-fg); }
+    .problems { padding-inline-start: 1.5rem; font-size: 0.8125rem; line-height: 1.6; overflow-wrap: anywhere; }
+    .problems li::marker { content: "* "; color: var(--warn-fg); }
     details { margin-top: 0.25rem; }
     summary { cursor: pointer; color: var(--link); width: fit-content; font-size: 0.875rem; }
-    progress { display: block; width: 100%; height: 0.75rem; margin: 0.25rem 0 0.5rem; accent-color: var(--info-fg); }
+
+    /* The progress bar as a row of phosphor blocks. */
+    progress {
+      display: block; width: 100%; height: 1.25rem; margin: 0.25rem 0 0.5rem; padding: 2px;
+      -webkit-appearance: none; appearance: none; border: 1px solid var(--text-bright); background: var(--surface-sunk); color: var(--text-bright);
+    }
+    progress::-webkit-progress-bar { background: transparent; }
+    progress::-webkit-progress-value { background: repeating-linear-gradient(to right, var(--text-bright) 0 0.5rem, transparent 0.5rem 0.6875rem); }
+    progress::-moz-progress-bar { background: repeating-linear-gradient(to right, var(--text-bright) 0 0.5rem, transparent 0.5rem 0.6875rem); }
+    progress:indeterminate { background: repeating-linear-gradient(to right, var(--ok-bg) 0 0.5rem, transparent 0.5rem 0.6875rem) content-box, var(--surface-sunk); }
+    progress:indeterminate::-moz-progress-bar { background: transparent; }
+    @media (forced-colors: active) { progress { -webkit-appearance: auto; appearance: auto; } }
     .progress-text { font-variant-numeric: tabular-nums; margin-bottom: 0.75rem; }
-    .empty { border: 1px dashed var(--border); border-radius: var(--radius); padding: 1.25rem; color: var(--text-muted); }
+    .progress-text strong { color: var(--text-bright); }
+    .empty { border: 1px dashed var(--line); padding: 1.25rem; color: var(--text-muted); }
     .empty strong { color: var(--text); }
 
-    .block-head { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+    .block-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
     .block-head h3 { margin: 0; }
     .history { display: flex; gap: 0.25rem; padding: 0; list-style: none; }
-    .tick { display: grid; place-items: center; width: 1.25rem; height: 1.25rem; border-radius: 4px; font-size: 0.6875rem; font-weight: 700; }
+    .tick { display: grid; place-items: center; width: 1.25rem; height: 1.25rem; border: 1px solid currentColor; font-size: 0.6875rem; font-weight: 700; }
 
-    .table-wrap { overflow-x: auto; width: fit-content; max-width: 100%; border: 1px solid var(--border-muted); border-radius: 6px; }
+    .table-wrap { overflow-x: auto; width: fit-content; max-width: 100%; border: 1px solid var(--line); }
     table { border-collapse: collapse; font-size: 0.8125rem; }
-    th, td { text-align: start; padding: 0.5rem 1rem; white-space: nowrap; }
-    th { color: var(--text-muted); font-weight: 600; background: var(--surface-sunk); border-bottom: 1px solid var(--border-muted); }
-    tbody tr + tr td { border-top: 1px solid var(--border-muted); }
+    th, td { text-align: start; padding: 0.375rem 1rem; white-space: nowrap; }
+    th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.75rem; background: var(--surface-sunk); border-bottom: 1px solid var(--line); }
+    tbody tr + tr td { border-top: 1px dashed color-mix(in srgb, var(--line) 60%, transparent); }
     .num { text-align: end; font-variant-numeric: tabular-nums; }
 """
 
