@@ -97,15 +97,28 @@ fn refusal(item, to, overwrite) {
         return { status: "failed", message: "{item.path}: {link} is a symlink, refusing to restore through it" }
     }
     target = to + item.path
-    if (fs.exists(target) or fs.is_symlink(target)) and not overwrite {
+    if fs.exists(target, follow: false) and not overwrite {
         return { status: "skipped", message: "{target}: exists (use --overwrite)" }
     }
     null
 }
 
+## True when this process runs as root: /proc/self belongs to the
+## process's effective user.
+export fn as_root() = try { fs.owner("/proc/self").uid == 0 } catch (e) { false }
+
+# Give the download its backed-up owner, "uid:gid". The ids are numbers, so
+# on another machine they may name different users.
+fn set_owner(path, owner) {
+    parts = split(owner, ":")
+    try { fs.chown(path, int(parts[0]), int(parts[1])) } catch (e) {
+        error({ kind: "fs", message: "can't set owner {owner}: " + string(get(e, "message") ?? e) })
+    }
+}
+
 # Download one file. A symlink is not created here but returned as
 # { status: "link", item, target } for restore to create after every file.
-fn restore_file(c, item, to, overwrite) {
+fn restore_file(c, item, to, overwrite, chown) {
     no = refusal(item, to, overwrite)
     if no != null { return no }
     target = to + item.path
@@ -126,6 +139,8 @@ fn restore_file(c, item, to, overwrite) {
             fs.remove(partial)
             return { status: "failed", message: "{target}: checksum mismatch, download discarded" }
         }
+        # Before the mode: a chown clears setuid and setgid bits.
+        if chown and has(meta, "owner") { set_owner(partial, meta.owner) }
         fs.rename(partial, target)
     } catch (e) {
         if fs.exists(partial) { fs.remove(partial) }
@@ -144,17 +159,19 @@ fn restore_link(l, to, overwrite) {
     target = to + l.item.path
     dir = fs.dirname(target)
     unless fs.exists(dir) { fs.mkdir(dir) }
-    if fs.exists(target) or fs.is_symlink(target) { fs.remove(target) }
+    if fs.exists(target, follow: false) { fs.remove(target) }
     fs.symlink(l.target, target)
     { status: "restored" }
 }
 
 fn guarded(path, f) = try { f() } catch (e) { { status: "failed", message: path + ": " + string(get(e, "message") ?? e) } }
 
-## Restore files. opts: { path, at_ms, to, overwrite, oldest_ms, concurrency }
+## Restore files. opts: { path, at_ms, to, overwrite, oldest_ms, concurrency, chown }
 ## `oldest_ms` is how far back version history reaches (now - keep_versions_days).
 ## Files download `concurrency` at a time. Symlinks are created afterwards,
 ## one at a time, so no file is ever written through a link this restore made.
+## Files get their backed-up owners when `chown` is on, which it is by
+## default when running as root.
 ## Returns { restored: Int, skipped: [String], failed: [String] }.
 export fn restore(c, job, opts) {
     at = get(opts, "at_ms")
@@ -162,7 +179,8 @@ export fn restore(c, job, opts) {
         error({ kind: "usage", message: "--at is older than this job's version history (keep_versions_days = {job.keep_versions_days})" })
     }
     items = select(c, job, opts)
-    first_pass = util.pool(items, concurrency(opts), fn(item) guarded(item.path, fn() restore_file(c, item, opts.to, opts.overwrite)))
+    chown = get(opts, "chown") ?? as_root()
+    first_pass = util.pool(items, concurrency(opts), fn(item) guarded(item.path, fn() restore_file(c, item, opts.to, opts.overwrite, chown)))
     links = map(filter(first_pass, fn(r) r.status == "link"), fn(l) guarded(l.item.path, fn() restore_link(l, opts.to, opts.overwrite)))
     mut restored = 0
     mut skipped = []

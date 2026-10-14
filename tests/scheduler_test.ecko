@@ -103,7 +103,6 @@ test.case("locks: acquire, refuse while held, take over stale", fn() {
     test.ok(lock.acquire(p), "first")
     test.ok(lock.acquire(p), "re-entrant for the same pid")
     test.eq(lock.holder(p), os.pid())
-    # Locks left as plain files by older versions are still honoured.
     fs.remove(p)
     fs.write(p, "1")
     test.ok(not lock.acquire(p), "pid 1 is alive")
@@ -111,14 +110,29 @@ test.case("locks: acquire, refuse while held, take over stale", fn() {
     fs.write(p, "999999999")
     test.ok(lock.acquire(p), "dead holder taken over")
     lock.release(p)
-    test.ok(not fs.is_symlink(p) and not fs.exists(p), "released")
+    test.ok(not fs.exists(p, follow: false), "released")
+})
+
+# 0.6 held locks as symlinks whose target was the owner. One left by a
+# daemon still running the old version must keep a new one out.
+test.case("a lock held as a symlink by an older version is still honoured", fn() {
+    p = fs.join(fs.temp_dir(), "old.lock")
+    fs.symlink("1", p)
+    test.ok(not lock.acquire(p), "pid 1 is alive")
+    test.eq(lock.holder(p), 1)
+    fs.remove(p)
+    fs.symlink("999999999", p)
+    test.ok(lock.acquire(p), "dead holder taken over")
+    test.ok(not fs.is_symlink(p), "the new lock is a plain file")
+    lock.release(p)
+    test.ok(not fs.exists(p, follow: false), "released")
 })
 
 test.case("I4: a lock from a previous boot is stale even if the pid is alive", fn() {
     p = fs.join(fs.temp_dir(), "boot.lock")
     fs.write(p, "1 00000000-0000-0000-0000-000000000000")
     test.ok(lock.acquire(p), "other boot -> stale")
-    test.ok(contains(fs.readlink(p), " "), "new lock records the boot id")
+    test.ok(contains(fs.read(p), " "), "new lock records the boot id")
     lock.release(p)
 })
 
@@ -128,11 +142,10 @@ test.case("taking a lock is atomic: a second create fails", fn() {
     p = fs.join(fs.temp_dir(), "race.lock")
     test.ok(lock.create(p, "111 boot"), "first create wins")
     test.ok(not lock.create(p, "222 boot"), "second create loses")
-    test.ok(fs.is_symlink(p), "the lock is a symlink holding its owner")
-    test.eq(fs.readlink(p), "111 boot")
+    test.eq(fs.read(p), "111 boot")
     fs.remove(p)
     test.ok(lock.acquire(p), "acquire takes a free lock")
     test.eq(lock.holder(p), os.pid())
     lock.release(p)
-    test.ok(not fs.is_symlink(p) and not fs.exists(p), "released")
+    test.ok(not fs.exists(p, follow: false), "released")
 })

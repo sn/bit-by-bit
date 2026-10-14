@@ -151,3 +151,15 @@ test.case("a wide tree scans completely, deep problems included", fn() {
     test.eq(r.skipped, 1)
     test.eq(len(r.problems), 1)
 })
+
+test.case("each file's owner is recorded as uid:gid", fn() {
+    root = fs.join(fs.temp_dir(), "owned")
+    fs.mkdir(root)
+    fs.write(fs.join(root, "f.txt"), "f")
+    fs.symlink("f.txt", fs.join(root, "l"))
+    o = fs.owner(fs.join(root, "f.txt"))
+    entries = scanner.scan(job(root, {})).entries
+    test.eq(map(entries, fn(e) [e.kind, e.owner]), [["file", "{o.uid}:{o.gid}"], ["symlink", null]])
+    single = scanner.scan(merge(job(root, {}), { paths: [fs.join(root, "f.txt")] })).entries
+    test.eq(single[0].owner, "{o.uid}:{o.gid}")
+})

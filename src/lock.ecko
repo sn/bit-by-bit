@@ -17,16 +17,15 @@ fn pid_of(content) = split(trim(content), " ")[0]
 
 fn re_digits(s) = len(s) > 0 and all(chars(s), fn(c) c >= "0" and c <= "9")
 
-# A lock is a symlink whose target is its owner, "<pid> <boot id>": creating
-# a symlink fails when the path exists, so taking a free lock is one atomic
-# step (Ecko has no exclusive file create). Older locks are plain files with
-# the same text, and are still read.
-fn present(path) = fs.is_symlink(path) or fs.exists(path)
+# A lock is a file holding its owner, "<pid> <boot id>", created only if
+# nothing is at the path, so taking a free lock is one atomic step. Version
+# 0.6 held locks as symlinks whose target was the owner; those are still read.
+fn present(path) = fs.exists(path, follow: false)
 
 fn owner_of(path) = try { if fs.is_symlink(path) { fs.readlink(path) } else { fs.read(path) } } catch (e) { "" }
 
 ## Create the lock at `path` holding `content`. False when it already exists.
-export fn create(path, content) = try { fs.symlink(content, path) true } catch (e) { false }
+export fn create(path, content) = try { fs.create_new(path, content) } catch (e) { false }
 
 ## Take a pid lock. Returns true when acquired, false when a live process
 ## holds it. A lock left by a dead process (or an earlier boot) is taken over.

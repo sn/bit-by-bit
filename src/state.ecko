@@ -23,7 +23,7 @@ export fn open(state_dir) {
 
 # Columns added after the first release. `create table if not exists` leaves
 # an existing table alone, so older databases get them here.
-let ADDED_COLUMNS = [["runs", "planned", "integer"], ["runs", "done", "integer not null default 0"], ["files", "mode", "text"]]
+let ADDED_COLUMNS = [["runs", "planned", "integer"], ["runs", "done", "integer not null default 0"], ["files", "mode", "text"], ["files", "owner", "text"]]
 
 fn migrate(db) {
     for (table, name, decl) in ADDED_COLUMNS {
@@ -37,25 +37,29 @@ export fn close(db) = sql.close(db)
 # ---- file index ----------------------------------------------------------------
 
 ## Every indexed file of a job, keyed by path: read rows with
-## get(idx, path) -> { path, size, mtime, sha256, kind, mode }. mode is null
-## for links, and for rows written before modes were recorded.
-export fn index(db, job) = util.index_by(sql.query(db, "select path, size, mtime, sha256, kind, mode from files where job = ? order by path", [job]), fn(r) r.path)
+## get(idx, path) -> { path, size, mtime, sha256, kind, mode, owner }. mode
+## and owner ("uid:gid") are null for links, and for rows written before
+## they were recorded.
+export fn index(db, job) = util.index_by(sql.query(db, "select path, size, mtime, sha256, kind, mode, owner from files where job = ? order by path", [job]), fn(r) r.path)
 
-## Insert or replace one index row. row: { path, size, mtime, sha256, kind, mode? }.
+## Insert or replace one index row. row: { path, size, mtime, sha256, kind, mode?, owner? }.
 export fn put_file(db, job, row) =
-    sql.exec(db, "insert or replace into files (job, path, size, mtime, sha256, kind, mode) values (?, ?, ?, ?, ?, ?, ?)",
-        [job, row.path, row.size, row.mtime, row.sha256, row.kind, get(row, "mode")])
+    sql.exec(db, "insert or replace into files (job, path, size, mtime, sha256, kind, mode, owner) values (?, ?, ?, ?, ?, ?, ?, ?)",
+        [job, row.path, row.size, row.mtime, row.sha256, row.kind, get(row, "mode"), get(row, "owner")])
 
-## Record files' modes without other changes: pairs [[path, mode]], in one transaction.
-export fn set_modes(db, job, pairs) = sql.transaction(db, fn(tx) {
-    for (path, mode) in pairs { sql.exec(tx, "update files set mode = ? where job = ? and path = ?", [mode, job, path]) }
+## Record files' modes and owners without other changes, in one transaction:
+## rows [{ path, mode, owner }]; a null leaves that attribute as it was.
+export fn set_attrs(db, job, rows) = sql.transaction(db, fn(tx) {
+    for r in rows {
+        sql.exec(tx, "update files set mode = coalesce(?, mode), owner = coalesce(?, owner) where job = ? and path = ?", [r.mode, r.owner, job, r.path])
+    }
 })
 
 export fn remove_file(db, job, path) = sql.exec(db, "delete from files where job = ? and path = ?", [job, path])
 
-## Record a new mtime and mode for a file whose content did not change.
-export fn touch_file(db, job, path, mtime, mode = null) =
-    sql.exec(db, "update files set mtime = ?, mode = coalesce(?, mode) where job = ? and path = ?", [mtime, mode, job, path])
+## Record a new mtime, mode and owner for a file whose content did not change.
+export fn touch_file(db, job, path, mtime, mode = null, owner = null) =
+    sql.exec(db, "update files set mtime = ?, mode = coalesce(?, mode), owner = coalesce(?, owner) where job = ? and path = ?", [mtime, mode, owner, job, path])
 
 ## Replace a job's whole index (used by --rebuild-state).
 export fn replace_index(db, job, rows) = sql.transaction(db, fn(tx) {

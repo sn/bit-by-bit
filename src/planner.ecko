@@ -24,18 +24,27 @@ export fn guard_empty_roots(scan, index, roots) {
     merge(scan, { protected: protected, problems: problems })
 }
 
+# An attribute counts as changed only when both sides know it: a row indexed
+# before it was recorded has null there.
+fn differs(e, prev, name) = get(e, name) != null and get(prev, name) != null and get(e, name) != get(prev, name)
+fn learns(e, prev, name) = get(e, name) != null and get(prev, name) == null
+
+## True when the file's mode or owner differs from what was backed up.
+export fn attrs_changed(e, prev) = differs(e, prev, "mode") or differs(e, prev, "owner")
+fn attrs_unknown(e, prev) = learns(e, prev, "mode") or learns(e, prev, "owner")
+
 ## Decide what a run must do. Pure: no I/O.
 ##   scan:  the result of scanner.scan
 ##   index: state.index for the job ({path: row})
 ## Returns {
-##   actions:   [{ op: "upload" | "check" | "replace" | "delete" | "chmod", path, entry, prev }]
+##   actions:   [{ op: "upload" | "check" | "replace" | "delete" | "attrs", path, entry, prev }]
 ##   unchanged: Int
-##   remember:  [[path, mode]] - modes to record for rows indexed before
-##              modes were (no request needed: nothing to compare them with)
+##   remember:  [{ path, mode, owner }] - attributes to record for rows indexed
+##              before they were (no request needed: nothing to compare them with)
 ## }
 ## "check" means size or mtime changed: the executor hashes the file and either
-## records a touch (same content) or does a replace. "chmod" means only the
-## mode changed: the object's metadata is updated in place.
+## records a touch (same content) or does a replace. "attrs" means only the
+## mode or owner changed: the object's metadata is updated in place.
 export fn plan(scan, index) {
     mut actions = []
     mut unchanged = 0
@@ -54,13 +63,11 @@ export fn plan(scan, index) {
                 actions = push(actions, { op: "replace", path: e.path, entry: e, prev: prev })
             }
         } else if prev.size == e.size and prev.mtime == e.mtime {
-            mode = get(e, "mode")
-            prev_mode = get(prev, "mode")
-            if mode != null and prev_mode != null and mode != prev_mode {
-                actions = push(actions, { op: "chmod", path: e.path, entry: e, prev: prev })
+            if attrs_changed(e, prev) {
+                actions = push(actions, { op: "attrs", path: e.path, entry: e, prev: prev })
             } else {
                 unchanged = unchanged + 1
-                if prev_mode == null and mode != null { remember = push(remember, [e.path, mode]) }
+                if attrs_unknown(e, prev) { remember = push(remember, { path: e.path, mode: get(e, "mode"), owner: get(e, "owner") }) }
             }
         } else {
             actions = push(actions, { op: "check", path: e.path, entry: e, prev: prev })

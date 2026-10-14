@@ -117,6 +117,32 @@ test.case("mode and mtime are restored", fn() {
     test.eq(fs.modified(out), fs.modified(p))
 })
 
+# Only root can give a file away, so a restore sets owners when it runs as
+# root (chown defaults to that) and leaves files to whoever restores them
+# otherwise.
+test.case("owners are set when chown is on, and left alone when it is off", fn() {
+    env = setup()
+    p = fs.join(env.root, "a.txt")
+    fs.write(p, "v1")
+    run_at(env, T0)
+    k = "pc" + p
+    fake_s3.put_raw(k, bytes("v1"), merge(fake_s3.object(k).meta, { "bbb-owner": "0:0" }))
+    me = fs.owner(p)
+    off = opts({ to: fs.join(fs.temp_dir(), "out-nochown"), chown: false })
+    r = restore.restore(CLIENT, env.job, off)
+    test.eq([r.restored, r.failed], [1, []])
+    test.eq(fs.owner(off.to + p), me)
+    on = opts({ to: fs.join(fs.temp_dir(), "out-chown"), chown: true })
+    r2 = restore.restore(CLIENT, env.job, on)
+    test.eq(r2.restored, 0)
+    test.ok(any(r2.failed, fn(f) contains(f, "can't set owner 0:0")), string(r2.failed))
+    test.ok(not fs.exists(on.to + p) and not fs.exists(on.to + p + ".bbb-partial"), "nothing left behind")
+})
+
+test.case("chown defaults to whether the restore runs as root", fn() {
+    test.eq(restore.as_root(), fs.owner("/proc/self").uid == 0)
+})
+
 test.case("a file name that is not valid UTF-8 backs up and restores", fn() {
     env = setup()
     # U+F7FF is how Ecko spells the raw byte 0xFF in a file name.

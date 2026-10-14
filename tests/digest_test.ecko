@@ -15,7 +15,17 @@ test.case("a small file's fingerprint is its sha256", fn() {
     test.ok(not digest.matches(p, hash.sha256("other")), "a different hash does not")
 })
 
-test.case("a large file's fingerprint is built from its part hashes", fn() {
+test.case("one read gives a large file's sha256 and its part hashes", fn() {
+    body = bytes("0123456789" * 1000)   # 10,000 bytes: parts of 4096, 4096, 1808
+    p = file("whole.bin", body)
+    h = digest.hashes(p, 10000, 4096)
+    test.eq(h.sha256, hash.sha256(body))
+    test.eq(h.parts, [hash.sha256(body[..4096]), hash.sha256(body[4096..8192]), hash.sha256(body[8192..])])
+    test.ok(digest.matches(p, h.sha256), "a large file matches its plain sha256")
+})
+
+# Files uploaded in parts before 0.7 were fingerprinted from their part hashes.
+test.case("a fingerprint built from part hashes still matches", fn() {
     body = bytes("0123456789" * 1000)   # 10,000 bytes: parts of 4096, 4096, 1808
     p = file("large.bin", body)
     hashes = digest.part_hashes(p, 10000, 4096)

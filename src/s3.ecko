@@ -173,11 +173,7 @@ export fn request(c, method, key, opts) {
         base_headers = merge(extra, { host: loc.host, "x-amz-content-sha256": payload_hash })
         req = { method: method, path: loc.path, query: query, headers: base_headers, payload_hash: payload_hash }
         signed = sigv4.sign(req, c.creds, c.dest.region, "s3", amz_now())
-        # Ecko sends no content-length for an empty bytes body, and S3 answers
-        # a PUT or POST without one with 411 (empty files, symlinks, copies).
-        # A stream carries its own length.
-        empty = send_body == null or (type_of(send_body) == "bytes" and len(send_body) == 0)
-        send_headers = merge(remove(signed, "host"), if empty and (method == "PUT" or method == "POST") { { "content-length": "0" } } else { {} })
+        send_headers = remove(signed, "host")
         url = loc.url + query_string(query)
         resp = match method {
             "GET" => http.get(url, headers: send_headers, timeout: REQUEST_TIMEOUT_MS, stream: want_stream)

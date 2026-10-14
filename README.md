@@ -55,7 +55,7 @@ sha256sum -c $f.sha256
 tar -xzf $f && cd ${f%.tar.gz}
 ```
 
-To build from source instead, install Ecko 0.66 or later and run this in the
+To build from source instead, install Ecko 0.68 or later and run this in the
 repo:
 
 ```bash
@@ -166,8 +166,10 @@ See `deploy/config.example.json`. The full field reference is in
 - **Symlinks** are backed up as links, not followed (unless `follow_symlinks`
   is set), and keep their target exactly as written: a relative link restores
   relative. A link whose target is missing is backed up too.
-- **Permissions:** a change of mode alone (`chmod`) is backed up by updating
-  the object's metadata, without uploading the file again.
+- **Permissions and owners:** each file's mode and owner (numeric
+  `uid:gid`) are backed up. A change of either alone (`chmod`, `chown`) is
+  backed up by updating the object's metadata, without uploading the file
+  again.
 - **Problems:** a run counts every problem, and keeps the text of the first
   1,000 for `status` and the dashboard. The log has all of them.
 
@@ -241,14 +243,15 @@ journalctl -u bit-by-bit -p warning    # problems and failures
 
 Restore never overwrites existing files unless you pass `--overwrite`. It
 checks every file against its stored fingerprint, and puts back each file's
-mode and modification time. Files download several at a time; symlinks are
+mode and modification time. Run as root, it also puts back each file's owner
+and group, by number: on another machine the same numbers may belong to
+different users. Run as anyone else, restored files belong to that user.
+Files download several at a time; symlinks are
 created after every file, and nothing is ever written through a symlink, so a
 tampered bucket can't make a restore write outside `--to`.
 
-**Not backed up:** file owner and group (restored files belong to the user
-running the restore; Ecko has no way yet to read or set ownership), empty
-directories, and directory permissions. Hard links are uploaded once per
-name.
+**Not backed up:** empty directories, directory permissions and owners, and
+the owners of symlinks. Hard links are uploaded once per name.
 
 ## State
 
@@ -295,14 +298,15 @@ restart.
 <prefix>/_versions/<run time>/<absolute local path>  copy moved aside by that run
 ```
 
-Objects carry `x-amz-meta-bbb-sha256`, `-mtime`, `-mode` and `-run`. Symlinks
-are stored as empty objects with `x-amz-meta-bbb-symlink`.
+Objects carry `x-amz-meta-bbb-sha256`, `-mtime`, `-mode`, `-owner` and
+`-run`. Symlinks are stored as empty objects with `x-amz-meta-bbb-symlink`.
 
-`bbb-sha256` is the content's SHA-256 for a file uploaded in one request. A
-file uploaded in parts (at least `multipart_threshold`, 64 MiB by default)
-has `mp<part size>-<SHA-256 of its parts' hex SHA-256s, joined>` instead:
-its parts are hashed in one read and each is sent with its hash, so the
-provider refuses any part that changed in between.
+`bbb-sha256` is the content's SHA-256. A file uploaded in parts (at least
+`multipart_threshold`, 64 MiB by default) is hashed whole and by part in one
+read, and each part is sent with its hash, so the provider refuses any part
+that changed in between. Files uploaded in parts before 0.7 have
+`mp<part size>-<SHA-256 of its parts' hex SHA-256s, joined>` instead; they
+still restore and verify, and get a plain SHA-256 the next time they change.
 
 ## Develop
 

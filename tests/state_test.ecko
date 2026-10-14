@@ -26,12 +26,24 @@ test.case("index put, touch, remove, per job", fn() {
     state.put_file(db, "home", { path: "/b", size: 3, mtime: 4, sha256: "h2", kind: "symlink" })
     state.put_file(db, "other", { path: "/a", size: 9, mtime: 9, sha256: "h9", kind: "file" })
     state.touch_file(db, "home", "/a", 50)
-    test.eq(get(state.index(db, "home"), "/a"), { path: "/a", size: 1, mtime: 50, sha256: "h1", kind: "file", mode: null })
+    test.eq(get(state.index(db, "home"), "/a"), { path: "/a", size: 1, mtime: 50, sha256: "h1", kind: "file", mode: null, owner: null })
     state.remove_file(db, "home", "/b")
     test.eq(keys(state.index(db, "home")), ["/a"])
     test.eq(get(state.index(db, "other"), "/a").sha256, "h9")
     state.put_file(db, "home", { path: "/a", size: 7, mtime: 8, sha256: "new", kind: "file" })
     test.eq(get(state.index(db, "home"), "/a").sha256, "new")
+})
+
+test.case("modes and owners are stored, touched and learned", fn() {
+    db = fresh()
+    state.put_file(db, "home", { path: "/a", size: 1, mtime: 2, sha256: "h", kind: "file", mode: "644", owner: "1000:1000" })
+    state.put_file(db, "home", { path: "/b", size: 1, mtime: 2, sha256: "h", kind: "file" })
+    state.touch_file(db, "home", "/a", 9, mode: "600", owner: "0:0")
+    a = get(state.index(db, "home"), "/a")
+    test.eq([a.mtime, a.mode, a.owner], [9, "600", "0:0"])
+    state.set_attrs(db, "home", [{ path: "/b", mode: "640", owner: "1000:100" }])
+    b = get(state.index(db, "home"), "/b")
+    test.eq([b.mode, b.owner], ["640", "1000:100"])
 })
 
 test.case("replace_index swaps a job's rows atomically", fn() {

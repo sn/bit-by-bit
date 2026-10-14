@@ -84,17 +84,19 @@ fn version_aside(ctx, path, size) {
 
 fn prev_size(action) = if action.prev == null { 0 } else { action.prev.size }
 
-# Set the object's mode metadata to the file's, in place. The content is
-# unchanged, so the old copy is not versioned.
-fn update_mode(ctx, path, size, mode) {
+# Set the object's mode and owner metadata to the file's, in place. The
+# content is unchanged, so the old copy is not versioned. `attrs` is
+# { mode, owner }; an attribute that is null is left out.
+fn update_attrs(ctx, path, size, attrs) {
     key = current_key(ctx.job, path)
+    changes = reduce(keys(attrs), fn(acc, k) if attrs[k] == null { acc } else { set(acc, k, attrs[k]) }, {})
     limit = get(ctx.cfg, "copy_limit") ?? COPY_LIMIT
     if size > limit {
         meta = s3.head_object(ctx.client, key)
         if meta == null { error({ kind: "s3_not_found", message: "{key}: no such object" }) }
-        multipart_copy(ctx, key, key, size, meta_override: set(meta, "mode", mode))
+        multipart_copy(ctx, key, key, size, meta_override: merge(meta, changes))
     } else {
-        s3.update_meta(ctx.client, key, { mode: mode })
+        s3.update_meta(ctx.client, key, changes)
     }
 }
 
@@ -113,40 +115,41 @@ fn upload_multipart(ctx, path, key, meta, size, ps, hashes) {
         open_part = fn() digest.open_range(path, first, min([ps, size - first]))
         { n: n, etag: s3.upload_part(c, key, id, n, open_part, sha256: hashes[n - 1]) }
     }
-    # Tasks, not pmap: pmap is capped at the core count, so a 2-core
-    # machine would send the parts 2 at a time.
-    async fn send_task(n) = send_part(n)
-    mut parts = []
-    for group in chunk(range(1, count + 1), PART_PARALLEL) {
-        tasks = map(group, send_task)
-        for t in tasks { parts = push(parts, await t) }
-    }
+    # An explicit limit: pmap's default is one worker per core, and sending
+    # parts waits on the network, not the CPU.
+    parts = pmap(range(1, count + 1), send_part, limit: PART_PARALLEL)
     s3.complete_multipart(c, key, id, parts, expect: meta)
     state.remove_multipart(ctx.db, ctx.job.name, key, id)
 }
+
+# Whether the indexed fingerprint `prev` is of this content: its SHA-256,
+# or for a large file indexed before 0.7, the form built from its parts.
+fn same_content(prev, h, ps) = prev == h.sha256 or (len(h.parts) > 0 and prev == digest.of_parts(ps, h.parts))
 
 fn upload_file(ctx, action, replacing) {
     path = action.path
     before = stat(path)
     multipart = before.size >= ctx.cfg.multipart_threshold
     ps = part_size_for(before.size, ctx.cfg.multipart_part_size)
-    hashes = if multipart { digest.part_hashes(path, before.size, ps) } else { [] }
-    sha = if multipart { digest.of_parts(ps, hashes) } else { hash.sha256(fs.open(path)) }
+    h = if multipart { digest.hashes(path, before.size, ps) } else { { sha256: hash.sha256(fs.open(path)), parts: [] } }
+    sha = h.sha256
     mode = fs.mode(path)
-    if action.op == "check" and sha == action.prev.sha256 {
-        prev_mode = get(action.prev, "mode")
-        if prev_mode != null and prev_mode != mode { update_mode(ctx, path, before.size, mode) }
-        return { op: "touch", path: path, mtime: before.mtime, mode: mode }
+    owner = scanner.owner_of(path)
+    if action.op == "check" and same_content(action.prev.sha256, h, ps) {
+        if planner.attrs_changed({ mode: mode, owner: owner }, action.prev) {
+            update_attrs(ctx, path, before.size, { mode: mode, owner: owner })
+        }
+        return { op: "touch", path: path, mtime: before.mtime, mode: mode, owner: owner }
     }
     if replacing { version_aside(ctx, path, prev_size(action)) }
     key = current_key(ctx.job, path)
-    meta = { sha256: sha, mtime: string(before.mtime), mode: mode, run: ctx.run_ts }
+    meta = { sha256: sha, mtime: string(before.mtime), mode: mode, owner: owner, run: ctx.run_ts }
     # Streamed from disk with the hash computed above: one more read, no copy
     # in memory and no second hash. If the file changed since it was hashed,
     # the provider refuses the mismatched body.
     refused = try {
         if multipart {
-            upload_multipart(ctx, path, key, meta, before.size, ps, hashes)
+            upload_multipart(ctx, path, key, meta, before.size, ps, h.parts)
         } else {
             s3.put_object(ctx.client, key, fn() fs.open(path), meta, sha256: sha)
         }
@@ -161,7 +164,7 @@ fn upload_file(ctx, action, replacing) {
     if after != before {
         return { op: "problem", path: path, message: "{path}: changed during upload" }
     }
-    row = { path: path, size: before.size, mtime: before.mtime, sha256: sha, kind: "file", mode: mode }
+    row = { path: path, size: before.size, mtime: before.mtime, sha256: sha, kind: "file", mode: mode, owner: owner }
     { op: if replacing { "replace" } else { "upload" }, path: path, row: row, bytes: before.size }
 }
 
@@ -184,9 +187,10 @@ export fn execute(ctx, action) {
                 s3.delete_object(ctx.client, current_key(ctx.job, action.path))
                 { op: "delete", path: action.path }
             }
-            "chmod" => {
-                update_mode(ctx, action.path, action.prev.size, action.entry.mode)
-                { op: "touch", path: action.path, mtime: action.entry.mtime, mode: action.entry.mode }
+            "attrs" => {
+                e = action.entry
+                update_attrs(ctx, action.path, action.prev.size, { mode: e.mode, owner: e.owner })
+                { op: "touch", path: action.path, mtime: e.mtime, mode: e.mode, owner: e.owner }
             }
             _ => {
                 kind = if action.entry == null { "file" } else { action.entry.kind }
@@ -226,7 +230,7 @@ fn record(ctx, totals, r) {
             merge(totals, { replaced: totals.replaced + 1, bytes: totals.bytes + r.bytes })
         }
         "touch" => {
-            state.touch_file(ctx.db, ctx.job.name, r.path, r.mtime, mode: get(r, "mode"))
+            state.touch_file(ctx.db, ctx.job.name, r.path, r.mtime, mode: get(r, "mode"), owner: get(r, "owner"))
             set(totals, "touched", totals.touched + 1)
         }
         "delete" => {
@@ -307,7 +311,7 @@ export fn run_job(ctx) {
         for a in p.actions { ctx.log("info", "would " + a.op, { path: a.path }) }
         return merge(totals, { status: "ok", error: null })
     }
-    if len(p.remember) > 0 { state.set_modes(ctx.db, ctx.job.name, p.remember) }
+    if len(p.remember) > 0 { state.set_attrs(ctx.db, ctx.job.name, p.remember) }
     state.set_planned(ctx.db, ctx.run_id, len(p.actions))
     mut fatal = null
     # A worker pool: each worker takes the next action as soon as it finishes

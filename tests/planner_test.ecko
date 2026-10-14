@@ -56,14 +56,24 @@ test.case("kind change replaces", fn() {
     test.eq(ops(p), [["replace", "/x"]])
 })
 
-# chmod changes neither size nor mtime, so the mode is compared too.
-test.case("a mode-only change is a chmod, and an unknown old mode is remembered", fn() {
-    f = fn(path, mode) merge(file(path, 1, 1), { mode: mode })
-    known = fn(mode) merge(idx(1, 1, "h", "file"), { mode: mode })
+# chmod and chown change neither size nor mtime, so the mode and the owner
+# are compared too.
+test.case("a mode-only change is an attrs update, and an unknown old mode is remembered", fn() {
+    f = fn(path, mode) merge(file(path, 1, 1), { mode: mode, owner: "1000:1000" })
+    known = fn(mode) merge(idx(1, 1, "h", "file"), { mode: mode, owner: "1000:1000" })
     p = planner.plan(scan([f("/a", "600"), f("/b", "644"), f("/c", "644")], []),
         index({ "/a": known("644"), "/b": known("644"), "/c": known(null) }))
-    test.eq(ops(p), [["chmod", "/a"]])
+    test.eq(ops(p), [["attrs", "/a"]])
     test.eq(p.unchanged, 2)
     # Indexes written before modes were recorded learn them without a request.
-    test.eq(p.remember, [["/c", "644"]])
+    test.eq(p.remember, [{ path: "/c", mode: "644", owner: "1000:1000" }])
+})
+
+test.case("an owner-only change is an attrs update, and an unknown old owner is remembered", fn() {
+    f = fn(path, owner) merge(file(path, 1, 1), { mode: "644", owner: owner })
+    known = fn(owner) merge(idx(1, 1, "h", "file"), { mode: "644", owner: owner })
+    p = planner.plan(scan([f("/a", "0:0"), f("/b", "1000:1000"), f("/c", "1000:100")], []),
+        index({ "/a": known("1000:1000"), "/b": known("1000:1000"), "/c": known(null) }))
+    test.eq(ops(p), [["attrs", "/a"]])
+    test.eq(p.remember, [{ path: "/c", mode: "644", owner: "1000:100" }])
 })

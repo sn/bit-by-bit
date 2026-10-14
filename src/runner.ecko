@@ -92,7 +92,7 @@ export fn rebuild_state(cfg, job, db) {
         if meta == null { null } else if has(meta, "symlink") {
             { path: path, size: 0, mtime: 0, sha256: planner.link_sha(encoding.url_decode(meta.symlink)), kind: "symlink" }
         } else {
-            { path: path, size: o.size, mtime: int(get(meta, "mtime") ?? "0"), sha256: get(meta, "sha256") ?? "", kind: "file", mode: get(meta, "mode") }
+            { path: path, size: o.size, mtime: int(get(meta, "mtime") ?? "0"), sha256: get(meta, "sha256") ?? "", kind: "file", mode: get(meta, "mode"), owner: get(meta, "owner") }
         }
     })
     rows = filter(found, fn(r) r != null)

@@ -6,6 +6,7 @@ import std.sql
 import "../src/s3.ecko"
 import "../src/state.ecko"
 import "../src/sync.ecko"
+import "../src/digest.ecko"
 import "../testkit/fake_s3.ecko"
 
 port = fake_s3.start()
@@ -50,6 +51,8 @@ test.case("first run uploads everything with metadata", fn() {
     meta = remote(env, "a.txt").meta
     test.eq(meta["bbb-sha256"], hash.sha256("alpha"))
     test.ok(has(meta, "bbb-mtime") and has(meta, "bbb-mode") and has(meta, "bbb-run"), string(meta))
+    own = fs.owner(fs.join(env.root, "a.txt"))
+    test.eq(meta["bbb-owner"], "{own.uid}:{own.gid}")
     test.eq(len(keys(state.index(env.db, "t"))), 2)
     test.eq(state.last_run(env.db, "t").status, "ok")
 })
@@ -222,7 +225,23 @@ test.case("a large file that changes before its parts go up is refused, not stor
     o2 = sync.run(ctx(env, { cfg: cfg }))
     test.eq(o2.uploaded, 1)
     test.eq(remote(env, "big.bin").body, bytes("fedcba9876543210" * 1024))
-    test.ok(starts_with(remote(env, "big.bin").meta["bbb-sha256"], "mp4096-"), string(remote(env, "big.bin").meta))
+    test.eq(remote(env, "big.bin").meta["bbb-sha256"], hash.sha256(bytes("fedcba9876543210" * 1024)))
+})
+
+# Before 0.7 a large file's fingerprint was built from its part hashes. A
+# touch must not upload such a file again just because the form changed.
+test.case("a large file indexed with an old part fingerprint is only touched", fn() {
+    env = setup()
+    cfg = merge(CFG, { multipart_threshold: 1000, multipart_part_size: 4096 })
+    p = fs.join(env.root, "big.bin")
+    body = bytes("0123456789abcdef" * 1024)
+    fs.write(p, body)
+    sync.run(ctx(env, { cfg: cfg }))
+    old = digest.of_parts(4096, digest.hashes(p, len(body), 4096).parts)
+    sql.exec(env.db, "update files set sha256 = ? where path = ?", [old, p])
+    fs.set_modified(p, fs.modified(p) + 5000)
+    o = sync.run(ctx(env, { cfg: cfg }))
+    test.eq([o.uploaded, o.replaced, o.touched], [0, 0, 1])
 })
 
 # Index rows are written in batches. Whatever reached the bucket before a
@@ -307,15 +326,35 @@ test.case("a chmod alone updates the object's mode without uploading it again", 
     test.eq(run(env).touched, 0)
 })
 
-test.case("an index from before modes were recorded learns them without requests", fn() {
+# Only root can chown, so the change is made on the other side: the index
+# and the object say the file belonged to root.
+test.case("an owner change alone updates the object's owner without uploading it again", fn() {
     env = setup()
     run(env)
-    sql.exec(env.db, "update files set mode = null")
+    a = fs.join(env.root, "a.txt")
+    k = key(env, "a.txt")
+    fake_s3.put_raw(k, bytes("alpha"), set(remote(env, "a.txt").meta, "bbb-owner", "0:0"))
+    sql.exec(env.db, "update files set owner = '0:0' where path = ?", [a])
+    fake_s3.reset_log()
+    o = run(env)
+    test.eq([o.status, o.uploaded, o.replaced, o.touched], ["ok", 0, 0, 1])
+    me = fs.owner(a)
+    test.eq(remote(env, "a.txt").meta["bbb-owner"], "{me.uid}:{me.gid}")
+    test.eq(remote(env, "a.txt").body, bytes("alpha"))
+    test.eq(versions(), [])
+    test.eq(state.index(env.db, "t")[a].owner, "{me.uid}:{me.gid}")
+    test.eq(run(env).touched, 0)
+})
+
+test.case("an index from before modes and owners were recorded learns them without requests", fn() {
+    env = setup()
+    run(env)
+    sql.exec(env.db, "update files set mode = null, owner = null")
     fake_s3.reset_log()
     o = run(env)
     test.eq([o.status, o.touched, o.uploaded], ["ok", 0, 0])
     test.eq(filter(fake_s3.requests(), fn(r) not starts_with(r, "GET ")), [])
-    test.ok(all(values(state.index(env.db, "t")), fn(r) r.mode != null), "modes recorded")
+    test.ok(all(values(state.index(env.db, "t")), fn(r) r.mode != null and r.owner != null), "modes and owners recorded")
 })
 
 test.case("dry run changes nothing", fn() {
