@@ -28,11 +28,13 @@ then run a first backup and start the service.
 ### 1. Get the binary
 
 Each [release](https://github.com/sn/bit-by-bit/releases) has a prebuilt
-binary for x86-64 and arm64 Linux, so you don't need Ecko. This downloads the
-one for your machine, checks its SHA-256 and unpacks it:
+binary for x86-64 and arm64 Linux, so you don't need Ecko. This finds the
+latest release, downloads the build for your machine, checks its SHA-256 and
+unpacks it:
 
 ```bash
-v=v0.6.0
+v=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/sn/bit-by-bit/releases/latest)
+v=${v##*/}
 f=bit-by-bit-$v-$(uname -m)-linux.tar.gz
 curl -fsSLO https://github.com/sn/bit-by-bit/releases/download/$v/$f
 curl -fsSLO https://github.com/sn/bit-by-bit/releases/download/$v/$f.sha256
