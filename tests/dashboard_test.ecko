@@ -123,10 +123,10 @@ test.case("the favicon carries the overall health", fn() {
     record("home", "r1", time.now() - H, "ok", [], null)
     ok = http.get(url("/")).body
     test.ok(contains(ok, "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,"), "inline svg icon")
-    test.ok(contains(ok, "%2322d3ee") and not contains(ok, "%23f43f5e"), "cyan-violet arrow when healthy")
+    test.ok(contains(ok, "%237dfca4") and not contains(ok, "%23f43f5e"), "green arrow when healthy")
     record("home", "r2", time.now() - 60000, "failed", [], "boom")
     bad = http.get(url("/")).body
-    test.ok(contains(bad, "%23f43f5e") and not contains(bad, "%2322d3ee"), "orange-red arrow when not")
+    test.ok(contains(bad, "%23f43f5e") and not contains(bad, "%237dfca4"), "orange-red arrow when not")
 })
 
 test.case("the header shows the icon beside the name", fn() {

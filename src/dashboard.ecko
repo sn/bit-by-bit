@@ -414,9 +414,9 @@ let SCRIPT = r"""
 
 # The tab icon: an upload arrow whose shaft breaks up into bits, so the
 # backup assembles bit by bit as it rises. The arrow's colour is the overall
-# health, cyan to violet when every backup is fine and orange to red when one
+# health, phosphor green when every backup is fine and orange to red when one
 # needs attention, so a background tab still says whether to look.
-let ICON_OK = ["#22d3ee", "#8b5cf6"]
+let ICON_OK = ["#7dfca4", "#16a34a"]
 let ICON_BAD = ["#ffb03a", "#f43f5e"]
 # The trailing bits: x, y, opacity. They fade and scatter as they fall away.
 let ICON_BITS = [[12.2, 19.8, 0.85], [16.2, 19.8, 0.85], [12.2, 23.4, 0.5], [17.6, 23.8, 0.4], [14.4, 26.8, 0.22]]
