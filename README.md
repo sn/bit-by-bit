@@ -23,7 +23,20 @@ systemd service. Written in [Ecko](https://ecko.sh).
 ## Install
 
 There are four steps: get the binary, run the installer, add your settings,
-then run a first backup and start the service.
+then run a first backup and start the service. This one line does the first
+two, then continue at [step 3](#3-add-your-settings):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sn/bit-by-bit/main/get.sh | sh
+```
+
+It downloads the latest release for your machine, checks its SHA-256 and
+runs the installer with `sudo`. To read the script before running it, open
+[`get.sh`](get.sh). To install a particular release, set `BBB_VERSION`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sn/bit-by-bit/main/get.sh | BBB_VERSION=v0.6.0 sh
+```
 
 ### 1. Get the binary
 
