@@ -163,9 +163,13 @@ fn history(j) {
     "<ol class=\"history\" aria-hidden=\"true\">" + ticks + "</ol>"
 }
 
-fn kpi(label, value, detail) = "<div class=\"kpi\"><dt>" + label + "</dt><dd><span class=\"value\">" + esc(value) + "</span><span class=\"when\">" + esc(detail) + "</span></dd></div>"
+fn kpi(label, value, detail) = kpi_as("kpi", label, value, detail)
+fn kpi_as(cls, label, value, detail) = "<div class=\"" + cls + "\"><dt>" + label + "</dt><dd><span class=\"value\">" + esc(value) + "</span><span class=\"when\">" + esc(detail) + "</span></dd></div>"
 
 fn stat(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(if type_of(value) == "int" { commas(value) } else { value }) + "</dd></div>"
+
+# Rounded down, so a run shows 100% only once every file is done.
+fn percent(done, planned) = if planned <= 0 { 100 } else { min([100, done * 100 // planned]) }
 
 # A run in progress: how far it has got, how fast, and roughly how long is
 # left, from the progress it saves to the database about once a second.
@@ -184,19 +188,21 @@ fn progress_html(j, now) {
     }
     "<section class=\"block\"><h3>in progress</h3>" +
         "<progress id=\"progress-" + j.job + "\" max=\"" + string(j.planned) + "\" value=\"" + string(j.done) + "\" aria-label=\"" + bar_label + "\"></progress>" +
-        "<p class=\"progress-text\"><strong>" + commas(j.done) + " of " + commas(j.planned) + "</strong> files · " + esc(status.size_text(j.bytes)) + " · " + esc(pace) + "</p>" +
+        "<p class=\"progress-text\"><strong>" + string(percent(j.done, j.planned)) + "% · " + commas(j.done) + " of " + commas(j.planned) + "</strong> files · " + replace(esc(status.size_text(j.bytes)), " ", "&nbsp;") + " · " + esc(pace) + "</p>" +
         "<dl class=\"stats\">" + stat("uploaded", j.uploaded) + stat("replaced", j.replaced) + stat("deleted", j.deleted) + "</dl></section>"
 }
 
+fn meta_item(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(value) + "</dd></div>"
+
 fn job_card(j, now) {
     overdue = if j.overdue { " <span class=\"badge bad\"><span aria-hidden=\"true\">!</span> overdue</span>" } else { "" }
-    meta = "<p class=\"job-meta\"><span>" + esc(schedule_text(j.schedule)) + "</span><span>" + esc(j.destination + "/" + j.prefix) +
-        "</span><span class=\"paths\">" + esc(join(j.paths, ", ")) + "</span></p>"
+    meta = "<dl class=\"job-meta\">" + meta_item("from", join(j.paths, ", ")) + meta_item("to", j.destination + "/" + j.prefix) +
+        meta_item("runs", schedule_text(j.schedule)) + "</dl>"
     took = if j.started_at == null { "" } else if j.finished_at == null { "running for " + span_text(now - j.started_at) } else { "took " + dur_text(j.finished_at - j.started_at) }
     kpis = "<dl class=\"kpis\">" +
-        kpi("last good backup", ago_text(j.last_good_at, now), if j.last_good_at == null { "no run has worked yet" } else { at_text(j.last_good_at) }) +
-        kpi("next run", until_text(j.next_due, now), if j.next_due <= now { "" } else { at_text(j.next_due) }) +
+        kpi_as("kpi lead", "last good backup", ago_text(j.last_good_at, now), if j.last_good_at == null { "no run has worked yet" } else { at_text(j.last_good_at) }) +
         kpi("last run", ago_text(j.started_at, now), if j.started_at == null { "" } else { at_text(j.started_at) + " · " + took }) +
+        kpi("next run", until_text(j.next_due, now), if j.next_due <= now { "" } else { at_text(j.next_due) }) +
         "</dl>"
     stats = if j.finished_at == null { "" } else {
         "<section class=\"block\"><h3>changes in the last run</h3><dl class=\"stats\">" + stat("uploaded", j.uploaded) + stat("replaced", j.replaced) +
@@ -264,7 +270,7 @@ let CSS = r"""
     .sub { color: var(--text-muted); font-size: 0.875rem; flex: 1 1 20rem; }
     button {
       font: inherit; font-size: 0.8125rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.375rem 0.875rem;
-      border: 1px solid var(--text-bright); border-radius: 0; background: transparent; color: var(--text-bright); text-shadow: inherit; cursor: pointer;
+      border: 1px solid var(--line); border-radius: 0; background: transparent; color: var(--text-muted); cursor: pointer;
       transition-property: background-color, color; transition-duration: 150ms; transition-timing-function: ease-out;
     }
     button::before { content: "[ "; content: "[ " / ""; }
@@ -293,8 +299,10 @@ let CSS = r"""
     .job-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; padding: 0.875rem 1.25rem; border-bottom: 1px dashed var(--line); border-inline-start: 4px solid var(--tone-fg); }
     .job-head h2 { font-size: 1.25rem; line-height: 1.3; color: var(--text-bright); text-shadow: var(--glow); }
     .job-head h2::before { content: "> "; content: "> " / ""; color: var(--text-muted); }
-    .job-meta { display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; margin-inline-start: auto; color: var(--text-muted); font-size: 0.8125rem; }
-    .job-meta .paths { overflow-wrap: anywhere; }
+    .job-meta { display: flex; flex-wrap: wrap; gap: 0.25rem 1.5rem; margin-inline-start: auto; font-size: 0.8125rem; min-width: 0; }
+    .job-meta div { display: flex; gap: 0.5rem; align-items: baseline; min-width: 0; }
+    .job-meta dt { color: var(--text-muted); font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+    .job-meta dd { overflow-wrap: anywhere; }
     .job-body { display: grid; grid-template-columns: minmax(0, 1fr); }
     .facts, .detail { padding: 1.25rem; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem; align-content: start; min-width: 0; }
     .facts { background: var(--surface-sunk); }
@@ -306,12 +314,14 @@ let CSS = r"""
     .kpis { display: grid; gap: 1rem; }
     .kpi dt, .stats dt, h3 { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); letter-spacing: 0.05em; text-transform: uppercase; }
     .kpi dd { display: grid; }
-    .kpi .value { font-size: 1.5rem; font-weight: 600; line-height: 1.2; color: var(--text-bright); text-shadow: var(--glow); font-variant-numeric: tabular-nums; }
+    .kpi .value { font-size: 1.125rem; font-weight: 600; line-height: 1.2; color: var(--text-bright); text-shadow: var(--glow); font-variant-numeric: tabular-nums; }
+    /* The last good backup is the question the page answers; the other two support it. */
+    .kpi.lead .value { font-size: 1.75rem; }
     .kpi .when { color: var(--text-muted); font-size: 0.8125rem; font-variant-numeric: tabular-nums; }
     h3 { margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
     h3::before { content: "//"; content: "//" / ""; color: var(--line); }
     .count { font-size: 0.75rem; padding: 0 0.4rem; letter-spacing: 0; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr)); gap: 0.75rem 1rem; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(5.25rem, 1fr)); gap: 0.75rem 1rem; }
     .stats dd { font-size: 1.0625rem; font-weight: 600; color: var(--text-bright); font-variant-numeric: tabular-nums; }
 
     .callout { border: 1px solid var(--bad-fg); border-inline-start-width: 4px; background: var(--bad-bg); padding: 0.75rem 1rem; }
@@ -343,10 +353,19 @@ let CSS = r"""
     .history { display: flex; gap: 0.25rem; padding: 0; list-style: none; }
     .tick { display: grid; place-items: center; width: 1.25rem; height: 1.25rem; border: 1px solid currentColor; font-size: 0.6875rem; font-weight: 700; }
 
-    .table-wrap { overflow-x: auto; width: fit-content; max-width: 100%; border: 1px solid var(--line); }
+    /* When the table is wider than its column, a glow on the cut-off edge says it scrolls. */
+    .table-wrap {
+      overflow-x: auto; width: fit-content; max-width: 100%; border: 1px solid var(--line);
+      background:
+        linear-gradient(to right, var(--surface) 40%, transparent) left / 2rem 100% no-repeat local,
+        linear-gradient(to left, var(--surface) 40%, transparent) right / 2rem 100% no-repeat local,
+        radial-gradient(farthest-side at 0 50%, rgb(125 252 164 / 0.5), transparent) left / 1rem 100% no-repeat scroll,
+        radial-gradient(farthest-side at 100% 50%, rgb(125 252 164 / 0.5), transparent) right / 1rem 100% no-repeat scroll,
+        var(--surface);
+    }
     table { border-collapse: collapse; font-size: 0.8125rem; }
     th, td { text-align: start; padding: 0.375rem 1rem; white-space: nowrap; }
-    th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.75rem; background: var(--surface-sunk); border-bottom: 1px solid var(--line); }
+    th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.75rem; border-bottom: 1px solid var(--line); }
     tbody tr + tr td { border-top: 1px dashed color-mix(in srgb, var(--line) 60%, transparent); }
     .num { text-align: end; font-variant-numeric: tabular-nums; }
 """
