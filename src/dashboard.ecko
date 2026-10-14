@@ -152,7 +152,7 @@ fn problems_html(j) {
 
 fn run_row(r) = "<tr><td>" + esc(at_text(r.started_at)) + "</td><td>" + badge(r.status) + "</td><td>" + esc(dur_text(r.duration_ms)) +
     "</td><td class=\"num\">" + commas(r.uploaded) + "</td><td class=\"num\">" + commas(r.replaced) + "</td><td class=\"num\">" + commas(r.deleted) +
-    "</td><td class=\"num\">" + esc(status.size_text(r.bytes)) + "</td><td class=\"num\">" + esc(r.problem_count) + "</td></tr>"
+    "</td><td class=\"num\">" + esc(status.size_text(r.bytes)) + "</td><td class=\"num\">" + commas(r.problem_count) + "</td></tr>"
 
 # The recent runs as a strip, oldest first: a glance at the pattern. The table
 # below carries the same facts as text, so the strip is hidden from assistive tech.
@@ -371,43 +371,58 @@ let CSS = r"""
 """
 
 # Updates the page in place every data-refresh ms (faster while a run is
-# going), keeping the reader's
-# place, open disclosures and focus. Pausable, and idle while the tab is hidden.
+# going), keeping the reader's place, open disclosures, focus and table scroll.
+# Pausable, idle while the tab is hidden or text is selected, and caught up as
+# soon as the tab is shown again. When the daemon can't be reached the tab says
+# so, rather than going on showing the last health it reported.
 let SCRIPT = r"""
 (function () {
-  var paused = false, btn = document.getElementById('pause'), conn = document.getElementById('conn');
+  var paused = false, timer = null, btn = document.getElementById('pause'), conn = document.getElementById('conn');
+  var main = document.getElementById('main'), favicon = document.getElementById('favicon'), logo = document.getElementById('logo');
   btn.addEventListener('click', function () {
     paused = !paused;
     btn.textContent = paused ? 'Resume updates' : 'Pause updates';
   });
   function schedule() {
-    setTimeout(update, Number(document.getElementById('main').dataset.refresh) || 30000);
+    clearTimeout(timer);
+    timer = setTimeout(update, Number(main.dataset.refresh) || 30000);
+  }
+  // Replacing the page would drop a selection the reader is about to copy.
+  function selecting() {
+    var s = window.getSelection();
+    return s && !s.isCollapsed && main.contains(s.anchorNode);
   }
   function update() {
-    if (paused || document.hidden) { schedule(); return; }
+    if (paused || document.hidden || selecting()) { schedule(); return; }
     fetch(location.pathname, { cache: 'no-store' }).then(function (r) {
       if (!r.ok) throw new Error(r.status);
       return r.text();
     }).then(function (text) {
       var next = new DOMParser().parseFromString(text, 'text/html');
-      var main = document.getElementById('main');
       var open = Array.prototype.map.call(main.querySelectorAll('details[open]'), function (d) { return d.id; });
+      var scrolled = Array.prototype.map.call(main.querySelectorAll('.table-wrap'), function (t) { return [t.id, t.scrollLeft]; });
       var focused = main.contains(document.activeElement) ? document.activeElement.id : '';
       main.innerHTML = next.getElementById('main').innerHTML;
       main.dataset.refresh = next.getElementById('main').dataset.refresh;
       open.forEach(function (id) { var d = document.getElementById(id); if (d) d.open = true; });
+      scrolled.forEach(function (s) { var t = document.getElementById(s[0]); if (t) t.scrollLeft = s[1]; });
       if (focused) { var f = document.getElementById(focused); if (f) f.focus({ preventScroll: true }); }
       document.title = next.title;
-      document.getElementById('favicon').href = next.getElementById('favicon').href;
-      document.getElementById('logo').src = next.getElementById('logo').src;
+      favicon.href = next.getElementById('favicon').href;
+      logo.src = next.getElementById('logo').src;
       document.getElementById('updated').textContent = next.getElementById('updated').textContent;
       conn.textContent = '';
       schedule();
     }).catch(function () {
       conn.textContent = " · can't reach the daemon, showing the last data it sent. Check: systemctl status bit-by-bit";
+      document.title = "bit-by-bit: can't reach the daemon";
+      favicon.href = logo.src = favicon.dataset.unreachable;
       schedule();
     });
   }
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && !paused) update();
+  });
   schedule();
 })();
 """
@@ -450,7 +465,7 @@ export fn render_html(snap) {
     refresh_ms = (if busy { REFRESH_RUNNING_SECONDS } else { REFRESH_SECONDS }) * 1000
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
-        "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"" + icon + "\">" +
+        "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"" + icon + "\" data-unreachable=\"" + favicon(false) + "\">" +
         "<title>bit-by-bit: " + health_text + "</title><style>" + CSS + "</style></head><body>" +
         "<header class=\"topbar\"><div class=\"brand\"><img class=\"logo\" id=\"logo\" src=\"" + icon + "\" width=\"28\" height=\"28\" alt=\"\"><h1>bit-by-bit</h1>" + overall + "</div>" +
         "<p class=\"sub\"><span id=\"updated\">daemon up " + esc(dur_text(snap.daemon.uptime_ms)) + " (since " + esc(at_text(snap.daemon.started_at)) +

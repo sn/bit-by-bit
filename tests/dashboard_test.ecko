@@ -118,15 +118,25 @@ test.case("the page updates faster while a run is going", fn() {
     test.ok(contains(http.get(url("/")).body, "<main id=\"main\" data-refresh=\"3000\">"), "running: 3s")
 })
 
+# An attribute of the favicon link.
+fn attr(body, name) {
+    # Not split on ">": the inline SVG is full of them. Its quotes are single.
+    link = split(split(body, "<link rel=\"icon\" ")[1], "<title>")[0]
+    parts = split(link, " {name}=\"")
+    if len(parts) < 2 { "" } else { split(parts[1], "\"")[0] }
+}
+
 test.case("the favicon carries the overall health", fn() {
     reset()
     record("home", "r1", time.now() - H, "ok", [], null)
     ok = http.get(url("/")).body
     test.ok(contains(ok, "<link rel=\"icon\" id=\"favicon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,"), "inline svg icon")
-    test.ok(contains(ok, "%237dfca4") and not contains(ok, "%23f43f5e"), "green arrow when healthy")
+    test.ok(contains(attr(ok, "href"), "%237dfca4") and not contains(attr(ok, "href"), "%23f43f5e"), "green arrow when healthy")
+    # The page can't vouch for backups once it loses the daemon: it switches to this.
+    test.ok(contains(attr(ok, "data-unreachable"), "%23f43f5e"), "orange-red icon ready for an unreachable daemon")
     record("home", "r2", time.now() - 60000, "failed", [], "boom")
     bad = http.get(url("/")).body
-    test.ok(contains(bad, "%23f43f5e") and not contains(bad, "%237dfca4"), "orange-red arrow when not")
+    test.ok(contains(attr(bad, "href"), "%23f43f5e") and not contains(attr(bad, "href"), "%237dfca4"), "orange-red arrow when not")
 })
 
 test.case("the header shows the icon beside the name", fn() {
@@ -155,6 +165,7 @@ test.case("a capped problem list shows the full count and says it is capped", fn
     body = http.get(url("/")).body
     test.ok(contains(body, "<span class=\"count warn\">1,500</span>"), "full count")
     test.ok(contains(body, "1,498 more problems not listed"), "says the rest are not listed")
+    test.ok(contains(body, "<td class=\"num\">1,500</td></tr>"), "the runs table groups digits too")
 })
 
 test.case("every problem is reachable, past the first five behind a disclosure", fn() {
