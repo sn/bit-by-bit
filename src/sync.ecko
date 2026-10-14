@@ -98,9 +98,13 @@ fn upload_multipart(ctx, path, key, meta, size) {
         }
         { n: n, etag: s3.upload_part(c, key, id, n, open_part, sha256: hash.sha256(open_part())) }
     }
+    # Tasks, not pmap: pmap is capped at the core count, so a 2-core
+    # machine would send the parts 2 at a time.
+    async fn send_task(n) = send_part(n)
     mut parts = []
     for group in chunk(range(1, count + 1), PART_PARALLEL) {
-        parts = parts + (if len(group) == 1 { [send_part(group[0])] } else { pmap(group, send_part) })
+        tasks = map(group, send_task)
+        for t in tasks { parts = push(parts, await t) }
     }
     s3.complete_multipart(c, key, id, parts)
     state.remove_multipart(ctx.db, ctx.job.name, key, id)
