@@ -4,6 +4,8 @@ Incremental backups of a Linux machine to S3-compatible object storage (AWS S3,
 Google Cloud Storage, Cloudflare R2, Backblaze B2, MinIO, Wasabi), run as a
 systemd service. Written in [Ecko](https://ecko.sh).
 
+![The dashboard: three backup jobs, each with its last good backup, next run, the last run's changes, any problems and its recent runs](.github/dashboard.png)
+
 - Each local file becomes one object, and only changed files are uploaded.
 - Before a remote file is overwritten or deleted, the old copy is moved under
   `_versions/`, so local mistakes can be undone. Old versions are pruned after
@@ -208,8 +210,6 @@ The daemon can serve a read-only status page. It's off unless the config has:
 ```json
 "dashboard": { "listen": "127.0.0.1:8484" }
 ```
-
-![The dashboard: three backup jobs, each with its last good backup, next run, the last run's changes, any problems and its recent runs](.github/dashboard.png)
 
 | URL | What |
 |---|---|
