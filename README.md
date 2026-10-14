@@ -22,42 +22,74 @@ systemd service. Written in [Ecko](https://ecko.sh).
 
 ## Install
 
+There are four steps: get the binary, run the installer, add your settings,
+then run a first backup and start the service.
+
+### 1. Get the binary
+
 Each [release](https://github.com/sn/bit-by-bit/releases) has a prebuilt
-binary for x86-64 and arm64 Linux, with a `.sha256` beside it. No Ecko needed:
+binary for x86-64 and arm64 Linux, so you don't need Ecko. This downloads the
+one for your machine, checks its SHA-256 and unpacks it:
 
 ```bash
-v=v0.5.0 arch=x86_64   # or aarch64
-f=bit-by-bit-$v-$arch-linux.tar.gz
+v=v0.6.0
+f=bit-by-bit-$v-$(uname -m)-linux.tar.gz
 curl -fsSLO https://github.com/sn/bit-by-bit/releases/download/$v/$f
 curl -fsSLO https://github.com/sn/bit-by-bit/releases/download/$v/$f.sha256
-sha256sum -c $f.sha256 && tar -xzf $f && cd bit-by-bit-$v-$arch-linux
-sudo ./deploy/install.sh
+sha256sum -c $f.sha256
+tar -xzf $f && cd ${f%.tar.gz}
 ```
 
-To build from source instead, you need Ecko 0.66 or later. The one
-dependency, the [`xml`](https://github.com/ecko-lang/xml) package, is vendored
-in `vendor/` and pinned in `ecko.lock`; `ecko install` restores it if it's
-missing.
+To build from source instead, install Ecko 0.66 or later and run this in the
+repo:
 
 ```bash
 ecko build main.ecko -o bit-by-bit
+```
+
+The one dependency, the [`xml`](https://github.com/ecko-lang/xml) package, is
+already in `vendor/`. If it's missing, `ecko install` restores it.
+
+### 2. Run the installer
+
+From the unpacked folder, or the repo if you built from source:
+
+```bash
 sudo ./deploy/install.sh
 ```
 
-The installer puts the binary in `/usr/local/bin` and an example config in
-`/etc/bit-by-bit/config.json`, and registers the systemd unit. It does not
-enable the service. Then:
+The installer copies the binary to `/usr/local/bin`, puts an example config
+in `/etc/bit-by-bit/config.json` and registers the systemd unit. It never
+overwrites an existing config, and it doesn't start the service.
+
+### 3. Add your settings
+
+Put your storage keys in a file only root can read, then set the bucket,
+folders and schedule in the config:
 
 ```bash
+sudo install -m 600 /dev/null /etc/bit-by-bit/aws.env
+sudoedit /etc/bit-by-bit/aws.env      # ACCESS_KEY_ID=... and SECRET_ACCESS_KEY=...
 sudoedit /etc/bit-by-bit/config.json
 sudo bit-by-bit check-config
-sudo bit-by-bit run --dry-run
-sudo bit-by-bit run                    # first full upload, in the foreground
+```
+
+[Configure](#configure) explains every setting, and
+[AWS S3 setup](#aws-s3-setup) shows how to create the bucket and a key that
+can only reach it. `check-config` reads the file but doesn't contact your
+provider.
+
+### 4. Run a first backup, then start the service
+
+```bash
+sudo bit-by-bit run --dry-run    # logs what it would upload; sends nothing
+sudo bit-by-bit run              # the first full upload, in the foreground
 sudo systemctl enable --now bit-by-bit
 ```
 
-`check-config` only reads the file. The first real `run` is what proves the
-credentials, bucket and region.
+The first real run is the one that proves your keys, bucket and region work,
+so let it finish before you start the service. After that, the service runs
+each job on its schedule and starts again at every boot.
 
 ## Run as a service
 
