@@ -4,7 +4,7 @@ Incremental backups of a Linux machine to S3-compatible object storage (AWS S3,
 Google Cloud Storage, Cloudflare R2, Backblaze B2, MinIO, Wasabi), run as a
 systemd service. Written in [Ecko](https://ecko.sh).
 
-![The dashboard: three backup jobs, each with its last good backup, next run, the last run's changes, any problems and its recent runs](.github/dashboard.png)
+![The dashboard: two backup jobs, one part-way through a run with a progress bar and one whose last run had problems, each with its last good backup, next run and recent runs](.github/dashboard.png)
 
 - Each local file becomes one object, and only changed files are uploaded.
 - Before a remote file is overwritten or deleted, the old copy is moved under
