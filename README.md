@@ -71,7 +71,7 @@ config shows up as repeated errors in the journal, not as a stopped service.
 | Check it | `systemctl status bit-by-bit`, `sudo bit-by-bit status` |
 | Follow the log | `journalctl -u bit-by-bit -f` (also written to `/var/log/bit-by-bit/bit-by-bit.log`) |
 | Apply config changes | `sudo systemctl reload bit-by-bit` |
-| Back up now | `sudo bit-by-bit run home`. A run holds `job-<name>.lock` in `state_dir`, so it never overlaps the daemon's run of the same job. |
+| Back up now | `sudo bit-by-bit run home`. A run holds `job-<name>.lock` in `state_dir`, so it never overlaps the daemon's run of the same job, and a daemon that restarts meanwhile leaves it running. |
 | Stop it | `sudo systemctl stop bit-by-bit`. Uploads already started finish; nothing new starts. It waits up to 60 seconds. |
 | Turn it off | `sudo systemctl disable --now bit-by-bit` |
 
@@ -81,8 +81,10 @@ See `deploy/config.example.json`. The full field reference is in
 `docs/superpowers/specs/2026-10-12-bit-by-bit-design.md`, section 3.
 
 - **Schedules:** `{ "every": "6h" }` (minimum `1m`) or
-  `{ "daily_at": "02:30" }` (local time). A run missed while the machine was
-  off happens once at startup.
+  `{ "daily_at": "02:30" }` (local time, following daylight-saving changes).
+  A run missed while the machine was off happens once at startup. A run that
+  fails, or is cut short by a restart, is retried 15 minutes after it ended,
+  then after 30, 60 and so on, never waiting longer than the job's interval.
 - **Credentials:** a `KEY=value` file, mode 600:
 
   ```
@@ -112,7 +114,15 @@ See `deploy/config.example.json`. The full field reference is in
   second, 64 about 370 and 128 about 530. Use 32-64 for a distant region.
   Large files go up in parts, 4 at a time, streamed from disk; no file is
   held in memory. The scan before the uploads also runs in parallel for
-  large trees (except with `follow_symlinks`).
+  large trees (except with `follow_symlinks`). `ls`, `restore` and
+  `--rebuild-state` use the same number of workers.
+- **Symlinks** are backed up as links, not followed (unless `follow_symlinks`
+  is set), and keep their target exactly as written: a relative link restores
+  relative. A link whose target is missing is backed up too.
+- **Permissions:** a change of mode alone (`chmod`) is backed up by updating
+  the object's metadata, without uploading the file again.
+- **Problems:** a run counts every problem, and keeps the text of the first
+  1,000 for `status` and the dashboard. The log has all of them.
 
 ### AWS S3 setup
 
@@ -183,8 +193,15 @@ journalctl -u bit-by-bit -p warning    # problems and failures
 ```
 
 Restore never overwrites existing files unless you pass `--overwrite`. It
-checks every file against its stored SHA-256, and puts back each file's mode
-and modification time.
+checks every file against its stored fingerprint, and puts back each file's
+mode and modification time. Files download several at a time; symlinks are
+created after every file, and nothing is ever written through a symlink, so a
+tampered bucket can't make a restore write outside `--to`.
+
+**Not backed up:** file owner and group (restored files belong to the user
+running the restore; Ecko has no way yet to read or set ownership), empty
+directories, and directory permissions. Hard links are uploaded once per
+name.
 
 ## State
 
@@ -234,6 +251,12 @@ restart.
 Objects carry `x-amz-meta-bbb-sha256`, `-mtime`, `-mode` and `-run`. Symlinks
 are stored as empty objects with `x-amz-meta-bbb-symlink`.
 
+`bbb-sha256` is the content's SHA-256 for a file uploaded in one request. A
+file uploaded in parts (at least `multipart_threshold`, 64 MiB by default)
+has `mp<part size>-<SHA-256 of its parts' hex SHA-256s, joined>` instead:
+its parts are hashed in one read and each is sent with its hash, so the
+provider refuses any part that changed in between.
+
 ## Develop
 
 ```bash
@@ -252,3 +275,7 @@ Publish a GitHub release with a tag such as `v0.6.0`. The release workflow
 runs the checks and tests, builds on native x86-64 and arm64 Linux runners
 with the Ecko version pinned in `.github/workflows/release.yml`, and attaches
 `bit-by-bit-<tag>-<arch>-linux.tar.gz` and its `.sha256` to the release.
+
+## License
+
+MIT. Copyright (c) 2026 Sean Nieuwoudt. See [LICENSE](LICENSE).

@@ -1,11 +1,11 @@
 import std.fs
 import std.io
-import std.hash
 import std.encoding
 import "./s3.ecko"
 import "./sync.ecko"
 import "./scanner.ecko"
 import "./util.ecko"
+import "./digest.ecko"
 
 fn wanted(path, sub) = sub == null or path == sub or starts_with(path, sub + "/")
 
@@ -37,8 +37,12 @@ fn run_ms_of(c, key) {
     try { sync.run_ts_ms(meta.run) } catch (e) { null }
 }
 
+let DEFAULT_CONCURRENCY = 4
+
+fn concurrency(opts) = get(opts, "concurrency") ?? DEFAULT_CONCURRENCY
+
 ## What a restore would bring back: [{ path, key }] sorted by path.
-## opts: { path: String or null, at_ms: Int or null }
+## opts: { path: String or null, at_ms: Int or null, concurrency: Int (default 4) }
 export fn select(c, job, opts) {
     cat = catalogue(c, job)
     sub = get(opts, "path")
@@ -47,65 +51,110 @@ export fn select(c, job, opts) {
         return map(filter(sort(keys(cat.current)), fn(p) wanted(p, sub)), fn(p) get(cat.current, p))
     }
     paths = unique(keys(cat.current) + keys(cat.versions)) |> filter(fn(p) wanted(p, sub)) |> sort
-    mut out = []
-    for p in paths {
+    # Each path needs a HEAD or two to learn when its copies were uploaded.
+    picked = util.pool(paths, concurrency(opts), fn(p) {
         cur = get(cat.current, p)
         if cur != null {
             ms = run_ms_of(c, cur.key)
-            if ms != null and ms <= at {
-                out = push(out, { path: p, key: cur.key })
-                continue
-            }
+            if ms != null and ms <= at { return { path: p, key: cur.key } }
         }
         # The earliest copy moved aside after `at` holds the content as of `at`,
         # provided that content had already been uploaded by then.
         later = sort_by(filter(get(cat.versions, p) ?? [], fn(v) sync.run_ts_ms(v.ts) > at), fn(v) v.ts)
         if len(later) > 0 {
             ms = run_ms_of(c, later[0].key)
-            if ms != null and ms <= at { out = push(out, { path: p, key: later[0].key }) }
+            if ms != null and ms <= at { return { path: p, key: later[0].key } }
         }
-    }
-    out
+        null
+    })
+    filter(picked, fn(x) x != null)
 }
 
 # A key could hold ".." segments (a tampered or foreign bucket); restoring it
 # would write outside --to.
 fn unsafe(path) = not starts_with(path, "/") or contains(split(path, "/"), "..")
 
-fn restore_one(c, item, to, overwrite) {
+# The first folder between `to` and `path` that is a symlink, or null. A
+# restored link must never be written through: a tampered bucket could pair
+# a link to /etc with a file "inside" it.
+fn linked_parent(to, path) {
+    parts = split(path, "/")
+    mut dir = to
+    for name in parts[1..len(parts) - 1] {
+        dir = dir + "/" + name
+        if fs.is_symlink(dir) { return dir }
+    }
+    null
+}
+
+# Checks shared by files and links: null when `item` may be written.
+fn refusal(item, to, overwrite) {
     if unsafe(item.path) {
         return { status: "failed", message: "{item.path}: unsafe path, refusing to restore it" }
+    }
+    link = linked_parent(to, item.path)
+    if link != null {
+        return { status: "failed", message: "{item.path}: {link} is a symlink, refusing to restore through it" }
     }
     target = to + item.path
     if (fs.exists(target) or fs.is_symlink(target)) and not overwrite {
         return { status: "skipped", message: "{target}: exists (use --overwrite)" }
     }
-    dir = fs.dirname(target)
-    unless fs.exists(dir) { fs.mkdir(dir) }
+    null
+}
+
+# Download one file. A symlink is not created here but returned as
+# { status: "link", item, target } for restore to create after every file.
+fn restore_file(c, item, to, overwrite) {
+    no = refusal(item, to, overwrite)
+    if no != null { return no }
+    target = to + item.path
     got = s3.get_stream(c, item.key)
     meta = got.meta
     if has(meta, "symlink") {
         io.close(got.body)
-        if fs.exists(target) or fs.is_symlink(target) { fs.remove(target) }
-        fs.symlink(encoding.url_decode(meta.symlink), target)
-        return { status: "restored" }
+        return { status: "link", item: item, target: encoding.url_decode(meta.symlink) }
     }
+    dir = fs.dirname(target)
+    unless fs.exists(dir) { fs.mkdir(dir) }
     partial = target + ".bbb-partial"
-    out = fs.open(partial, "w")
-    for piece in got.body { io.write(out, piece) }
-    io.close(out)
-    if has(meta, "sha256") and hash.sha256(fs.open(partial)) != meta.sha256 {
-        fs.remove(partial)
-        return { status: "failed", message: "{target}: checksum mismatch, download discarded" }
+    try {
+        out = fs.open(partial, "w")
+        for piece in got.body { io.write(out, piece) }
+        io.close(out)
+        if has(meta, "sha256") and not digest.matches(partial, meta.sha256) {
+            fs.remove(partial)
+            return { status: "failed", message: "{target}: checksum mismatch, download discarded" }
+        }
+        fs.rename(partial, target)
+    } catch (e) {
+        if fs.exists(partial) { fs.remove(partial) }
+        error(e)
     }
-    fs.rename(partial, target)
     if has(meta, "mode") { fs.chmod(target, meta.mode) }
     if has(meta, "mtime") { fs.set_modified(target, int(meta.mtime)) }
     { status: "restored" }
 }
 
-## Restore files. opts: { path, at_ms, to, overwrite, oldest_ms }
+# Create one link. Checked again: an earlier link in this restore may now
+# sit above it.
+fn restore_link(l, to, overwrite) {
+    no = refusal(l.item, to, overwrite)
+    if no != null { return no }
+    target = to + l.item.path
+    dir = fs.dirname(target)
+    unless fs.exists(dir) { fs.mkdir(dir) }
+    if fs.exists(target) or fs.is_symlink(target) { fs.remove(target) }
+    fs.symlink(l.target, target)
+    { status: "restored" }
+}
+
+fn guarded(path, f) = try { f() } catch (e) { { status: "failed", message: path + ": " + string(get(e, "message") ?? e) } }
+
+## Restore files. opts: { path, at_ms, to, overwrite, oldest_ms, concurrency }
 ## `oldest_ms` is how far back version history reaches (now - keep_versions_days).
+## Files download `concurrency` at a time. Symlinks are created afterwards,
+## one at a time, so no file is ever written through a link this restore made.
 ## Returns { restored: Int, skipped: [String], failed: [String] }.
 export fn restore(c, job, opts) {
     at = get(opts, "at_ms")
@@ -113,13 +162,12 @@ export fn restore(c, job, opts) {
         error({ kind: "usage", message: "--at is older than this job's version history (keep_versions_days = {job.keep_versions_days})" })
     }
     items = select(c, job, opts)
+    first_pass = util.pool(items, concurrency(opts), fn(item) guarded(item.path, fn() restore_file(c, item, opts.to, opts.overwrite)))
+    links = map(filter(first_pass, fn(r) r.status == "link"), fn(l) guarded(l.item.path, fn() restore_link(l, opts.to, opts.overwrite)))
     mut restored = 0
     mut skipped = []
     mut failed = []
-    for item in items {
-        r = try { restore_one(c, item, opts.to, opts.overwrite) } catch (e) {
-            { status: "failed", message: item.path + ": " + string(get(e, "message") ?? e) }
-        }
+    for r in filter(first_pass, fn(r) r.status != "link") + links {
         match r.status {
             "restored" => { restored = restored + 1 }
             "skipped" => { skipped = push(skipped, r.message) }

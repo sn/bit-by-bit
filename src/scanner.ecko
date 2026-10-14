@@ -41,19 +41,20 @@ fn walk(dirs, job, excluded, pruned, limit, seen_in) {
 
     fn add_file(path) {
         try {
-            entries = push(entries, { path: path, kind: "file", size: fs.size(path), mtime: fs.modified(path), target: null })
+            entries = push(entries, { path: path, kind: "file", size: fs.size(path), mtime: fs.modified(path), mode: fs.mode(path), target: null })
         } catch (e) {
             problems = push(problems, "{path}: " + string(get(e, "message")))
             protected = push(protected, path)
         }
     }
 
+    # A link is kept as its literal target (relative stays relative), and a
+    # dangling one is kept too: there is nothing wrong with it to report.
     fn add_link(path) {
         try {
-            target = fs.canonical(path)
-            entries = push(entries, { path: path, kind: "symlink", size: 0, mtime: 0, target: target })
+            entries = push(entries, { path: path, kind: "symlink", size: 0, mtime: 0, mode: null, target: fs.readlink(path) })
         } catch (e) {
-            problems = push(problems, "{path}: broken symlink")
+            problems = push(problems, "{path}: " + string(get(e, "message")))
             protected = push(protected, path)
         }
     }
@@ -62,7 +63,9 @@ fn walk(dirs, job, excluded, pruned, limit, seen_in) {
     # caller to queue rather than walked recursively.
     fn visit(path) {
         if excluded(path) { return null }
-        if fs.is_symlink(path) and not job.follow_symlinks {
+        # With follow_symlinks, a link whose target is missing has nothing to
+        # follow, so it is kept as a link.
+        if fs.is_symlink(path) and (not job.follow_symlinks or not fs.exists(path)) {
             add_link(path)
             return null
         }
@@ -117,7 +120,7 @@ fn merge_results(a, b) = {
 
 ## Scan a job's paths. Never raises for filesystem problems; returns
 ## {
-##   entries:   [{ path, kind: "file" | "symlink", size, mtime, target }]
+##   entries:   [{ path, kind: "file" | "symlink", size, mtime, mode, target }]
 ##   problems:  [String]           - things that make the run "partial"
 ##   protected: [String]           - roots/dirs that could not be read; nothing
 ##                                   under them may be deleted remotely
@@ -167,7 +170,7 @@ export fn scan(job) {
 fn root_file(path) {
     r = empty_result({})
     try {
-        set(r, "entries", [{ path: path, kind: "file", size: fs.size(path), mtime: fs.modified(path), target: null }])
+        set(r, "entries", [{ path: path, kind: "file", size: fs.size(path), mtime: fs.modified(path), mode: fs.mode(path), target: null }])
     } catch (e) {
         merge(r, { problems: ["{path}: " + string(get(e, "message"))], protected: [path] })
     }
@@ -176,9 +179,9 @@ fn root_file(path) {
 fn root_link(path) {
     r = empty_result({})
     try {
-        set(r, "entries", [{ path: path, kind: "symlink", size: 0, mtime: 0, target: fs.canonical(path) }])
+        set(r, "entries", [{ path: path, kind: "symlink", size: 0, mtime: 0, mode: null, target: fs.readlink(path) }])
     } catch (e) {
-        merge(r, { problems: ["{path}: broken symlink"], protected: [path] })
+        merge(r, { problems: ["{path}: " + string(get(e, "message"))], protected: [path] })
     }
 }
 

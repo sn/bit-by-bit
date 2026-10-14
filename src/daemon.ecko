@@ -31,7 +31,9 @@ export fn run(config_path) {
         return 1
     }
     db = state.open(cfg.state_dir)
-    stale = state.mark_interrupted(db, time.now())
+    # A manual `bit-by-bit run` may still be going: its job lock says so.
+    busy = map(filter(cfg.jobs, fn(j) lock.holder(runner.job_lock_path(cfg, j)) != null), fn(j) j.name)
+    stale = state.mark_interrupted(db, time.now(), busy)
     if stale > 0 { logging.emit("warn", "marked runs interrupted by the last shutdown as failed", { count: stale }) }
     started = time.now()
     # The dashboard reads the live config through this cell, so a reload shows up there too.
@@ -61,15 +63,25 @@ export fn run(config_path) {
         mut due_times = []
         for job in cfg.jobs {
             if has(tasks, job.name) { continue }
-            last = try { state.last_run(db, job.name) } catch (e) {
+            runs = try { state.recent_runs(db, job.name, 10) } catch (e) {
                 logging.emit("error", "can't read run history: " + string(get(e, "message") ?? e), { job: job.name })
-                null
+                []
             }
-            last_ms = if last == null { null } else { last.started_at }
-            due = scheduler.next_due(job.schedule, last_ms, now, scheduler.local_offset_ms(now))
+            due = scheduler.next_run(job.schedule, runs, now, scheduler.local_offset_ms)
             if due <= now {
                 run_cfg = cfg
-                tasks = set(tasks, job.name, bg.spawn(fn() runner.run_job(run_cfg, job, db, { dry_run: false, should_stop: should_stop })))
+                # Each run gets its own connection. Jobs run at the same time,
+                # and on a shared one a job's plain writes would land inside
+                # another job's open transaction, and be lost if it rolled back.
+                tasks = set(tasks, job.name, bg.spawn(fn() {
+                    job_db = try { state.open(run_cfg.state_dir) } catch (e) {
+                        logging.emit("error", "can't open the state database: " + string(get(e, "message") ?? e), { job: job.name })
+                        return null
+                    }
+                    o = runner.run_job(run_cfg, job, job_db, { dry_run: false, should_stop: should_stop })
+                    state.close(job_db)
+                    o
+                }))
             } else {
                 due_times = push(due_times, due)
             }

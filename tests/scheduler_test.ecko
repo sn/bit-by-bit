@@ -47,6 +47,45 @@ test.case("daily_at respects the local offset", fn() {
     test.eq(scheduler.next_due(s, MIDNIGHT, MIDNIGHT, -5 * H), MIDNIGHT + 7 * H + 30 * M)
 })
 
+# A failed run is retried soon, not a whole interval later: an outage or a
+# restart mid-run must not cost a day of backups.
+fn run_row(status, started, finished) = { status: status, started_at: started, finished_at: finished }
+
+test.case("after a failed run, retry in 15m rather than a full interval", fn() {
+    s = { kind: "every", ms: 24 * H }
+    runs = [run_row("failed", MIDNIGHT, MIDNIGHT + 10 * M)]
+    test.eq(scheduler.next_run(s, runs, MIDNIGHT + 11 * M, 0), MIDNIGHT + 25 * M)
+    daily = { kind: "daily_at", hour: 2, minute: 30 }
+    test.eq(scheduler.next_run(daily, runs, MIDNIGHT + 11 * M, 0), MIDNIGHT + 25 * M)
+})
+
+test.case("repeated failures back off, never past the interval", fn() {
+    s = { kind: "every", ms: 2 * H }
+    f = fn(n) map(0..n, fn(i) run_row("failed", MIDNIGHT - i * H, MIDNIGHT - i * H + M))
+    test.eq(scheduler.next_run(s, f(2), MIDNIGHT, 0), MIDNIGHT + M + 30 * M)
+    test.eq(scheduler.next_run(s, f(3), MIDNIGHT, 0), MIDNIGHT + M + 60 * M)
+    test.eq(scheduler.next_run(s, f(6), MIDNIGHT, 0), MIDNIGHT + M + 2 * H)
+    short = { kind: "every", ms: 5 * M }
+    test.eq(scheduler.next_run(short, f(1), MIDNIGHT, 0), MIDNIGHT + M + 5 * M)
+})
+
+test.case("a good run after failures goes back to the schedule", fn() {
+    s = { kind: "every", ms: 6 * H }
+    runs = [run_row("partial", MIDNIGHT, MIDNIGHT + H), run_row("failed", MIDNIGHT - H, MIDNIGHT - H + M)]
+    test.eq(scheduler.next_run(s, runs, MIDNIGHT + H, 0), MIDNIGHT + 6 * H)
+    test.eq(scheduler.next_run(s, [], 500, 0), 500)
+})
+
+test.case("daily_at uses the offset in force at the run time, across a clock change", fn() {
+    s = { kind: "daily_at", hour: 2, minute: 30 }
+    # UTC+2 until 12:00 UTC on the 11th, UTC+1 after (clocks went back).
+    change = MIDNIGHT - 12 * H
+    offset = fn(ms) if ms < change { 2 * H } else { H }
+    last = MIDNIGHT - 24 * H + 30 * M   # 02:30 local on the 11th, at UTC+2
+    # 02:30 local on the 12th is 01:30 UTC at UTC+1, not 00:30.
+    test.eq(scheduler.next_due(s, last, last + M, offset), MIDNIGHT + H + 30 * M)
+})
+
 test.case("local offset parses", fn() {
     off = scheduler.local_offset_ms(time.now())
     test.ok(off % (15 * M) == 0, string(off))
@@ -64,18 +103,36 @@ test.case("locks: acquire, refuse while held, take over stale", fn() {
     test.ok(lock.acquire(p), "first")
     test.ok(lock.acquire(p), "re-entrant for the same pid")
     test.eq(lock.holder(p), os.pid())
+    # Locks left as plain files by older versions are still honoured.
+    fs.remove(p)
     fs.write(p, "1")
     test.ok(not lock.acquire(p), "pid 1 is alive")
+    fs.remove(p)
     fs.write(p, "999999999")
     test.ok(lock.acquire(p), "dead holder taken over")
     lock.release(p)
-    test.ok(not fs.exists(p), "released")
+    test.ok(not fs.is_symlink(p) and not fs.exists(p), "released")
 })
 
 test.case("I4: a lock from a previous boot is stale even if the pid is alive", fn() {
     p = fs.join(fs.temp_dir(), "boot.lock")
     fs.write(p, "1 00000000-0000-0000-0000-000000000000")
     test.ok(lock.acquire(p), "other boot -> stale")
-    test.ok(contains(fs.read(p), " "), "new lock records the boot id")
+    test.ok(contains(fs.readlink(p), " "), "new lock records the boot id")
     lock.release(p)
+})
+
+# Two processes racing for a free lock must not both win: taking it is a
+# single atomic create, which fails when the lock already exists.
+test.case("taking a lock is atomic: a second create fails", fn() {
+    p = fs.join(fs.temp_dir(), "race.lock")
+    test.ok(lock.create(p, "111 boot"), "first create wins")
+    test.ok(not lock.create(p, "222 boot"), "second create loses")
+    test.ok(fs.is_symlink(p), "the lock is a symlink holding its owner")
+    test.eq(fs.readlink(p), "111 boot")
+    fs.remove(p)
+    test.ok(lock.acquire(p), "acquire takes a free lock")
+    test.eq(lock.holder(p), os.pid())
+    lock.release(p)
+    test.ok(not fs.is_symlink(p) and not fs.exists(p), "released")
 })

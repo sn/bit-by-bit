@@ -46,7 +46,7 @@ fn job_view(job, db, now) {
         status: if last == null { "never run" } else { last.status },
         started_at: last_ms,
         finished_at: if last == null { null } else { last.finished_at },
-        next_due: scheduler.next_due(job.schedule, last_ms, now, scheduler.local_offset_ms(now)),
+        next_due: scheduler.next_run(job.schedule, runs, now, scheduler.local_offset_ms),
         overdue: overdue,
         uploaded: if last == null { 0 } else { last.uploaded },
         replaced: if last == null { 0 } else { last.replaced },
@@ -57,6 +57,7 @@ fn job_view(job, db, now) {
         done: if last == null { 0 } else { get(last, "done") ?? 0 },
         error: if last == null { null } else { last.error },
         problems: if last == null { [] } else { last.problem_list },
+        problem_count: if last == null { 0 } else { last.problems },
         runs: map(runs, run_view),
     }
 }
@@ -134,16 +135,19 @@ let SHOWN_PROBLEMS = 5
 
 # The first few problems, and the rest behind a disclosure: never cut off.
 fn problems_html(j) {
-    n = len(j.problems)
+    n = max([j.problem_count, len(j.problems)])
     if n == 0 { return "" }
-    rest = n - SHOWN_PROBLEMS
+    # A run keeps the text of its first 1,000 problems and counts the rest.
+    unlisted = n - len(j.problems)
+    note = if unlisted <= 0 { "" } else { "<p class=\"progress-text\">" + commas(unlisted) + " more problems not listed: a run keeps the first " + commas(len(j.problems)) + ". See the log for all of them.</p>" }
+    rest = len(j.problems) - SHOWN_PROBLEMS
     more = if rest <= 0 { "" } else {
         word = if rest == 1 { "problem" } else { "problems" }
         "<details id=\"problems-" + j.job + "\"><summary id=\"problems-" + j.job + "-more\">Show " + string(rest) + " more " + word + "</summary><ul class=\"problems\">" +
             join(map(drop(j.problems, SHOWN_PROBLEMS), li), "") + "</ul></details>"
     }
-    "<section class=\"block\"><h3>problems <span class=\"count warn\">" + string(n) + "</span></h3><ul class=\"problems\">" +
-        join(map(take(j.problems, SHOWN_PROBLEMS), li), "") + "</ul>" + more + "</section>"
+    "<section class=\"block\"><h3>problems <span class=\"count warn\">" + commas(n) + "</span></h3><ul class=\"problems\">" +
+        join(map(take(j.problems, SHOWN_PROBLEMS), li), "") + "</ul>" + more + note + "</section>"
 }
 
 fn run_row(r) = "<tr><td>" + esc(at_text(r.started_at)) + "</td><td>" + badge(r.status) + "</td><td>" + esc(dur_text(r.duration_ms)) +

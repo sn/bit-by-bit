@@ -1,5 +1,4 @@
 import std.fs
-import std.io
 import std.hash
 import std.time
 import std.sql
@@ -8,12 +7,17 @@ import "./state.ecko"
 import "./scanner.ecko"
 import "./planner.ecko"
 import "./sigv4.ecko"
+import "./digest.ecko"
 
 let FATAL_KINDS = ["s3_auth", "s3_config", "s3_retry", "net", "timeout"]
 let MAX_PARTS = 10000
 let RECORD_BATCH = 500
 let PART_PARALLEL = 4
 let RECORD_EVERY_MS = 1000
+# Problems kept as text per run. All of them are counted; past this many
+# only the count grows, so a tree of unreadable files can't bloat the run's
+# row, its once-a-second progress saves or the dashboard.
+export let MAX_PROBLEMS = 1000
 let MIB = 1048576
 # S3 refuses a single CopyObject from a source over 5 GiB.
 let COPY_LIMIT = 5368709120
@@ -42,10 +46,11 @@ export fn part_size_for(size, configured) {
 }
 
 # Copy a large object part by part (UploadPartCopy). Metadata is not carried
-# by part copies, so it is read first and set on the new upload.
-fn multipart_copy(ctx, src, dst, size) {
+# by part copies, so it is read first (or `meta_override` used) and set on
+# the new upload.
+fn multipart_copy(ctx, src, dst, size, meta_override = null) {
     c = ctx.client
-    meta = s3.head_object(c, src)
+    meta = meta_override ?? s3.head_object(c, src)
     if meta == null { return null }
     id = s3.create_multipart(c, dst, meta)
     state.add_multipart(ctx.db, ctx.job.name, dst, id)
@@ -59,7 +64,7 @@ fn multipart_copy(ctx, src, dst, size) {
         first = last + 1
         n = n + 1
     }
-    s3.complete_multipart(c, dst, id, parts)
+    s3.complete_multipart(c, dst, id, parts, expect: meta)
     state.remove_multipart(ctx.db, ctx.job.name, dst, id)
 }
 
@@ -79,24 +84,34 @@ fn version_aside(ctx, path, size) {
 
 fn prev_size(action) = if action.prev == null { 0 } else { action.prev.size }
 
+# Set the object's mode metadata to the file's, in place. The content is
+# unchanged, so the old copy is not versioned.
+fn update_mode(ctx, path, size, mode) {
+    key = current_key(ctx.job, path)
+    limit = get(ctx.cfg, "copy_limit") ?? COPY_LIMIT
+    if size > limit {
+        meta = s3.head_object(ctx.client, key)
+        if meta == null { error({ kind: "s3_not_found", message: "{key}: no such object" }) }
+        multipart_copy(ctx, key, key, size, meta_override: set(meta, "mode", mode))
+    } else {
+        s3.update_meta(ctx.client, key, { mode: mode })
+    }
+}
+
 # A large file goes up in parts, PART_PARALLEL at a time. Each part is
 # streamed straight from its offset in the file: hashed in one pass, sent in
 # a second, never held in memory.
-fn upload_multipart(ctx, path, key, meta, size) {
+# `hashes` are the parts' hashes from the read that fingerprinted the file:
+# each part is sent with its own, so a part that has changed since is refused.
+fn upload_multipart(ctx, path, key, meta, size, ps, hashes) {
     c = ctx.client
     id = s3.create_multipart(c, key, meta)
     state.add_multipart(ctx.db, ctx.job.name, key, id)
-    ps = part_size_for(size, ctx.cfg.multipart_part_size)
-    count = max([1, int((size + ps - 1) / ps)])
+    count = len(hashes)
     fn send_part(n) {
         first = (n - 1) * ps
-        length = min([ps, size - first])
-        fn open_part() {
-            s = fs.open(path)
-            io.seek(s, first)
-            io.limit(s, length)
-        }
-        { n: n, etag: s3.upload_part(c, key, id, n, open_part, sha256: hash.sha256(open_part())) }
+        open_part = fn() digest.open_range(path, first, min([ps, size - first]))
+        { n: n, etag: s3.upload_part(c, key, id, n, open_part, sha256: hashes[n - 1]) }
     }
     # Tasks, not pmap: pmap is capped at the core count, so a 2-core
     # machine would send the parts 2 at a time.
@@ -106,26 +121,32 @@ fn upload_multipart(ctx, path, key, meta, size) {
         tasks = map(group, send_task)
         for t in tasks { parts = push(parts, await t) }
     }
-    s3.complete_multipart(c, key, id, parts)
+    s3.complete_multipart(c, key, id, parts, expect: meta)
     state.remove_multipart(ctx.db, ctx.job.name, key, id)
 }
 
 fn upload_file(ctx, action, replacing) {
     path = action.path
     before = stat(path)
-    sha = hash.sha256(fs.open(path))
+    multipart = before.size >= ctx.cfg.multipart_threshold
+    ps = part_size_for(before.size, ctx.cfg.multipart_part_size)
+    hashes = if multipart { digest.part_hashes(path, before.size, ps) } else { [] }
+    sha = if multipart { digest.of_parts(ps, hashes) } else { hash.sha256(fs.open(path)) }
+    mode = fs.mode(path)
     if action.op == "check" and sha == action.prev.sha256 {
-        return { op: "touch", path: path, mtime: before.mtime }
+        prev_mode = get(action.prev, "mode")
+        if prev_mode != null and prev_mode != mode { update_mode(ctx, path, before.size, mode) }
+        return { op: "touch", path: path, mtime: before.mtime, mode: mode }
     }
     if replacing { version_aside(ctx, path, prev_size(action)) }
     key = current_key(ctx.job, path)
-    meta = { sha256: sha, mtime: string(before.mtime), mode: fs.mode(path), run: ctx.run_ts }
+    meta = { sha256: sha, mtime: string(before.mtime), mode: mode, run: ctx.run_ts }
     # Streamed from disk with the hash computed above: one more read, no copy
     # in memory and no second hash. If the file changed since it was hashed,
     # the provider refuses the mismatched body.
     refused = try {
-        if before.size >= ctx.cfg.multipart_threshold {
-            upload_multipart(ctx, path, key, meta, before.size)
+        if multipart {
+            upload_multipart(ctx, path, key, meta, before.size, ps, hashes)
         } else {
             s3.put_object(ctx.client, key, fn() fs.open(path), meta, sha256: sha)
         }
@@ -140,7 +161,7 @@ fn upload_file(ctx, action, replacing) {
     if after != before {
         return { op: "problem", path: path, message: "{path}: changed during upload" }
     }
-    row = { path: path, size: before.size, mtime: before.mtime, sha256: sha, kind: "file" }
+    row = { path: path, size: before.size, mtime: before.mtime, sha256: sha, kind: "file", mode: mode }
     { op: if replacing { "replace" } else { "upload" }, path: path, row: row, bytes: before.size }
 }
 
@@ -163,6 +184,10 @@ export fn execute(ctx, action) {
                 s3.delete_object(ctx.client, current_key(ctx.job, action.path))
                 { op: "delete", path: action.path }
             }
+            "chmod" => {
+                update_mode(ctx, action.path, action.prev.size, action.entry.mode)
+                { op: "touch", path: action.path, mtime: action.entry.mtime, mode: action.entry.mode }
+            }
             _ => {
                 kind = if action.entry == null { "file" } else { action.entry.kind }
                 replacing = action.op == "replace" or action.op == "check"
@@ -180,6 +205,15 @@ export fn execute(ctx, action) {
     }
 }
 
+## Add problem messages to running totals: every one counts toward
+## problem_count, and the first MAX_PROBLEMS are kept as text.
+export fn add_problems(totals, msgs) {
+    room = max([0, MAX_PROBLEMS - len(totals.problems)])
+    merge(totals, { problems: totals.problems + take(msgs, room), problem_count: totals.problem_count + len(msgs) })
+}
+
+fn no_totals() = { uploaded: 0, replaced: 0, deleted: 0, touched: 0, pruned: 0, bytes: 0, problems: [], problem_count: 0 }
+
 # Apply one result to the state index and the running totals.
 fn record(ctx, totals, r) {
     match r.op {
@@ -192,7 +226,7 @@ fn record(ctx, totals, r) {
             merge(totals, { replaced: totals.replaced + 1, bytes: totals.bytes + r.bytes })
         }
         "touch" => {
-            state.touch_file(ctx.db, ctx.job.name, r.path, r.mtime)
+            state.touch_file(ctx.db, ctx.job.name, r.path, r.mtime, mode: get(r, "mode"))
             set(totals, "touched", totals.touched + 1)
         }
         "delete" => {
@@ -201,7 +235,7 @@ fn record(ctx, totals, r) {
         }
         "problem" => {
             ctx.log("warn", r.message, {})
-            set(totals, "problems", push(totals.problems, r.message))
+            add_problems(totals, [r.message])
         }
         _ => totals
     }
@@ -268,11 +302,12 @@ export fn run_job(ctx) {
     for p in sc.problems { ctx.log("warn", p, {}) }
     p = planner.plan(sc, index)
     ctx.log("info", "planned", { actions: len(p.actions), unchanged: p.unchanged, skipped: sc.skipped })
-    mut totals = { uploaded: 0, replaced: 0, deleted: 0, touched: 0, pruned: 0, bytes: 0, problems: sc.problems }
+    mut totals = add_problems(no_totals(), sc.problems)
     if ctx.dry_run {
         for a in p.actions { ctx.log("info", "would " + a.op, { path: a.path }) }
         return merge(totals, { status: "ok", error: null })
     }
+    if len(p.remember) > 0 { state.set_modes(ctx.db, ctx.job.name, p.remember) }
     state.set_planned(ctx.db, ctx.run_id, len(p.actions))
     mut fatal = null
     # A worker pool: each worker takes the next action as soon as it finishes
@@ -355,8 +390,8 @@ export fn run_job(ctx) {
         return merge(totals, { status: "failed", error: "stopped before finishing (shutdown requested)" })
     }
     pr = try { prune(ctx) } catch (e) { { pruned: 0, problems: ["prune: " + string(get(e, "message"))] } }
-    totals = merge(totals, { pruned: pr.pruned, problems: totals.problems + pr.problems })
-    status = if len(totals.problems) > 0 { "partial" } else { "ok" }
+    totals = add_problems(set(totals, "pruned", pr.pruned), pr.problems)
+    status = if totals.problem_count > 0 { "partial" } else { "ok" }
     merge(totals, { status: status, error: null })
 }
 
@@ -365,7 +400,7 @@ export fn run(ctx) {
     started = ctx.now_ms
     unless ctx.dry_run { state.start_run(ctx.db, ctx.job.name, ctx.run_id, started) }
     outcome = try { run_job(ctx) } catch (e) {
-        totals = get(e, "totals") ?? { uploaded: 0, replaced: 0, deleted: 0, touched: 0, pruned: 0, bytes: 0, problems: [] }
+        totals = get(e, "totals") ?? no_totals()
         msg = string(get(e, "message") ?? e)
         ctx.log("error", "job failed: " + msg, {})
         merge(totals, { status: "failed", error: msg })

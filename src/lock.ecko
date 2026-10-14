@@ -17,28 +17,41 @@ fn pid_of(content) = split(trim(content), " ")[0]
 
 fn re_digits(s) = len(s) > 0 and all(chars(s), fn(c) c >= "0" and c <= "9")
 
-## Take a pid lock file. Returns true when acquired, false when a live process
-## holds it. A lock left by a dead process is taken over.
+# A lock is a symlink whose target is its owner, "<pid> <boot id>": creating
+# a symlink fails when the path exists, so taking a free lock is one atomic
+# step (Ecko has no exclusive file create). Older locks are plain files with
+# the same text, and are still read.
+fn present(path) = fs.is_symlink(path) or fs.exists(path)
+
+fn owner_of(path) = try { if fs.is_symlink(path) { fs.readlink(path) } else { fs.read(path) } } catch (e) { "" }
+
+## Create the lock at `path` holding `content`. False when it already exists.
+export fn create(path, content) = try { fs.symlink(content, path) true } catch (e) { false }
+
+## Take a pid lock. Returns true when acquired, false when a live process
+## holds it. A lock left by a dead process (or an earlier boot) is taken over.
 export fn acquire(path) {
     me = string(os.pid())
-    if fs.exists(path) {
-        owner = try { fs.read(path) } catch (e) { "" }
-        if pid_of(owner) != me and alive(owner) { return false }
+    if present(path) {
+        owner = owner_of(path)
+        if pid_of(owner) == me { return true }
+        if alive(owner) { return false }
+        try { fs.remove(path) } catch (e) { null }
     }
-    fs.write(path, me + " " + boot_id())
-    true
+    # If another process took it between the remove and here, it wins.
+    create(path, me + " " + boot_id())
 }
 
 ## Release a lock this process holds. A lock held by someone else is left alone.
 export fn release(path) {
-    if fs.exists(path) and pid_of(try { fs.read(path) } catch (e) { "" }) == string(os.pid()) {
+    if present(path) and pid_of(owner_of(path)) == string(os.pid()) {
         fs.remove(path)
     }
 }
 
 ## The pid holding `path`, or null.
 export fn holder(path) {
-    unless fs.exists(path) { return null }
-    h = try { fs.read(path) } catch (e) { "" }
+    unless present(path) { return null }
+    h = owner_of(path)
     if alive(h) { int(pid_of(h)) } else { null }
 }

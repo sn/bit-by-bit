@@ -1,0 +1,40 @@
+import std.fs
+import std.io
+import std.hash
+
+# A file's content fingerprint, stored as its index sha256 and in the
+# object's bbb-sha256 metadata.
+#
+# A small file's is the SHA-256 of its content. A large file goes up in
+# parts, and its fingerprint is built from the parts' hashes:
+# "mp<part size>-<sha256 of the parts' hex hashes joined>". The part hashes
+# are taken in one read and each part is sent with its own, so the provider
+# refuses a part that changed after it was hashed, and what is stored always
+# matches its fingerprint. (Ecko has no incremental hasher, so one read can't
+# give both the whole-file hash and the part hashes.)
+
+## A stream over bytes [first, first + length) of `path`.
+export fn open_range(path, first, length) {
+    s = fs.open(path)
+    io.seek(s, first)
+    io.limit(s, length)
+}
+
+## The number of parts a file of `size` bytes splits into at part size `ps`.
+export fn part_count(size, ps) = max([1, int((size + ps - 1) / ps)])
+
+## The hex SHA-256 of each part of `path`, in order.
+export fn part_hashes(path, size, ps) =
+    map(range(0, part_count(size, ps)), fn(i) hash.sha256(open_range(path, i * ps, min([ps, size - i * ps]))))
+
+## The fingerprint of a file uploaded in parts of `ps` bytes with these hashes.
+export fn of_parts(ps, hashes) = "mp{ps}-" + hash.sha256(join(hashes, ""))
+
+## True when the file at `path` matches `fingerprint`, either form.
+export fn matches(path, fingerprint) {
+    unless starts_with(fingerprint, "mp") { return hash.sha256(fs.open(path)) == fingerprint }
+    dash = index_of(fingerprint, "-")
+    ps = try { int(fingerprint[2..dash]) } catch (e) { 0 }
+    if dash < 0 or ps <= 0 { return false }
+    of_parts(ps, part_hashes(path, fs.size(path), ps)) == fingerprint
+}

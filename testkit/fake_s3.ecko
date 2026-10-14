@@ -143,7 +143,10 @@ fn handle(req) {
                 if o == null { return xml_error(404, "NoSuchKey") }
                 lim = cell_get(copy_limit)
                 if lim > 0 and len(o.body) > lim { return xml_error(400, "InvalidRequest") }
-                cell_update(objects, fn(m) set(m, key, o))
+                replace_meta = get(req.headers, "x-amz-metadata-directive") == "REPLACE"
+                # S3 refuses to copy an object onto itself without changing it.
+                if src_key == key and not replace_meta { return xml_error(400, "InvalidRequest") }
+                cell_update(objects, fn(m) set(m, key, if replace_meta { { body: o.body, meta: meta_from(req) } } else { o }))
                 return http.response(200, "<CopyObjectResult></CopyObjectResult>")
             }
             cell_update(objects, fn(o) set(o, key, { body: body, meta: meta_from(req) }))

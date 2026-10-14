@@ -55,3 +55,15 @@ test.case("kind change replaces", fn() {
     p = planner.plan(scan([file("/x", 1, 1)], []), index({ "/x": idx(0, 0, "link:/t", "symlink") }))
     test.eq(ops(p), [["replace", "/x"]])
 })
+
+# chmod changes neither size nor mtime, so the mode is compared too.
+test.case("a mode-only change is a chmod, and an unknown old mode is remembered", fn() {
+    f = fn(path, mode) merge(file(path, 1, 1), { mode: mode })
+    known = fn(mode) merge(idx(1, 1, "h", "file"), { mode: mode })
+    p = planner.plan(scan([f("/a", "600"), f("/b", "644"), f("/c", "644")], []),
+        index({ "/a": known("644"), "/b": known("644"), "/c": known(null) }))
+    test.eq(ops(p), [["chmod", "/a"]])
+    test.eq(p.unchanged, 2)
+    # Indexes written before modes were recorded learn them without a request.
+    test.eq(p.remember, [["/c", "644"]])
+})

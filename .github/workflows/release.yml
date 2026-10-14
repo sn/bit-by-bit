@@ -1,8 +1,8 @@
 name: Release
 
 # Publishing a GitHub release builds bit-by-bit for Linux and attaches the
-# archives to that release. Each archive holds the binary, deploy/ and the
-# README, so installing is: unpack, cd in, sudo ./deploy/install.sh.
+# archives to that release. Each archive holds the binary, deploy/, the
+# README and LICENSE, so installing is: unpack, cd in, sudo ./deploy/install.sh.
 #
 # Each architecture is built on its own native runner: `ecko build` packs the
 # program into a copy of the Ecko runtime, so the output runs where that
@@ -67,7 +67,7 @@ jobs:
         run: |
           name="bit-by-bit-$TAG-${{ matrix.name }}"
           mkdir -p "dist/$name"
-          cp bit-by-bit README.md "dist/$name/"
+          cp bit-by-bit README.md LICENSE "dist/$name/"
           cp -r deploy "dist/$name/deploy"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")

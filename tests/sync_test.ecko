@@ -2,6 +2,7 @@ import std.test
 import std.fs
 import std.encoding
 import std.hash
+import std.sql
 import "../src/s3.ecko"
 import "../src/state.ecko"
 import "../src/sync.ecko"
@@ -198,6 +199,32 @@ test.case("a file that changes after it was hashed is a problem, not a backup", 
     test.eq(run(env).uploaded, 1)
 })
 
+# A large file is fingerprinted from its part hashes, and each part is sent
+# with the hash taken in that same read, so a file that changes before its
+# parts go up is refused part by part instead of being stored under a hash
+# that doesn't match it.
+test.case("a large file that changes before its parts go up is refused, not stored", fn() {
+    env = setup()
+    p = fs.join(env.root, "big.bin")
+    fs.write(p, bytes("0123456789abcdef" * 1024))
+    fake_s3.delay("big.bin", 300)
+    cfg = merge(CFG, { multipart_threshold: 1000, multipart_part_size: 4096 })
+    c = ctx(env, { cfg: cfg })
+    async fn go() = sync.run(c)
+    task = go()
+    sleep(150)   # hashed; CreateMultipartUpload is being held
+    fs.write(p, bytes("fedcba9876543210" * 1024))
+    o = await task
+    test.ok(contains(o.problems, p + ": changed during upload"), string(o.problems))
+    test.ok(remote(env, "big.bin") == null, "nothing stored under a stale hash")
+    # Next run uploads the new content, fingerprinted by its parts.
+    fake_s3.reset_faults()
+    o2 = sync.run(ctx(env, { cfg: cfg }))
+    test.eq(o2.uploaded, 1)
+    test.eq(remote(env, "big.bin").body, bytes("fedcba9876543210" * 1024))
+    test.ok(starts_with(remote(env, "big.bin").meta["bbb-sha256"], "mp4096-"), string(remote(env, "big.bin").meta))
+})
+
 # Index rows are written in batches. Whatever reached the bucket before a
 # fatal error must still be recorded, or the next run uploads it again.
 test.case("a fatal error mid-run still records every upload that finished", fn() {
@@ -247,6 +274,48 @@ test.case("progress is saved while the run is still going", fn() {
     test.eq([o.status, o.uploaded], ["ok", 9])
     final = state.last_run(env.db, "t")
     test.eq([final.status, final.done, final.planned], ["ok", 9, 9])
+})
+
+# A tree full of unreadable folders must not make a run's problem list, its
+# progress saves or the dashboard grow without bound.
+test.case("problems are counted in full but only the first 1,000 are kept", fn() {
+    env = setup()
+    for i in 0..1050 {
+        d = fs.join(env.root, "locked/d{i}")
+        fs.mkdir(d)
+        fs.chmod(d, "000")
+    }
+    o = run(env)
+    for i in 0..1050 { fs.chmod(fs.join(env.root, "locked/d{i}"), "755") }
+    test.eq([o.status, o.problem_count, len(o.problems)], ["partial", 1050, 1000])
+    row = state.last_run(env.db, "t")
+    test.eq([row.problems, len(row.problem_list)], [1050, 1000])
+})
+
+test.case("a chmod alone updates the object's mode without uploading it again", fn() {
+    env = setup()
+    run(env)
+    a = fs.join(env.root, "a.txt")
+    fs.chmod(a, "600")
+    fake_s3.reset_log()
+    o = run(env)
+    test.eq([o.status, o.uploaded, o.replaced, o.touched], ["ok", 0, 0, 1])
+    test.eq(remote(env, "a.txt").meta["bbb-mode"], "600")
+    test.eq(remote(env, "a.txt").body, bytes("alpha"))
+    test.eq(versions(), [])
+    test.eq(state.index(env.db, "t")[a].mode, "600")
+    test.eq(run(env).touched, 0)
+})
+
+test.case("an index from before modes were recorded learns them without requests", fn() {
+    env = setup()
+    run(env)
+    sql.exec(env.db, "update files set mode = null")
+    fake_s3.reset_log()
+    o = run(env)
+    test.eq([o.status, o.touched, o.uploaded], ["ok", 0, 0])
+    test.eq(filter(fake_s3.requests(), fn(r) not starts_with(r, "GET ")), [])
+    test.ok(all(values(state.index(env.db, "t")), fn(r) r.mode != null), "modes recorded")
 })
 
 test.case("dry run changes nothing", fn() {

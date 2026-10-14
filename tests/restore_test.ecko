@@ -149,6 +149,18 @@ test.case("I2: symlink with a non-ASCII target restores", fn() {
     test.eq(fs.canonical(o.to + env.root + "/music-link"), target)
 })
 
+test.case("a relative symlink restores relative, and a dangling one restores", fn() {
+    env = setup()
+    fs.symlink("hello.txt", fs.join(env.root, "rel-link"))
+    fs.symlink("nowhere/at/all", fs.join(env.root, "dangling"))
+    run_at(env, T0)
+    o = opts({ to: fs.join(fs.temp_dir(), "out-links") })
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq(r.failed, [])
+    test.eq(fs.readlink(o.to + env.root + "/rel-link"), "hello.txt")
+    test.eq(fs.readlink(o.to + env.root + "/dangling"), "nowhere/at/all")
+})
+
 test.case("M5: keys that climb out of --to are refused", fn() {
     env = setup()
     # Under the job's root, so it passes the job's own-paths filter, then
@@ -159,6 +171,80 @@ test.case("M5: keys that climb out of --to are refused", fn() {
     test.eq(r.restored, 0)
     test.ok(any(r.failed, fn(f) contains(f, "unsafe path")), string(r.failed))
     test.ok(not fs.exists(fs.join(fs.dirname(o.to), "escape.txt")), "nothing written outside")
+})
+
+test.case("a restore never writes through a symlink it restored", fn() {
+    env = setup()
+    evil = fs.join(fs.temp_dir(), "evil")
+    fs.mkdir(evil)
+    # A tampered bucket: x is a link out of --to, then a file "inside" it.
+    fake_s3.put_raw("pc" + env.root + "/x", bytes(""), { "bbb-symlink": encoding.url_encode(evil) })
+    fake_s3.put_raw("pc" + env.root + "/x/pwned.txt", bytes("gotcha"), {})
+    o = opts({ to: fs.join(fs.temp_dir(), "out-traverse") })
+    r = restore.restore(CLIENT, env.job, o)
+    test.ok(not fs.exists(fs.join(evil, "pwned.txt")), "nothing written through the link")
+    # Files go first, so the file lands in a real folder x and the link is
+    # then refused because x exists.
+    test.ok(not fs.is_symlink(o.to + env.root + "/x"), "no link over the folder")
+    test.eq(fs.read(o.to + env.root + "/x/pwned.txt"), "gotcha")
+    test.eq(len(r.skipped), 1)
+})
+
+test.case("restore downloads several files at a time", fn() {
+    env = setup()
+    for i in 0..6 { fs.write(fs.join(env.root, "f{i}.txt"), "file {i}") }
+    run_at(env, T0)
+    fake_s3.delay(".txt", 200)
+    o = opts({ to: fs.join(fs.temp_dir(), "out-parallel"), concurrency: 4 })
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, r.failed], [6, []])
+    test.eq(read_out(o, env, "f3.txt"), "file 3")
+    test.ok(max(fake_s3.overlaps_()) >= 2, "GETs held at once: {fake_s3.overlaps_()}")
+})
+
+test.case("a restore never writes through a symlink already in --to", fn() {
+    env = setup()
+    evil = fs.join(fs.temp_dir(), "evil2")
+    fs.mkdir(evil)
+    fake_s3.put_raw("pc" + env.root + "/y/pwned.txt", bytes("gotcha"), {})
+    o = opts({ to: fs.join(fs.temp_dir(), "out-prelinked") })
+    fs.mkdir(o.to + env.root)
+    fs.symlink(evil, o.to + env.root + "/y")
+    r = restore.restore(CLIENT, env.job, o)
+    test.ok(not fs.exists(fs.join(evil, "pwned.txt")), "nothing written through the link")
+    test.ok(any(r.failed, fn(f) contains(f, "is a symlink")), string(r.failed))
+})
+
+test.case("a failed download leaves no .bbb-partial file behind", fn() {
+    env = setup()
+    fs.write(fs.join(env.root, "a.txt"), "v1")
+    run_at(env, T0)
+    o = opts({ to: fs.join(fs.temp_dir(), "out-partial"), overwrite: true })
+    # The target is a non-empty folder, so the final rename fails.
+    fs.mkdir(o.to + env.root + "/a.txt/inside")
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq(len(r.failed), 1)
+    test.ok(not fs.exists(o.to + env.root + "/a.txt.bbb-partial"), "partial removed")
+})
+
+test.case("a file uploaded in parts restores and is verified by its part hashes", fn() {
+    env = setup()
+    body = bytes("0123456789abcdef" * 1024)
+    fs.write(fs.join(env.root, "big.bin"), body)
+    sync.run({
+        job: env.job, cfg: merge(CFG, { multipart_threshold: 1000, multipart_part_size: 4096 }), client: CLIENT, db: env.db,
+        run_id: "rbig", run_ts: sync.run_ts_of(T0), now_ms: T0, dry_run: false, should_stop: fn() false, log: fn(l, m, f) null,
+    })
+    o = opts({ to: fs.join(fs.temp_dir(), "out-big") })
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, r.failed], [1, []])
+    test.ok(fs.read_bytes(o.to + env.root + "/big.bin") == body, "same bytes")
+    # A corrupted copy in the bucket is caught.
+    k = "pc" + env.root + "/big.bin"
+    fake_s3.put_raw(k, bytes("X") + body[1..], fake_s3.object(k).meta)
+    o2 = opts({ to: fs.join(fs.temp_dir(), "out-big2") })
+    r2 = restore.restore(CLIENT, env.job, o2)
+    test.ok(any(r2.failed, fn(f) contains(f, "checksum mismatch")), string(r2.failed))
 })
 
 test.case("binary content restores byte-for-byte", fn() {

@@ -65,6 +65,8 @@ fn cmd_run(a) {
         o = runner.run_job(cfg, j, db, { dry_run: args.flag(a, "dry-run", false), should_stop: fn() false })
         print("{j.name}: {o.status}  uploaded {o.uploaded}, replaced {o.replaced}, deleted {o.deleted}, touched {o.touched}, pruned {o.pruned}")
         for p in o.problems { print("  problem: " + p) }
+        hidden = o.problem_count - len(o.problems)
+        if hidden > 0 { print("  ... and {hidden} more problems (only the first {len(o.problems)} are kept)") }
         if o.error != null { print("  error: " + o.error) }
         code = match o.status { "ok" => 0 "partial" => 2 _ => 1 }
         if code == 1 or (code == 2 and worst == 0) { worst = code }
@@ -85,7 +87,7 @@ fn cmd_ls(a) {
     cfg = load_or_exit(args.flag(a, "config", args.DEFAULT_CONFIG))
     job = find_job(cfg, a.positional[0])
     client = runner.make_client(cfg, job)
-    items = restore.select(client, job, { path: args.flag(a, "path", null), at_ms: parse_at(args.flag(a, "at", null)) })
+    items = restore.select(client, job, { path: args.flag(a, "path", null), at_ms: parse_at(args.flag(a, "at", null)), concurrency: cfg.concurrency })
     for i in items { print(i.path) }
     0
 }
@@ -103,6 +105,7 @@ fn cmd_restore(a) {
         to: to,
         overwrite: args.flag(a, "overwrite", false),
         oldest_ms: now - job.keep_versions_days * 86400000,
+        concurrency: cfg.concurrency,
     })
     print("restored {r.restored} file(s) to {to}")
     for s in r.skipped { print("  skipped: " + s) }

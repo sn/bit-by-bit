@@ -145,6 +145,18 @@ test.case("the tab title carries the overall health", fn() {
     test.ok(contains(http.get(url("/")).body, "<title>bit-by-bit: needs attention</title>"), "unhealthy title")
 })
 
+test.case("a capped problem list shows the full count and says it is capped", fn() {
+    reset()
+    state.start_run(DB, "home", "r1", time.now() - H)
+    state.finish_run(DB, "r1", {
+        status: "partial", finished_at: time.now() - H + 60000, uploaded: 0, replaced: 0, deleted: 0,
+        touched: 0, pruned: 0, bytes: 0, error: null, problems: ["/a: x", "/b: y"], problem_count: 1500,
+    })
+    body = http.get(url("/")).body
+    test.ok(contains(body, "<span class=\"count warn\">1,500</span>"), "full count")
+    test.ok(contains(body, "1,498 more problems not listed"), "says the rest are not listed")
+})
+
 test.case("every problem is reachable, past the first five behind a disclosure", fn() {
     reset()
     probs = map(0..8, fn(i) "/tmp/file-{i}: vanished")
@@ -190,6 +202,16 @@ test.case("/healthz is 503 when a job's last run failed", fn() {
     r = http.get(url("/healthz"))
     test.eq(r.status, 503)
     test.ok(contains(r.body, "home: last run failed"), r.body)
+})
+
+test.case("after a failed run the next run is a retry soon, not a full interval", fn() {
+    reset()
+    # Failed an hour ago: retried 15m after it ended, so it is due now
+    # rather than in 5h.
+    record("home", "r1", time.now() - H, "failed", [], "HTTP 500")
+    snap = json.decode(http.get(url("/api/status")).body)
+    home = find(snap.jobs, fn(j) j.job == "home")
+    test.ok(home.next_due <= time.now(), "retry is due: {home.next_due}")
 })
 
 test.case("/healthz is 503 when a job is overdue", fn() {

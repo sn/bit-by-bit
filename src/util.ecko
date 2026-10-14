@@ -4,3 +4,21 @@ export fn index_by(xs, key_fn) {
     for x in xs { m = set(m, key_fn(x), x) }
     m
 }
+
+## f(x) for every x in xs, at most `n` at a time, results in the order of
+## xs. For network-bound work: these are tasks, not pmap, so the limit is `n`
+## rather than the machine's core count. If f raises, so does pool.
+export fn pool(xs, n, f) {
+    todo = channel()
+    for (i, x) in enumerate(xs) { send(todo, [i, x]) }
+    close(todo)
+    async fn worker() {
+        mut done = []
+        for item in todo { done = push(done, [item[0], f(item[1])]) }
+        done
+    }
+    workers = map(0..min([n, max([len(xs), 1])]), fn(i) worker())
+    mut results = []
+    for w in workers { results = results + await w }
+    map(sort_by(results, fn(r) r[0]), fn(r) r[1])
+}

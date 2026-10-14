@@ -15,8 +15,8 @@ let META_PREFIX = "x-amz-meta-bbb-"
 # 4xx codes that mean the destination itself is misconfigured. Any other 4xx
 # is about one object (too big to copy, key too long, ...) and must not stop
 # the whole job.
-let CONFIG_CODES = ["NoSuchBucket", "PermanentRedirect", "AuthorizationHeaderMalformed", "InvalidBucketName", "IllegalLocationConstraintException", "InvalidRegion"]
-let RETRY_CODES = ["RequestTimeout", "SlowDown", "InternalError", "ServiceUnavailable", "RequestTimeTooSkewed"]
+let CONFIG_CODES = ["NoSuchBucket", "PermanentRedirect", "AuthorizationHeaderMalformed", "InvalidBucketName", "IllegalLocationConstraintException", "InvalidRegion", "RequestTimeTooSkewed"]
+let RETRY_CODES = ["RequestTimeout", "SlowDown", "InternalError", "ServiceUnavailable"]
 
 ## Build a client for one destination.
 ## dest: a normalized destination from config.validate.
@@ -79,6 +79,8 @@ export fn classify(status, body) {
         }
         return "ok"
     }
+    # A wrong clock doesn't fix itself between retries.
+    if code == "RequestTimeTooSkewed" { return "fail" }
     if status == 429 or status >= 500 { return "retry" }
     if code != null and contains(RETRY_CODES, code) { return "retry" }
     if status == 403 or code == "SignatureDoesNotMatch" or code == "InvalidAccessKeyId" { return "auth" }
@@ -96,6 +98,7 @@ let FIX_HINTS = {
     IllegalLocationConstraintException: "set endpoint and region to the bucket's region",
     NoSuchBucket: "check the bucket name, and that endpoint points at the account that owns it",
     InvalidBucketName: "check the bucket name",
+    RequestTimeTooSkewed: "this machine's clock is wrong: turn on time sync (timedatectl set-ntp true)",
 }
 
 fn fail_for(cls, method, key, status, body) {
@@ -230,12 +233,24 @@ export fn get_stream(c, key) {
 ## Download `key` into memory as bytes.
 export fn get_object(c, key) = request(c, "GET", key, {}).body_bytes
 
-## Server-side copy, keeping metadata.
-export fn copy_object(c, src_key, dst_key) {
+## Server-side copy. Keeps the source's metadata, or sets `meta` instead
+## ({name: value}) when given.
+export fn copy_object(c, src_key, dst_key, meta = null) {
     source = "/" + c.dest.bucket + "/" + sigv4.uri_encode(src_key, false)
-    headers = merge({ "x-amz-copy-source": source, "x-amz-metadata-directive": "COPY" }, sse_headers(c))
+    directive = if meta == null { { "x-amz-metadata-directive": "COPY" } } else {
+        merge(meta_headers(meta), { "x-amz-metadata-directive": "REPLACE", "content-type": "application/octet-stream" })
+    }
+    headers = merge(merge({ "x-amz-copy-source": source }, directive), sse_headers(c))
     request(c, "PUT", dst_key, { headers: headers })
     null
+}
+
+## Change some of `key`'s metadata in place (a copy onto itself), keeping the
+## rest. Objects over 5 GiB can't be copied in one request; see sync.
+export fn update_meta(c, key, changes) {
+    meta = head_object(c, key)
+    if meta == null { error({ kind: "s3_not_found", message: "{key}: no such object" }) }
+    copy_object(c, key, key, meta: merge(meta, changes))
 }
 
 ## Delete `key`. Deleting something that is already gone succeeds.
@@ -256,18 +271,20 @@ export fn parse_listing(body) {
 
 ## Every object under `prefix`: [{ key, size }], following continuation tokens.
 export fn list_objects(c, prefix) {
-    mut out = []
+    # Pages are kept apart and joined once: adding each page to one growing
+    # list copies it every time, which is quadratic in a large bucket.
+    mut pages = []
     mut token = null
     while true {
         mut query = { "list-type": "2", prefix: prefix }
         if token != null { query = set(query, "continuation-token", token) }
         page = parse_listing(request(c, "GET", "", { query: query }).body)
-        out = out + page.objects
+        pages = push(pages, page.objects)
         unless page.truncated { break }
         token = page.token
         if token == null { break }
     }
-    out
+    flatten(pages)
 }
 
 # ---- Multipart ----------------------------------------------------------------
@@ -299,11 +316,20 @@ export fn upload_part_copy(c, key, upload_id, n, src_key, first, last) {
     etag
 }
 
-## parts: [{ n, etag }] in order.
-export fn complete_multipart(c, key, upload_id, parts) {
+## parts: [{ n, etag }] in order. `expect` is the metadata the upload was
+## created with ({ sha256, run }): if a retry finds the upload gone because
+## an earlier attempt completed it and only the response was lost, an object
+## carrying that metadata means it worked.
+export fn complete_multipart(c, key, upload_id, parts, expect = null) {
     items = join(map(parts, fn(p) "<Part><PartNumber>{p.n}</PartNumber><ETag>" + xml.escape(p.etag) + "</ETag></Part>"), "")
     payload = "<CompleteMultipartUpload>" + items + "</CompleteMultipartUpload>"
-    request(c, "POST", key, { query: { uploadId: upload_id }, body: bytes(payload), headers: { "content-type": "application/xml" } })
+    try {
+        request(c, "POST", key, { query: { uploadId: upload_id }, body: bytes(payload), headers: { "content-type": "application/xml" } })
+    } catch (e) {
+        unless get(e, "kind") == "s3_not_found" and expect != null { error(e) }
+        h = head_object(c, key)
+        unless h != null and get(h, "sha256") == get(expect, "sha256") and get(h, "run") == get(expect, "run") { error(e) }
+    }
     null
 }
 

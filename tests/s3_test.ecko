@@ -72,6 +72,16 @@ test.case("copy keeps metadata, delete is idempotent", fn() {
     test.eq(fake_s3.object("a"), null)
 })
 
+test.case("update_meta changes metadata in place, keeping the rest", fn() {
+    fake_s3.reset()
+    s3.put_object(c, "m", bytes("body"), { sha256: "abc", mode: "644", run: "r1" })
+    s3.update_meta(c, "m", { mode: "600" })
+    test.eq(fake_s3.object("m").body, bytes("body"))
+    test.eq(s3.head_object(c, "m"), { sha256: "abc", mode: "600", run: "r1" })
+    # As on S3, copying an object onto itself without new metadata is refused.
+    test.err(fn() s3.copy_object(c, "m", "m"), "InvalidRequest")
+})
+
 test.case("list follows continuation tokens", fn() {
     fake_s3.reset()
     fake_s3.set_page_size(2)
@@ -148,6 +158,21 @@ test.case("multipart upload assembles parts in order", fn() {
     test.eq(fake_s3.object("big").meta, { "bbb-sha256": "s" })
 })
 
+# A completion whose response is lost is retried, and the retry finds the
+# upload already gone. If the object is there with this upload's metadata,
+# it did complete.
+test.case("a retried completion that finds its object done succeeds", fn() {
+    fake_s3.reset()
+    meta = { sha256: "s1", run: "r9" }
+    id = s3.create_multipart(c, "done", meta)
+    e1 = s3.upload_part(c, "done", id, 1, BINARY)
+    s3.complete_multipart(c, "done", id, [{ n: 1, etag: e1 }], expect: meta)
+    s3.complete_multipart(c, "done", id, [{ n: 1, etag: e1 }], expect: meta)
+    test.eq(fake_s3.object("done").body, BINARY)
+    # Without a matching object, the 404 still stands.
+    test.err(fn() s3.complete_multipart(c, "done", id, [{ n: 1, etag: e1 }], expect: { sha256: "other", run: "r9" }), "NoSuchUpload")
+})
+
 test.case("abort multipart is idempotent", fn() {
     fake_s3.reset()
     id = s3.create_multipart(c, "big", {})
@@ -185,6 +210,17 @@ test.case("a truncated listing raises instead of answering short", fn() {
     body = "<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><Contents><Key>b"
     test.err(fn() s3.parse_listing(body), "malformed")
     try { s3.parse_listing(body) } catch (e) { test.eq(get(e, "kind"), "s3_retry") }
+})
+
+# A wrong clock doesn't fix itself between retries: fail at once, saying so.
+test.case("a skewed clock fails at once with a fix", fn() {
+    fake_s3.reset()
+    fake_s3.fail_next("PUT", "skew", 403, "RequestTimeTooSkewed", 5)
+    e = try { s3.put_object(c, "skew", bytes("x"), {}) null } catch (err) { err }
+    fake_s3.reset_faults()
+    test.eq(get(e, "kind"), "s3_config")
+    test.ok(contains(e.message, "clock"), e.message)
+    test.eq(len(fake_s3.requests()), 1)
 })
 
 test.case("classify copes with a body that is not XML", fn() {

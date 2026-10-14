@@ -23,12 +23,12 @@ export fn open(state_dir) {
 
 # Columns added after the first release. `create table if not exists` leaves
 # an existing table alone, so older databases get them here.
-let ADDED_RUN_COLUMNS = [["planned", "integer"], ["done", "integer not null default 0"]]
+let ADDED_COLUMNS = [["runs", "planned", "integer"], ["runs", "done", "integer not null default 0"], ["files", "mode", "text"]]
 
 fn migrate(db) {
-    have = map(sql.query(db, "pragma table_info(runs)"), fn(c) c.name)
-    for (name, decl) in ADDED_RUN_COLUMNS {
-        unless contains(have, name) { sql.exec(db, "alter table runs add column {name} {decl}") }
+    for (table, name, decl) in ADDED_COLUMNS {
+        have = map(sql.query(db, "pragma table_info({table})"), fn(c) c.name)
+        unless contains(have, name) { sql.exec(db, "alter table {table} add column {name} {decl}") }
     }
 }
 
@@ -36,19 +36,26 @@ export fn close(db) = sql.close(db)
 
 # ---- file index ----------------------------------------------------------------
 
-## Every indexed file of a job, keyed by path:
-## read rows with get(idx, path) -> { path, size, mtime, sha256, kind }.
-export fn index(db, job) = util.index_by(sql.query(db, "select path, size, mtime, sha256, kind from files where job = ? order by path", [job]), fn(r) r.path)
+## Every indexed file of a job, keyed by path: read rows with
+## get(idx, path) -> { path, size, mtime, sha256, kind, mode }. mode is null
+## for links, and for rows written before modes were recorded.
+export fn index(db, job) = util.index_by(sql.query(db, "select path, size, mtime, sha256, kind, mode from files where job = ? order by path", [job]), fn(r) r.path)
 
-## Insert or replace one index row. row: { path, size, mtime, sha256, kind }.
+## Insert or replace one index row. row: { path, size, mtime, sha256, kind, mode? }.
 export fn put_file(db, job, row) =
-    sql.exec(db, "insert or replace into files (job, path, size, mtime, sha256, kind) values (?, ?, ?, ?, ?, ?)",
-        [job, row.path, row.size, row.mtime, row.sha256, row.kind])
+    sql.exec(db, "insert or replace into files (job, path, size, mtime, sha256, kind, mode) values (?, ?, ?, ?, ?, ?, ?)",
+        [job, row.path, row.size, row.mtime, row.sha256, row.kind, get(row, "mode")])
+
+## Record files' modes without other changes: pairs [[path, mode]], in one transaction.
+export fn set_modes(db, job, pairs) = sql.transaction(db, fn(tx) {
+    for (path, mode) in pairs { sql.exec(tx, "update files set mode = ? where job = ? and path = ?", [mode, job, path]) }
+})
 
 export fn remove_file(db, job, path) = sql.exec(db, "delete from files where job = ? and path = ?", [job, path])
 
-## Record a new mtime for a file whose content did not change.
-export fn touch_file(db, job, path, mtime) = sql.exec(db, "update files set mtime = ? where job = ? and path = ?", [mtime, job, path])
+## Record a new mtime and mode for a file whose content did not change.
+export fn touch_file(db, job, path, mtime, mode = null) =
+    sql.exec(db, "update files set mtime = ?, mode = coalesce(?, mode) where job = ? and path = ?", [mtime, mode, job, path])
 
 ## Replace a job's whole index (used by --rebuild-state).
 export fn replace_index(db, job, rows) = sql.transaction(db, fn(tx) {
@@ -75,16 +82,20 @@ export fn start_run(db, job, run_id, started_at) =
 ## How many actions the run will carry out, known once it has planned.
 export fn set_planned(db, run_id, n) = sql.exec(db, "update runs set planned = ? where id = ?", [n, run_id])
 
+# How many problems a run had: problem_count when the totals carry one (the
+# text list is capped), else the list's length.
+fn problem_total(t) = get(t, "problem_count") ?? len(t.problems)
+
 ## Save a running run's counts so far: `done` actions finished, and the
-## running totals { uploaded, replaced, deleted, touched, bytes, problems: [String] }.
+## running totals { uploaded, replaced, deleted, touched, bytes, problems: [String], problem_count }.
 export fn save_progress(db, run_id, done, t) =
     sql.exec(db, "update runs set done = ?, uploaded = ?, replaced = ?, deleted = ?, touched = ?, bytes = ?, problems = ?, problem_list = ? where id = ? and status = 'running'",
-        [done, t.uploaded, t.replaced, t.deleted, t.touched, t.bytes, len(t.problems), json.encode(t.problems), run_id])
+        [done, t.uploaded, t.replaced, t.deleted, t.touched, t.bytes, problem_total(t), json.encode(t.problems), run_id])
 
 ## outcome: { status, finished_at, uploaded, replaced, deleted, touched, pruned, bytes, error, problems: [String] }
 export fn finish_run(db, run_id, o) =
     sql.exec(db, "update runs set status = ?, finished_at = ?, uploaded = ?, replaced = ?, deleted = ?, touched = ?, pruned = ?, problems = ?, bytes = ?, error = ?, problem_list = ? where id = ?",
-        [o.status, o.finished_at, o.uploaded, o.replaced, o.deleted, o.touched, o.pruned, len(o.problems), o.bytes, o.error, json.encode(o.problems), run_id])
+        [o.status, o.finished_at, o.uploaded, o.replaced, o.deleted, o.touched, o.pruned, problem_total(o), o.bytes, o.error, json.encode(o.problems), run_id])
 
 fn decode_run(r) = if r == null { null } else { set(r, "problem_list", if r.problem_list == null { [] } else { json.decode(r.problem_list) }) }
 
@@ -100,9 +111,16 @@ export fn last_good_at(db, job) {
 ## The most recent runs of a job, newest first.
 export fn recent_runs(db, job, n) = map(sql.query(db, "select * from runs where job = ? order by started_at desc, id desc limit ?", [job, n]), decode_run)
 
-## Mark runs left 'running' by a crash as failed. Returns how many.
-export fn mark_interrupted(db, now) =
-    sql.exec(db, "update runs set status = 'failed', finished_at = ?, error = 'interrupted: the process stopped before the run finished' where status = 'running'", [now])
+## Mark runs left 'running' by a crash as failed, except those of `busy`
+## jobs (a live process still holds their lock). Returns how many.
+export fn mark_interrupted(db, now, busy = []) {
+    mut n = 0
+    for r in sql.query(db, "select id, job from runs where status = 'running'") {
+        if contains(busy, r.job) { continue }
+        n = n + sql.exec(db, "update runs set status = 'failed', finished_at = ?, error = 'interrupted: the process stopped before the run finished' where id = ?", [now, r.id])
+    }
+    n
+}
 
 # ---- multipart bookkeeping -------------------------------------------------------------
 

@@ -19,20 +19,22 @@ export fn size_text(n) {
 
 ## One map per job: { job, status, started_at, finished_at, next_due, counts, error, problems }.
 export fn collect(cfg, db, now) = map(cfg.jobs, fn(job) {
-    last = state.last_run(db, job.name)
+    runs = state.recent_runs(db, job.name, 10)
+    last = first(runs)
     last_ms = if last == null { null } else { last.started_at }
     {
         job: job.name,
         status: if last == null { "never run" } else { last.status },
         started_at: last_ms,
         finished_at: if last == null { null } else { last.finished_at },
-        next_due: scheduler.next_due(job.schedule, last_ms, now, scheduler.local_offset_ms(now)),
+        next_due: scheduler.next_run(job.schedule, runs, now, scheduler.local_offset_ms),
         uploaded: if last == null { 0 } else { last.uploaded },
         replaced: if last == null { 0 } else { last.replaced },
         deleted: if last == null { 0 } else { last.deleted },
         bytes: if last == null { 0 } else { last.bytes },
         error: if last == null { null } else { last.error },
         problems: if last == null { [] } else { last.problem_list },
+        problem_count: if last == null { 0 } else { last.problems },
     }
 })
 
@@ -48,8 +50,9 @@ export fn render(rows, now) {
         }
         if r.error != null { out = push(out, "  error: {r.error}") }
         for p in take(r.problems, 5) { out = push(out, "  problem: {p}") }
-        if len(r.problems) > 5 {
-            more = len(r.problems) - 5
+        total = max([get(r, "problem_count") ?? 0, len(r.problems)])
+        if total > 5 {
+            more = total - 5
             out = push(out, "  ... and {more} more")
         }
     }

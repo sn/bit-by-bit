@@ -28,14 +28,18 @@ export fn guard_empty_roots(scan, index, roots) {
 ##   scan:  the result of scanner.scan
 ##   index: state.index for the job ({path: row})
 ## Returns {
-##   actions:   [{ op: "upload" | "check" | "replace" | "delete", path, entry, prev }]
+##   actions:   [{ op: "upload" | "check" | "replace" | "delete" | "chmod", path, entry, prev }]
 ##   unchanged: Int
+##   remember:  [[path, mode]] - modes to record for rows indexed before
+##              modes were (no request needed: nothing to compare them with)
 ## }
 ## "check" means size or mtime changed: the executor hashes the file and either
-## records a touch (same content) or does a replace.
+## records a touch (same content) or does a replace. "chmod" means only the
+## mode changed: the object's metadata is updated in place.
 export fn plan(scan, index) {
     mut actions = []
     mut unchanged = 0
+    mut remember = []
     present = util.index_by(scan.entries, fn(e) e.path)
     for e in scan.entries {
         prev = get(index, e.path)
@@ -50,7 +54,14 @@ export fn plan(scan, index) {
                 actions = push(actions, { op: "replace", path: e.path, entry: e, prev: prev })
             }
         } else if prev.size == e.size and prev.mtime == e.mtime {
-            unchanged = unchanged + 1
+            mode = get(e, "mode")
+            prev_mode = get(prev, "mode")
+            if mode != null and prev_mode != null and mode != prev_mode {
+                actions = push(actions, { op: "chmod", path: e.path, entry: e, prev: prev })
+            } else {
+                unchanged = unchanged + 1
+                if prev_mode == null and mode != null { remember = push(remember, [e.path, mode]) }
+            }
         } else {
             actions = push(actions, { op: "check", path: e.path, entry: e, prev: prev })
         }
@@ -59,5 +70,5 @@ export fn plan(scan, index) {
         if has(present, path) or scanner.under_any(path, scan.protected) { continue }
         actions = push(actions, { op: "delete", path: path, entry: null, prev: get(index, path) })
     }
-    { actions: actions, unchanged: unchanged }
+    { actions: actions, unchanged: unchanged, remember: remember }
 }

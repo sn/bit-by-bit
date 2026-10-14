@@ -178,3 +178,12 @@ test.case("concurrency goes up to 128", fn() {
     test.eq(config.validate(merge(base(), { concurrency: 128 })).config.concurrency, 128)
     test.ok(has_error(config.validate(merge(base(), { concurrency: 129 })), "$.concurrency: must be an integer from 1 to 128"), "129 rejected")
 })
+
+# S3 refuses a single PUT, and a single part, over 5 GiB.
+test.case("multipart sizes stay within S3's 5 GiB limits", fn() {
+    r = config.validate(merge(base(), { multipart_threshold: "6GiB", multipart_part_size: "6GiB" }))
+    test.ok(has_error(r, "$.multipart_threshold: must be at most 5GiB"), string(r.errors))
+    test.ok(has_error(r, "$.multipart_part_size: must be at most 5GiB"), string(r.errors))
+    ok = config.validate(merge(base(), { multipart_threshold: "5GiB", multipart_part_size: "5GiB" }))
+    test.eq(ok.errors, [])
+})

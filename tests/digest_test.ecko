@@ -1,0 +1,29 @@
+import std.test
+import std.fs
+import std.hash
+import "../src/digest.ecko"
+
+fn file(name, body) {
+    p = fs.join(fs.temp_dir(), name)
+    fs.write(p, body)
+    p
+}
+
+test.case("a small file's fingerprint is its sha256", fn() {
+    p = file("small.txt", "hello")
+    test.ok(digest.matches(p, hash.sha256("hello")), "matches")
+    test.ok(not digest.matches(p, hash.sha256("other")), "a different hash does not")
+})
+
+test.case("a large file's fingerprint is built from its part hashes", fn() {
+    body = bytes("0123456789" * 1000)   # 10,000 bytes: parts of 4096, 4096, 1808
+    p = file("large.bin", body)
+    hashes = digest.part_hashes(p, 10000, 4096)
+    test.eq(hashes, [hash.sha256(body[..4096]), hash.sha256(body[4096..8192]), hash.sha256(body[8192..])])
+    fp = digest.of_parts(4096, hashes)
+    test.ok(starts_with(fp, "mp4096-"), fp)
+    test.ok(digest.matches(p, fp), "matches")
+    fs.write(p, bytes("x") + body[1..])
+    test.ok(not digest.matches(p, fp), "one changed byte does not")
+    test.ok(not digest.matches(p, "mpX-abc"), "a malformed fingerprint does not")
+})

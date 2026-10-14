@@ -37,7 +37,8 @@ test.case("files, excludes, symlinks, specials, unreadable dirs", fn() {
     test.ok(a.mtime > 0, "mtime")
     link = r.entries[2]
     test.eq(link.kind, "symlink")
-    test.eq(link.target, fs.join(root, "a.txt"))
+    # The link's own target, as written: a relative link stays relative.
+    test.eq(link.target, "a.txt")
     test.eq(r.skipped, 1)
     test.eq(r.protected, [fs.join(root, "locked")])
     test.ok(any(r.problems, fn(p) contains(p, "unreadable directory")), string(r.problems))
@@ -77,14 +78,19 @@ test.case("a single file as a root", fn() {
     test.eq(len(r.entries), 1)
 })
 
-test.case("broken symlink is a protected problem", fn() {
+# A link whose target is missing is still a link worth keeping (a build
+# output, a mount point), and must not make every run "partial".
+test.case("a dangling symlink is backed up like any other link", fn() {
     root = fs.join(fs.temp_dir(), "broken")
     fs.mkdir(root)
     fs.symlink("gone.txt", fs.join(root, "dangling"))
     r = scanner.scan(job(root, {}))
-    test.eq(r.entries, [])
-    test.eq(r.protected, [fs.join(root, "dangling")])
-    test.ok(contains(r.problems[0], "broken symlink"), r.problems[0])
+    test.eq(map(r.entries, fn(e) [e.kind, e.target]), [["symlink", "gone.txt"]])
+    test.eq([r.problems, r.protected], [[], []])
+    # With follow_symlinks there is nothing to follow, so it is kept as a link.
+    f = scanner.scan(job(root, { follow_symlinks: true }))
+    test.eq(map(f.entries, fn(e) [e.kind, e.target]), [["symlink", "gone.txt"]])
+    test.eq(f.problems, [])
 })
 
 test.case("C2: a followed root symlink to a missing target is protected", fn() {

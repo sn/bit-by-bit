@@ -10,6 +10,7 @@ import "./sync.ecko"
 import "./planner.ecko"
 import "./logging.ecko"
 import "./lock.ecko"
+import "./util.ecko"
 
 export fn job_lock_path(cfg, job) = fs.join(cfg.state_dir, "job-" + job.name + ".lock")
 
@@ -23,7 +24,7 @@ export fn make_client(cfg, job) {
 
 fn empty_outcome(status, err) = {
     status: status, error: err, uploaded: 0, replaced: 0, deleted: 0, touched: 0,
-    pruned: 0, bytes: 0, problems: [], finished_at: time.now(),
+    pruned: 0, bytes: 0, problems: [], problem_count: 0, finished_at: time.now(),
 }
 
 ## Run one job now and return its outcome. Never raises: anything that escapes
@@ -69,7 +70,7 @@ fn run_job_unguarded(cfg, job, db, opts) {
     level = match o.status { "ok" => "info" "partial" => "warn" _ => "error" }
     log_(level, "run finished", {
         status: o.status, uploaded: o.uploaded, replaced: o.replaced, deleted: o.deleted,
-        touched: o.touched, pruned: o.pruned, bytes: o.bytes, problems: len(o.problems),
+        touched: o.touched, pruned: o.pruned, bytes: o.bytes, problems: o.problem_count,
     })
     o
 }
@@ -79,21 +80,22 @@ fn run_job_unguarded(cfg, job, db, opts) {
 export fn rebuild_state(cfg, job, db) {
     client = make_client(cfg, job)
     vprefix = job.prefix + "/_versions/"
-    mut rows = []
-    for o in s3.list_objects(client, job.prefix + "/") {
-        if starts_with(o.key, vprefix) { continue }
+    # Another job may share the prefix; its files are not this job's.
+    mine = filter(s3.list_objects(client, job.prefix + "/"), fn(o) {
+        not starts_with(o.key, vprefix) and scanner.under_any(o.key[len(job.prefix)..], job.paths)
+    })
+    # One HEAD per object, `concurrency` at a time: one at a time takes hours
+    # for a few hundred thousand files.
+    found = util.pool(mine, cfg.concurrency, fn(o) {
         path = o.key[len(job.prefix)..]
-        # Another job may share the prefix; its files are not this job's.
-        unless scanner.under_any(path, job.paths) { continue }
         meta = s3.head_object(client, o.key)
-        if meta == null { continue }
-        row = if has(meta, "symlink") {
+        if meta == null { null } else if has(meta, "symlink") {
             { path: path, size: 0, mtime: 0, sha256: planner.link_sha(encoding.url_decode(meta.symlink)), kind: "symlink" }
         } else {
-            { path: path, size: o.size, mtime: int(get(meta, "mtime") ?? "0"), sha256: get(meta, "sha256") ?? "", kind: "file" }
+            { path: path, size: o.size, mtime: int(get(meta, "mtime") ?? "0"), sha256: get(meta, "sha256") ?? "", kind: "file", mode: get(meta, "mode") }
         }
-        rows = push(rows, row)
-    }
+    })
+    rows = filter(found, fn(r) r != null)
     state.replace_index(db, job.name, rows)
     len(rows)
 }

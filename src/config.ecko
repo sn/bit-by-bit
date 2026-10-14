@@ -13,6 +13,7 @@ let DEST_KEYS = ["provider", "endpoint", "region", "bucket", "credentials_file",
 let JOB_KEYS = ["name", "destination", "prefix", "paths", "exclude", "schedule", "keep_versions_days", "follow_symlinks"]
 let RETRY_KEYS = ["attempts", "base_delay", "max_delay"]
 let LEVELS = ["debug", "info", "warn", "error"]
+let FIVE_GIB = 5368709120
 
 ## Validate a decoded config map. Never raises: returns
 ## { config, errors: [String], warnings: [String] } where every message starts
@@ -270,8 +271,12 @@ export fn validate(raw) {
         }
     }
 
+    # S3's limits: parts of 5 MiB to 5 GiB, and a single PUT of at most 5 GiB.
     part_size = parsed("$.multipart_part_size", fn() duration.parse_size(opt(raw, "multipart_part_size", "16MiB")), 16777216)
     if part_size < 5242880 { err("$.multipart_part_size", "must be at least 5MiB") }
+    if part_size > FIVE_GIB { err("$.multipart_part_size", "must be at most 5GiB") }
+    threshold = parsed("$.multipart_threshold", fn() duration.parse_size(opt(raw, "multipart_threshold", "64MiB")), 67108864)
+    if threshold > FIVE_GIB { err("$.multipart_threshold", "must be at most 5GiB (S3 refuses a single upload over 5GiB)") }
 
     config = {
         state_dir: trim_end_slash(opt(raw, "state_dir", "/var/lib/bit-by-bit")),
@@ -280,7 +285,7 @@ export fn validate(raw) {
         jobs: jobs,
         retry: retry_cfg,
         concurrency: want_int(raw, "concurrency", "$", 4, 1, 128),
-        multipart_threshold: parsed("$.multipart_threshold", fn() duration.parse_size(opt(raw, "multipart_threshold", "64MiB")), 67108864),
+        multipart_threshold: threshold,
         multipart_part_size: part_size,
         dashboard: dashboard,
     }

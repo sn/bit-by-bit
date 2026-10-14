@@ -26,7 +26,7 @@ test.case("index put, touch, remove, per job", fn() {
     state.put_file(db, "home", { path: "/b", size: 3, mtime: 4, sha256: "h2", kind: "symlink" })
     state.put_file(db, "other", { path: "/a", size: 9, mtime: 9, sha256: "h9", kind: "file" })
     state.touch_file(db, "home", "/a", 50)
-    test.eq(get(state.index(db, "home"), "/a"), { path: "/a", size: 1, mtime: 50, sha256: "h1", kind: "file" })
+    test.eq(get(state.index(db, "home"), "/a"), { path: "/a", size: 1, mtime: 50, sha256: "h1", kind: "file", mode: null })
     state.remove_file(db, "home", "/b")
     test.eq(keys(state.index(db, "home")), ["/a"])
     test.eq(get(state.index(db, "other"), "/a").sha256, "h9")
@@ -64,6 +64,17 @@ test.case("mark_interrupted fails stale running rows", fn() {
     r = state.last_run(db, "home")
     test.eq(r.status, "failed")
     test.ok(contains(r.error, "interrupted"), r.error)
+})
+
+# A daemon restarting while `bit-by-bit run` is still going in another
+# process must not mark that run as failed.
+test.case("mark_interrupted leaves runs of jobs still in progress alone", fn() {
+    db = fresh()
+    state.start_run(db, "home", "r1", 100)
+    state.start_run(db, "dev", "r2", 100)
+    test.eq(state.mark_interrupted(db, 500, ["dev"]), 1)
+    test.eq(state.last_run(db, "home").status, "failed")
+    test.eq(state.last_run(db, "dev").status, "running")
 })
 
 test.case("multipart bookkeeping", fn() {

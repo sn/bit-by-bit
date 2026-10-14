@@ -83,4 +83,16 @@ test.case("rebuild_state recreates the index from the bucket", fn() {
     test.eq([o.uploaded, o.replaced, o.touched], [0, 0, 0])
 })
 
+test.case("rebuild_state reads object metadata several at a time", fn() {
+    env = setup()
+    for i in 0..6 { fs.write(fs.join(env.root, "f{i}.txt"), "file {i}") }
+    go(env)
+    before = state.index(env.db, "home")
+    fake_s3.delay(".txt", 200)
+    n = runner.rebuild_state(env.cfg, env.job, env.db)
+    test.eq(n, 7)
+    test.eq(state.index(env.db, "home"), before)
+    test.ok(max(fake_s3.overlaps_()) >= 2, "HEADs held at once: {fake_s3.overlaps_()}")
+})
+
 fake_s3.stop()

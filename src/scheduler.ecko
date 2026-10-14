@@ -15,20 +15,50 @@ export fn local_offset_ms(ms) {
 ## When a job is next due, in unix ms. A result <= now means "run now".
 ##   schedule: { kind: "every", ms } | { kind: "daily_at", hour, minute }
 ##   last_ms:  start time of the job's last run, or null if it never ran
-##   offset_ms: local UTC offset (see local_offset_ms)
+##   offset:   local UTC offset in ms, or a function from a unix-ms time to the
+##             offset in force then (local_offset_ms), which keeps daily_at
+##             on local time across a daylight-saving change
 ## A run missed while the daemon was down is made up once, not once per miss.
-export fn next_due(schedule, last_ms, now_ms, offset_ms) {
+export fn next_due(schedule, last_ms, now_ms, offset) {
     if last_ms == null { return now_ms }
+    offset_at = if type_of(offset) == "function" { offset } else { fn(ms) offset }
     match schedule.kind {
         "every" => last_ms + schedule.ms
         _ => {
-            local = last_ms + offset_ms
+            local = last_ms + offset_at(last_ms)
             day_start = local - (local % DAY)
             mut candidate = day_start + (schedule.hour * 60 + schedule.minute) * 60000
             if candidate <= local { candidate = candidate + DAY }
-            candidate - offset_ms
+            # The offset may differ on the day of the run: convert with that one.
+            first_guess = candidate - offset_at(last_ms)
+            candidate - offset_at(first_guess)
         }
     }
+}
+
+# A failed run is retried after RETRY_AFTER, doubling with each failure in a
+# row, but never later than the schedule's own interval.
+let RETRY_AFTER = 15 * 60000
+
+fn interval_ms(schedule) = if schedule.kind == "every" { schedule.ms } else { DAY }
+
+## When a job is next due given its recent runs, newest first
+## ([{ status, started_at, finished_at }]). After a good run that is the
+## schedule (next_due). After a failed one it is a retry: 15 minutes after it
+## ended, doubling for each failure in a row, capped at the job's interval, so
+## an outage or a restart mid-run doesn't cost a whole interval of backups.
+export fn next_run(schedule, runs, now_ms, offset) {
+    if len(runs) == 0 { return now_ms }
+    last = runs[0]
+    unless last.status == "failed" { return next_due(schedule, last.started_at, now_ms, offset) }
+    mut failures = 0
+    for r in runs {
+        unless r.status == "failed" { break }
+        failures = failures + 1
+    }
+    mut wait = RETRY_AFTER
+    for i in 1..failures { wait = wait * 2 }
+    (last.finished_at ?? last.started_at) + min([wait, interval_ms(schedule)])
 }
 
 ## How long the daemon should sleep: until the earliest due time, clamped to
