@@ -271,20 +271,18 @@ export fn parse_listing(body) {
 
 ## Every object under `prefix`: [{ key, size }], following continuation tokens.
 export fn list_objects(c, prefix) {
-    # Pages are kept apart and joined once: adding each page to one growing
-    # list copies it every time, which is quadratic in a large bucket.
-    mut pages = []
+    mut out = []
     mut token = null
     while true {
         mut query = { "list-type": "2", prefix: prefix }
         if token != null { query = set(query, "continuation-token", token) }
         page = parse_listing(request(c, "GET", "", { query: query }).body)
-        pages = push(pages, page.objects)
+        out = out + page.objects
         unless page.truncated { break }
         token = page.token
         if token == null { break }
     }
-    flatten(pages)
+    out
 }
 
 # ---- Multipart ----------------------------------------------------------------
