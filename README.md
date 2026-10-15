@@ -320,6 +320,8 @@ ecko check --strict main.ecko src/*.ecko tests/*.ecko testkit/*.ecko
 A few checks only root can make, like restoring files to other owners, run
 in a throwaway container: `tests/root/run.sh` (needs Docker; builds a
 `scratch` image from your `ecko` and its libraries, downloads nothing).
+`tests/root/run.sh tests/*.ecko` runs the whole suite as root; cases that
+can't run as root report `SKIP`. CI runs both on every push.
 
 Tests run offline against `testkit/fake_s3.ecko`, an in-memory S3 server that
 checks signatures, payload hashes and `content-length` (S3 refuses a PUT or

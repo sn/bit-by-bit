@@ -1,0 +1,51 @@
+name: CI
+
+# Checks and tests every push and pull request, so a broken commit shows up
+# when it lands rather than when a release is cut. The root tests run the
+# suite again as root in a throwaway container (tests/root/run.sh), for the
+# checks only root can make, like restoring files to other owners.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Keep in step with release.yml.
+  ECKO_VERSION: v0.69.0
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ecko ${{ env.ECKO_VERSION }}
+        run: |
+          archive="ecko-x86_64-linux.tar.gz"
+          base="https://ecko.sh/dl/$ECKO_VERSION"
+          mkdir -p "$RUNNER_TEMP/ecko" && cd "$RUNNER_TEMP/ecko"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/$archive.sha256"
+          sha256sum -c "$archive.sha256"
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/ecko/ecko" >> "$GITHUB_PATH"
+
+      - name: Check
+        run: |
+          ecko --version
+          ecko check --strict main.ecko src/*.ecko tests/*.ecko testkit/*.ecko
+
+      - name: Test
+        run: ecko test --jobs 4
+
+      # tests/live needs real credentials and the network, so it stays out.
+      - name: Test as root
+        run: tests/root/run.sh tests/*.ecko
+
+      - name: Build
+        run: |
+          ecko build main.ecko -o bit-by-bit
+          ./bit-by-bit help > /dev/null

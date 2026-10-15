@@ -6,7 +6,9 @@ import "../src/scanner.ecko"
 # Builds:
 #   root/a.txt  root/skip.tmp  root/sub/b.txt  root/node_modules/x/y.js
 #   root/link -> a.txt  root/dirlink -> sub  root/fifo  root/locked/ (mode 000)
-fn tree() {
+# with_fifo: false leaves out the fifo, for cases that don't need it (the
+# scratch image tests/root/run.sh uses has no mkfifo).
+fn tree(with_fifo = true) {
     root = fs.join(fs.temp_dir(), "root")
     fs.mkdir(fs.join(root, "sub"))
     fs.mkdir(fs.join(root, "node_modules/x"))
@@ -18,7 +20,7 @@ fn tree() {
     fs.write(fs.join(root, "locked/secret.txt"), "s")
     fs.symlink("a.txt", fs.join(root, "link"))
     fs.symlink("sub", fs.join(root, "dirlink"))
-    proc.run("mkfifo", [fs.join(root, "fifo")])
+    if with_fifo { proc.run("mkfifo", [fs.join(root, "fifo")]) }
     fs.chmod(fs.join(root, "locked"), "000")
     root
 }
@@ -27,7 +29,12 @@ fn job(root, opts) = merge({ paths: [root], exclude: ["**/*.tmp", "**/node_modul
 
 fn rel(root, entries) = map(entries, fn(e) e.path[len(root) + 1..])
 
+fn skip_as_root() {
+    if fs.owner("/proc/self").uid == 0 { test.skip("root reads mode-000 folders, so none is unreadable") }
+}
+
 test.case("files, excludes, symlinks, specials, unreadable dirs", fn() {
+    skip_as_root()
     root = tree()
     r = scanner.scan(job(root, {}))
     fs.chmod(fs.join(root, "locked"), "755")
@@ -45,7 +52,7 @@ test.case("files, excludes, symlinks, specials, unreadable dirs", fn() {
 })
 
 test.case("follow_symlinks descends into linked dirs", fn() {
-    root = tree()
+    root = tree(false)
     fs.chmod(fs.join(root, "locked"), "755")
     r = scanner.scan(job(root, { follow_symlinks: true }))
     paths = rel(root, r.entries)
@@ -72,7 +79,7 @@ test.case("missing root is protected and a problem", fn() {
 })
 
 test.case("a single file as a root", fn() {
-    root = tree()
+    root = tree(false)
     fs.chmod(fs.join(root, "locked"), "755")
     r = scanner.scan(job(fs.join(root, "a.txt"), {}))
     test.eq(len(r.entries), 1)
@@ -130,6 +137,7 @@ test.case("the compiled exclude matcher agrees with fs.match", fn() {
 # Wide enough that the scan hands subtrees to parallel workers. The merged
 # result must be exactly what one walk would find.
 test.case("a wide tree scans completely, deep problems included", fn() {
+    skip_as_root()
     root = fs.join(fs.temp_dir(), "wide")
     mut want = []
     for i in 0..300 {
