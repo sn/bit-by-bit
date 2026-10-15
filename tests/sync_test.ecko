@@ -475,4 +475,74 @@ test.case("binary files survive byte-for-byte", fn() {
     test.eq(remote(env, "blob.bin").body, blob)
 })
 
+
+fn folder_lists() = sort(filter(keys(fake_s3.objects_()), fn(k) starts_with(k, "pc/_folders/t/")))
+fn folders_in(k) = sync.decode_folders(fake_s3.object(k).body)
+
+test.case("a run uploads the folder list, and again only when it changes", fn() {
+    env = setup()
+    fs.mkdir(fs.join(env.root, "empty"))
+    run(env)
+    test.eq(len(folder_lists()), 1)
+    got = folders_in(folder_lists()[0])
+    test.eq(map(got, fn(d) d.path), [env.root, env.root + "/empty", env.root + "/sub"])
+    own = fs.owner(env.root)
+    test.eq(got[0].owner, "{own.uid}:{own.gid}")
+    test.eq(state.dirs(env.db, "t"), got)
+    run(env)
+    test.eq(len(folder_lists()), 1)
+    fs.chmod(fs.join(env.root, "empty"), "700")
+    run(env)
+    test.eq(len(folder_lists()), 2)
+    test.eq(folders_in(last(folder_lists()))[1].mode, "700")
+})
+
+test.case("an unreadable folder keeps its subfolders from the last list", fn() {
+    # Root reads a mode-000 directory anyway.
+    if fs.owner("/proc/self").uid == 0 { test.skip("root reads mode-000 folders, so none is unreadable") }
+    env = setup()
+    fs.mkdir(fs.join(env.root, "locked/inner"))
+    run(env)
+    fs.chmod(fs.join(env.root, "locked"), "000")
+    o = run(env)
+    fs.chmod(fs.join(env.root, "locked"), "755")
+    test.eq(o.status, "partial")
+    paths = map(state.dirs(env.db, "t"), fn(d) d.path)
+    test.ok(contains(paths, env.root + "/locked/inner"), string(paths))
+    # fs.mode is octal without padding: 000 is "0".
+    test.eq(filter(state.dirs(env.db, "t"), fn(d) d.path == env.root + "/locked")[0].mode, "0")
+})
+
+test.case("a folder list that fails to upload is a problem, and the next run sends it", fn() {
+    env = setup()
+    fake_s3.fail_next("PUT", "/_folders/", 403, "AccessDenied", 1)
+    o = run(env)
+    test.eq(o.status, "partial")
+    test.ok(any(o.problems, fn(p) starts_with(p, "folder list: ")), string(o.problems))
+    test.eq([folder_lists(), state.dirs(env.db, "t")], [[], []])
+    run(env)
+    test.eq(len(folder_lists()), 1)
+})
+
+test.case("pruning folder lists keeps the newest from before the cutoff", fn() {
+    env = setup()
+    run(env)
+    fs.chmod(fs.join(env.root, "sub"), "700")
+    c2 = ctx(env, {})
+    sync.run(c2)
+    fs.chmod(fs.join(env.root, "sub"), "750")
+    run(env)
+    lists = folder_lists()
+    test.eq(len(lists), 3)
+    # Lists 1 and 2 are past keeping; 2 was still in force at the cutoff.
+    sync.prune(ctx(env, { now_ms: sync.run_ts_ms(c2.run_ts) + 1 + 30 * 86400000 }))
+    test.eq(folder_lists(), drop(lists, 1))
+})
+
+test.case("a dry run uploads no folder list", fn() {
+    env = setup()
+    sync.run(ctx(env, { dry_run: true }))
+    test.eq(folder_lists(), [])
+})
+
 fake_s3.stop()

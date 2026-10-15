@@ -25,6 +25,9 @@ export fn owner_of(path) {
 
 fn file_entry(path) = { path: path, kind: "file", size: fs.size(path), mtime: fs.modified(path), mode: fs.mode(path), owner: owner_of(path), target: null }
 
+# A folder's own attributes, or null if it vanished before they were read.
+fn dir_entry(path) = try { { path: path, mode: fs.mode(path), owner: owner_of(path), mtime: fs.modified(path) } } catch (e) { null }
+
 # A directory is pruned when it matches a pattern, or when a "/**" pattern
 # matches the directory itself (so "**/node_modules/**" skips the whole tree).
 fn prune_patterns(patterns) = patterns + map(filter(patterns, fn(p) ends_with(p, "/**")), fn(p) p[..len(p) - 3])
@@ -34,7 +37,7 @@ fn prune_patterns(patterns) = patterns + map(filter(patterns, fn(p) ends_with(p,
 let SPLIT_AT = 256
 let SPLIT_CHUNK = 8
 
-fn empty_result(seen) = { entries: [], problems: [], protected: [], skipped: 0, pending: [], seen: seen }
+fn empty_result(seen) = { entries: [], dirs: [], problems: [], protected: [], skipped: 0, pending: [], seen: seen }
 
 # Walk breadth-first from `dirs`, classifying everything below them. With
 # `limit`, stop once that many directories are waiting and return them
@@ -42,6 +45,7 @@ fn empty_result(seen) = { entries: [], problems: [], protected: [], skipped: 0, 
 # already entered (follow_symlinks only), so a loop is entered once.
 fn walk(dirs, job, excluded, pruned, limit, seen_in) {
     mut entries = []
+    mut dirs_found = []
     mut problems = []
     mut protected = []
     mut skipped = 0
@@ -107,6 +111,10 @@ fn walk(dirs, job, excluded, pruned, limit, seen_in) {
             if has(seen, real) { continue }
             seen = set(seen, real, true)
         }
+        # Read before listing: a folder that can't be listed still has a mode
+        # and an owner to restore.
+        d = dir_entry(dir)
+        if d != null { dirs_found = push(dirs_found, d) }
         children = try { fs.list_dir(dir) } catch (e) {
             problems = push(problems, "{dir}: unreadable directory: " + string(get(e, "message")))
             protected = push(protected, dir)
@@ -118,17 +126,19 @@ fn walk(dirs, job, excluded, pruned, limit, seen_in) {
             if sub != null { queue = push(queue, sub) }
         }
     }
-    { entries: entries, problems: problems, protected: protected, skipped: skipped, pending: drop(queue, i), seen: seen }
+    { entries: entries, dirs: dirs_found, problems: problems, protected: protected, skipped: skipped, pending: drop(queue, i), seen: seen }
 }
 
 fn merge_results(a, b) = {
-    entries: a.entries + b.entries, problems: a.problems + b.problems, protected: a.protected + b.protected,
+    entries: a.entries + b.entries, dirs: a.dirs + b.dirs, problems: a.problems + b.problems, protected: a.protected + b.protected,
     skipped: a.skipped + b.skipped, pending: a.pending + b.pending, seen: a.seen,
 }
 
 ## Scan a job's paths. Never raises for filesystem problems; returns
 ## {
 ##   entries:   [{ path, kind: "file" | "symlink", size, mtime, mode, owner, target }]
+##   dirs:      [{ path, mode, owner, mtime }] - every folder walked, the roots
+##                                   and empty folders included
 ##   problems:  [String]           - things that make the run "partial"
 ##   protected: [String]           - roots/dirs that could not be read; nothing
 ##                                   under them may be deleted remotely
@@ -170,7 +180,7 @@ export fn scan(job) {
         }
     }
     {
-        entries: sort_by(out.entries, fn(e) e.path), problems: sort(out.problems),
+        entries: sort_by(out.entries, fn(e) e.path), dirs: sort_by(out.dirs, fn(d) d.path), problems: sort(out.problems),
         protected: sort(out.protected), skipped: out.skipped,
     }
 }

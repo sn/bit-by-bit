@@ -44,13 +44,16 @@ fn setup() {
 }
 
 fn go(env, j) = runner.run_job(env.cfg, j, env.db, { dry_run: false, should_stop: fn() false })
-fn current_keys() = sort(filter(keys(fake_s3.objects_()), fn(k) not contains(k, "/_versions/")))
+fn current_keys() = sort(filter(keys(fake_s3.objects_()), fn(k) not contains(k, "/_versions/") and not contains(k, "/_folders/")))
+fn folder_keys() = filter(keys(fake_s3.objects_()), fn(k) contains(k, "/_folders/"))
 fn version_keys() = filter(keys(fake_s3.objects_()), fn(k) contains(k, "/_versions/"))
 
 test.case("jobs with different folders may share a prefix", fn() {
     env = setup()
     test.eq([go(env, env.docs).status, go(env, env.pics).status], ["ok", "ok"])
     test.eq(current_keys(), sort(["pc" + env.docs_root + "/a.txt", "pc" + env.pics_root + "/p.jpg"]))
+    # Each job keeps its own folder list.
+    test.eq(map(sort(folder_keys()), fn(k) split(k, "/")[2]), ["docs", "pics"])
 })
 
 test.case("rebuilding one job's index leaves the other job's files alone", fn() {

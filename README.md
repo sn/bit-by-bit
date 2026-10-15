@@ -4,7 +4,7 @@ Incremental backups of a Linux machine to S3-compatible object storage (AWS S3,
 Google Cloud Storage, Cloudflare R2, Backblaze B2, MinIO, Wasabi), run as a
 systemd service. Written in [Ecko](https://ecko.sh).
 
-![The dashboard: two backup jobs, one part-way through a run with a progress bar and one whose last run had problems, each with its source, destination and schedule, its last good backup, last and next run, and recent runs](.github/dashboard.png)
+![The dashboard: two backup jobs, one part-way through a run with a progress bar and one whose last run had problems, each with its source, destination, schedule and when its backup was last checked, its last good backup, last and next run, and recent runs](.github/dashboard.png)
 
 - Each local file becomes one object, and only changed files are uploaded.
 - Before a remote file is overwritten or deleted, the old copy is moved under
@@ -18,6 +18,11 @@ systemd service. Written in [Ecko](https://ecko.sh).
   up from it (an unmounted drive).
 - Changing a job's destination or prefix triggers a full upload to the new
   place.
+- Folders are backed up too, empty ones included: a restore gives them back
+  their mode, owner and modification time.
+- Once a week the daemon checks that the bucket still holds every file it
+  backed up, and downloads a few at random to check their content. Anything
+  missing or wrong is uploaded again by the next run.
 - Server-side encryption is on by default, and every request goes over HTTPS.
 
 ## Install
@@ -170,6 +175,17 @@ See `deploy/config.example.json`. The full field reference is in
   `uid:gid`) are backed up. A change of either alone (`chmod`, `chown`) is
   backed up by updating the object's metadata, without uploading the file
   again.
+- **Checking the backup:** `"verify": { "every": "7d", "sample": 10 }` is the
+  default. After a run that worked, if the last check is older than `every`
+  (at least `1h`), the daemon lists the bucket once and checks that every
+  backed-up file is there at its size, and that the folder list is.
+  It then downloads `sample` files picked at random, up to 256 MiB each, and
+  checks them against their SHA-256 (`0` skips the downloads). Whatever is
+  missing or wrong is dropped from the state database, so the next run
+  uploads it again if it's still on the machine. A check that finds problems
+  makes `/healthz` unhealthy until a later one passes; run
+  `bit-by-bit verify <job>` after the next run to clear it sooner. `"verify":
+  false` turns checking off. The listing costs one request per 1,000 objects.
 - **Problems:** a run counts every problem, and keeps the text of the first
   1,000 for `status` and the dashboard. The log has all of them.
 
@@ -235,6 +251,7 @@ The secret goes straight into the credentials file without being printed.
 ```bash
 bit-by-bit status                      # last run, next run and problems for each job
 bit-by-bit run home                    # run a job now (exit 0 ok, 2 partial, 1 failed)
+bit-by-bit verify home                 # check the bucket holds the backup (exit 1 if not)
 bit-by-bit ls home --at 2026-10-01T12:00:00Z
 bit-by-bit restore home --path /home/me/Documents --to /tmp/restore
 bit-by-bit restore home --at 2026-10-01T12:00:00Z
@@ -251,8 +268,15 @@ Files download several at a time; symlinks are
 created after every file, and nothing is ever written through a symlink, so a
 tampered bucket can't make a restore write outside `--to`.
 
-**Not backed up:** empty directories, directory permissions and owners, and
-the owners of symlinks. Hard links are uploaded once per name.
+Folders come back last, from the folder list in force at `--at`: missing ones,
+empty folders included, are created, then get their mode and modification
+time (and, as root, their owner). A folder that was already there is left as
+it is unless you pass `--overwrite`. Jobs backed up before 0.10 have no folder
+list until their next run; until then, restored folders get default
+permissions, as before.
+
+**Not backed up:** the owners of symlinks. Hard links are uploaded once per
+name.
 
 ## State
 
@@ -262,9 +286,9 @@ whose size and mtime match its row there is not uploaded again, and the bucket
 is not checked for it.
 
 **So don't delete or change objects in the bucket by hand.** Anything removed
-behind bit-by-bit's back stays missing until the local file changes. If the
-bucket and the database disagree, or the database is lost, rebuild it from
-the bucket:
+behind bit-by-bit's back stays missing until the next check finds it (weekly
+by default, or `bit-by-bit verify`), and the run after that uploads it again.
+If the database is lost, rebuild it from the bucket:
 
 ```bash
 sudo bit-by-bit run home --rebuild-state   # only rebuilds the database, uploads nothing
@@ -281,9 +305,9 @@ The daemon can serve a read-only status page. It's off unless the config has:
 
 | URL | What |
 |---|---|
-| `http://127.0.0.1:8484/` | Each job's status, live progress of a running backup (files done of planned, data, files/s since the scan finished and time left, saved about once a second), how long ago its last good backup finished, when it runs next, its schedule and destination, the last run's changes, errors, problems and recent runs. Full-width, styled like a green-phosphor CRT terminal (scanlines and glow drop away when the system asks for more contrast). The tab icon, an upload arrow whose shaft breaks into bits, glows green when every backup is healthy and orange to red when one needs attention or the daemon can't be reached; a job whose last run had problems is noted beside the healthy badge without counting as unhealthy. Updates in place every 3 seconds while a backup runs and every 30 seconds otherwise (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
+| `http://127.0.0.1:8484/` | Each job's status, live progress of a running backup (files done of planned, data, files/s since the scan finished and time left, saved about once a second), how long ago its last good backup finished, when it runs next, its schedule and destination, when its backup was last checked (and what the check found), the last run's changes, errors, problems and recent runs. Full-width, styled like a green-phosphor CRT terminal (scanlines and glow drop away when the system asks for more contrast). The tab icon, an upload arrow whose shaft breaks into bits, glows green when every backup is healthy and orange to red when one needs attention or the daemon can't be reached; a job whose last run had problems is noted beside the healthy badge without counting as unhealthy. Updates in place every 3 seconds while a backup runs and every 30 seconds otherwise (keeping your scroll position, focus and open lists) while the tab is visible; "Pause updates" stops it. Without JavaScript, reload by hand. |
 | `/api/status` | The same data as JSON. |
-| `/healthz` | `200 ok`, or `503` listing why: a job's last run failed, it hasn't run for more than twice its interval, or its running backup has finished no file for that long (stalled). A long run that keeps finishing files, like a first backup, stays healthy. Point an uptime monitor at it. |
+| `/healthz` | `200 ok`, or `503` listing why: a job's last run failed, it hasn't run for more than twice its interval, its running backup has finished no file for that long (stalled), or the last check of its backup found problems. A long run that keeps finishing files, like a first backup, stays healthy, and so does a check that couldn't finish (it's tried again after the next run). Point an uptime monitor at it. |
 
 The page has no login, so it only binds to loopback addresses (`127.0.0.1`,
 `localhost`, `::1`). To reach it from elsewhere, use an SSH tunnel
@@ -297,7 +321,15 @@ restart.
 ```
 <prefix>/<absolute local path>                       current copy
 <prefix>/_versions/<run time>/<absolute local path>  copy moved aside by that run
+<prefix>/_folders/<job>/<run time>.json.gz           the job's folders, from that run
 ```
+
+A run uploads a new folder list only when a folder was added, removed or
+changed (mode, owner or modification time; adding or removing a file
+changes its folder's time). Each list is gzipped JSON of every folder's path,
+`mode`, `owner` and `mtime`, about 8 bytes a folder: 2.4 MB for 300,000.
+Lists are pruned with the versions, except the newest one from before the
+cutoff, which is still in force there. Renaming a job starts a new list.
 
 Objects carry `x-amz-meta-bbb-sha256`, `-mtime`, `-mode`, `-owner` and
 `-run`. Symlinks are stored as empty objects with `x-amz-meta-bbb-symlink`.

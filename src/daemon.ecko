@@ -85,7 +85,14 @@ fn serve(first_cfg, config_path) {
                         logging.emit("error", "can't open the state database: " + string(get(e, "message") ?? e), { job: job.name })
                         return null
                     }
-                    try { runner.run_job(run_cfg, job, job_db, { dry_run: false, should_stop: should_stop }) } finally { state.close(job_db) }
+                    try {
+                        o = runner.run_job(run_cfg, job, job_db, { dry_run: false, should_stop: should_stop })
+                        # Checked right after a run that worked, against the index it just updated.
+                        worked = o.status == "ok" or o.status == "partial"
+                        if worked and not should_stop() and runner.verify_due(job, job_db, time.now()) {
+                            runner.verify_job(run_cfg, job, job_db, { sample: null, should_stop: should_stop })
+                        }
+                    } finally { state.close(job_db) }
                 }))
             } else {
                 due_times = push(due_times, due)

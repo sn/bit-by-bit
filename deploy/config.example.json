@@ -22,7 +22,8 @@
       "paths": ["/home/me/Documents", "/home/me/Pictures"],
       "exclude": ["**/node_modules/**", "**/.cache/**", "**/*.tmp"],
       "schedule": { "every": "6h" },
-      "keep_versions_days": 30
+      "keep_versions_days": 30,
+      "verify": { "every": "7d", "sample": 10 }
     }
   ]
 }

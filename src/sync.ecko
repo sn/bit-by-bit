@@ -2,6 +2,8 @@ import std.fs
 import std.hash
 import std.time
 import std.sql
+import std.json
+import std.zlib
 import "./s3.ecko"
 import "./state.ecko"
 import "./scanner.ecko"
@@ -27,6 +29,55 @@ export fn current_key(job, path) = job.prefix + path
 
 ## Remote key of the copy of `path` moved aside during run `run_ts`.
 export fn version_key(job, run_ts, path) = job.prefix + "/_versions/" + run_ts + path
+
+# ---- folder lists -------------------------------------------------------------------
+# A run uploads the job's folders (mode, owner, modification time) as one
+# gzipped JSON object, when they changed since the last one. Restore uses the
+# list in force at --at to create empty folders and set folders' attributes.
+
+## Where a job's folder lists live: one object per run that changed them.
+export fn folders_prefix(job) = job.prefix + "/_folders/" + job.name + "/"
+
+export fn folders_key(job, run_ts) = folders_prefix(job) + run_ts + ".json.gz"
+
+## A folder list as the object's body.
+export fn encode_folders(job, dirs) = zlib.gzip(bytes(json.encode({ job: job.name, paths: job.paths, folders: dirs })))
+
+## The folders in a folder list's body: [{ path, mode, owner, mtime }].
+export fn decode_folders(body) = json.decode(string(zlib.gunzip(body))).folders
+
+## A job's folder lists, oldest first: [{ key, ms }].
+export fn folder_lists(c, job) {
+    pre = folders_prefix(job)
+    found = map(s3.list_objects(c, pre), fn(o) {
+        name = o.key[len(pre)..]
+        unless ends_with(name, ".json.gz") { return null }
+        ms = try { run_ts_ms(name[..len(name) - 8]) } catch (e) { null }
+        if ms == null { null } else { { key: o.key, ms: ms } }
+    })
+    sort_by(filter(found, fn(x) x != null), fn(x) x.ms)
+}
+
+## The folders in the list in force at `at_ms` (the newest at or before it;
+## with null, the newest of all), or [] when there is none.
+export fn folders_at(c, job, at_ms) {
+    lists = filter(folder_lists(c, job), fn(x) at_ms == null or x.ms <= at_ms)
+    if len(lists) == 0 { [] } else { decode_folders(s3.get_object(c, last(lists).key)) }
+}
+
+# Upload the run's folder list if it changed, then record it as uploaded.
+# Returns a problem message, or null.
+fn save_folders(ctx, fp) {
+    unless fp.changed { return null }
+    try {
+        body = encode_folders(ctx.job, fp.dirs)
+        s3.put_object(ctx.client, folders_key(ctx.job, ctx.run_ts), body, { run: ctx.run_ts })
+        state.replace_dirs(ctx.db, ctx.job.name, fp.dirs)
+        null
+    } catch (e) {
+        "folder list: " + string(get(e, "message") ?? e)
+    }
+}
 
 ## "YYYYMMDDTHHMMSS.mmmZ" for a unix-millis timestamp. Milliseconds keep two
 ## runs started in the same second from writing to the same version folder.
@@ -275,6 +326,17 @@ export fn prune(ctx) {
             problems = push(problems, "prune {o.key}: " + string(get(e, "message")))
         }
     }
+    # Folder lists too, except the newest one from before the cutoff: it is
+    # still the one in force at the cutoff, which a restore may ask for.
+    old = filter(folder_lists(ctx.client, ctx.job), fn(x) x.ms <= cutoff)
+    for x in take(old, len(old) - 1) {
+        try {
+            s3.delete_object(ctx.client, x.key)
+            pruned = pruned + 1
+        } catch (e) {
+            problems = push(problems, "prune {x.key}: " + string(get(e, "message")))
+        }
+    }
     { pruned: pruned, problems: problems }
 }
 
@@ -292,6 +354,7 @@ fn check_target(ctx) {
     if old != null and old != fp {
         ctx.log("warn", "destination or prefix changed - uploading everything again", { from: old, to: fp })
         state.replace_index(ctx.db, ctx.job.name, [])
+        state.replace_dirs(ctx.db, ctx.job.name, [])
     }
     if old != fp { state.set_target(ctx.db, ctx.job.name, fp) }
 }
@@ -305,10 +368,12 @@ export fn run_job(ctx) {
     sc = planner.guard_empty_roots(scanner.scan(ctx.job), index, ctx.job.paths)
     for p in sc.problems { ctx.log("warn", p, {}) }
     p = planner.plan(sc, index)
-    ctx.log("info", "planned", { actions: len(p.actions), unchanged: p.unchanged, skipped: sc.skipped })
+    fp = planner.plan_dirs(sc.dirs, state.dirs(ctx.db, ctx.job.name), sc.protected)
+    ctx.log("info", "planned", { actions: len(p.actions), unchanged: p.unchanged, skipped: sc.skipped, folders: len(fp.dirs) })
     mut totals = add_problems(no_totals(), sc.problems)
     if ctx.dry_run {
         for a in p.actions { ctx.log("info", "would " + a.op, { path: a.path }) }
+        if fp.changed { ctx.log("info", "would upload the folder list", { folders: len(fp.dirs) }) }
         return merge(totals, { status: "ok", error: null })
     }
     if len(p.remember) > 0 { state.set_attrs(ctx.db, ctx.job.name, p.remember) }
@@ -392,6 +457,13 @@ export fn run_job(ctx) {
     stopped = done < len(p.actions)
     if stopped {
         return merge(totals, { status: "failed", error: "stopped before finishing (shutdown requested)" })
+    }
+    # Only a run that got through its files saves a folder list: a stopped or
+    # failed one has returned above, and the next run tries again.
+    fl = save_folders(ctx, fp)
+    if fl != null {
+        ctx.log("warn", fl, {})
+        totals = add_problems(totals, [fl])
     }
     pr = try { prune(ctx) } catch (e) { { pruned: 0, problems: ["prune: " + string(get(e, "message"))] } }
     totals = add_problems(set(totals, "pruned", pr.pruned), pr.problems)

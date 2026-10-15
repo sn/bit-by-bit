@@ -74,6 +74,38 @@ fn cmd_run(a) {
     worst
 }
 
+fn cmd_verify(a) {
+    cfg = load_or_exit(args.flag(a, "config", args.DEFAULT_CONFIG))
+    jobs = if len(a.positional) == 0 { cfg.jobs } else { map(a.positional, fn(n) find_job(cfg, n)) }
+    sample_text = args.flag(a, "sample", null)
+    sample = if sample_text == null { null } else {
+        n = try { int(sample_text) } catch (e) { -1 }
+        if n < 0 {
+            print("--sample must be a whole number, 0 or more")
+            os.exit(64)
+        }
+        n
+    }
+    unless fs.exists(cfg.state_dir) { fs.mkdir(cfg.state_dir) }
+    db = state.open(cfg.state_dir)
+    mut worst = 0
+    for j in jobs {
+        v = runner.verify_job(cfg, j, db, { sample: sample, should_stop: fn() false })
+        match v.status {
+            "ok" => print("{j.name}: ok  all {v.checked} file(s) in the bucket, {v.sampled} downloaded and matching")
+            "failed" => print("{j.name}: failed  {v.problem_count} problem(s) in {v.checked} file(s)")
+            _ => print("{j.name}: {v.status}  {v.error}")
+        }
+        for p in v.problems { print("  problem: " + p) }
+        hidden = v.problem_count - len(v.problems)
+        if hidden > 0 { print("  ... and {hidden} more problems (only the first {len(v.problems)} are kept)") }
+        if v.repaired > 0 { print("  removed {v.repaired} from the index: the next run uploads them again if they're still here") }
+        if v.extra > 0 { print("  {v.extra} object(s) in the bucket aren't in the index yet; the next run sorts them out") }
+        unless v.status == "ok" { worst = 1 }
+    }
+    worst
+}
+
 fn cmd_status(a) {
     cfg = load_or_exit(args.flag(a, "config", args.DEFAULT_CONFIG))
     db = state.open(cfg.state_dir)
@@ -109,7 +141,7 @@ fn cmd_restore(a) {
         # null: the default, set owners when running as root.
         chown: if args.flag(a, "no-chown", false) { false } else { null },
     })
-    print("restored {r.restored} file(s) to {to}")
+    print("restored {r.restored} file(s) and {r.folders} folder(s) to {to}")
     for s in r.skipped { print("  skipped: " + s) }
     for f in r.failed { print("  failed: " + f) }
     if len(r.failed) > 0 { 1 } else { 0 }
@@ -129,6 +161,7 @@ fn main() {
         match a.command {
             "daemon" => daemon.run(args.flag(a, "config", args.DEFAULT_CONFIG))
             "run" => cmd_run(a)
+            "verify" => cmd_verify(a)
             "status" => cmd_status(a)
             "ls" => cmd_ls(a)
             "restore" => cmd_restore(a)

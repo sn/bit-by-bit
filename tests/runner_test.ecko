@@ -83,6 +83,17 @@ test.case("rebuild_state recreates the index from the bucket", fn() {
     test.eq([o.uploaded, o.replaced, o.touched], [0, 0, 0])
 })
 
+test.case("rebuild_state also takes the newest folder list from the bucket", fn() {
+    env = setup()
+    fs.mkdir(fs.join(env.root, "empty"))
+    go(env)
+    want = state.dirs(env.db, "home")
+    state.replace_dirs(env.db, "home", [])
+    runner.rebuild_state(env.cfg, env.job, env.db)
+    test.eq(state.dirs(env.db, "home"), want)
+    test.eq(map(want, fn(d) d.path), [env.root, env.root + "/empty"])
+})
+
 test.case("rebuild_state reads object metadata several at a time", fn() {
     env = setup()
     for i in 0..6 { fs.write(fs.join(env.root, "f{i}.txt"), "file {i}") }

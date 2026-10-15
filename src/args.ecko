@@ -1,5 +1,5 @@
-let COMMANDS = ["daemon", "run", "status", "ls", "restore", "check-config", "help"]
-let VALUE_FLAGS = ["config", "path", "at", "to"]
+let COMMANDS = ["daemon", "run", "verify", "status", "ls", "restore", "check-config", "help"]
+let VALUE_FLAGS = ["config", "path", "at", "to", "sample"]
 let BOOL_FLAGS = ["dry-run", "rebuild-state", "json", "overwrite", "no-chown", "help"]
 
 export let DEFAULT_CONFIG = "/etc/bit-by-bit/config.json"
@@ -10,6 +10,7 @@ export let USAGE = """
     usage:
       bit-by-bit daemon        [--config P]                  run the scheduler (systemd entry point)
       bit-by-bit run [job...]  [--config P] [--dry-run] [--rebuild-state]
+      bit-by-bit verify [job...] [--config P] [--sample N]
       bit-by-bit status        [--config P] [--json]         last run per job, next due, problems
       bit-by-bit ls <job>      [--path SUB] [--at TS]        list what a restore would produce
       bit-by-bit restore <job> [--path SUB] [--at TS] [--to DIR] [--overwrite] [--no-chown]
@@ -19,8 +20,11 @@ export let USAGE = """
     time such as 2026-10-12T14:00:00Z or 2026-10-12T16:00:00+02:00.
     Run as root, restore gives files their backed-up owners (by number);
     --no-chown leaves them owned by root.
+    verify checks the bucket holds every backed-up file at its size, and
+    downloads N random ones (--sample; default the job's verify.sample,
+    10) to check their content. --sample 0 checks presence and size only.
 
-    exit codes: 0 ok, 1 failed, 2 partial, 64 usage or config error
+    exit codes: 0 ok, 1 failed (verify: problems found), 2 partial, 64 usage or config error
 """
 
 ## Parse argv into { command, positional: [String], flags: {name: String | Bool} }.

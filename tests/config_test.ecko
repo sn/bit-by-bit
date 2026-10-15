@@ -80,12 +80,30 @@ test.case("nested prefixes on one destination", fn() {
     test.ok(has_error(r, "nested prefixes"), string(r.errors))
 })
 
-test.case("duplicate job names and /_versions paths", fn() {
+test.case("duplicate job names and /_versions and /_folders paths", fn() {
     j1 = base().jobs[0]
-    j2 = merge(j1, { prefix: "other", paths: ["/_versions/x"] })
+    j2 = merge(j1, { prefix: "other", paths: ["/_versions/x", "/_folders"] })
     r = config.validate(merge(base(), { jobs: [j1, j2] }))
     test.ok(has_error(r, "duplicate job name 'home'"), "dup")
-    test.ok(has_error(r, "collide with the version history prefix"), "versions")
+    test.ok(has_error(r, "paths under /_versions would collide"), "versions")
+    test.ok(has_error(r, "paths under /_folders would collide"), "folders")
+})
+
+test.case("verify defaults to weekly with 10 files, and false turns it off", fn() {
+    r = config.validate(base())
+    test.eq(r.config.jobs[0].verify, { every_ms: 7 * 86400000, sample: 10 })
+    off = config.validate(merge(base(), { jobs: [merge(base().jobs[0], { verify: false })] }))
+    test.eq([off.errors, off.config.jobs[0].verify], [[], null])
+    set_ = config.validate(merge(base(), { jobs: [merge(base().jobs[0], { verify: { every: "1d", sample: 0 } })] }))
+    test.eq(set_.config.jobs[0].verify, { every_ms: 86400000, sample: 0 })
+})
+
+test.case("verify settings are checked", fn() {
+    bad = fn(v) config.validate(merge(base(), { jobs: [merge(base().jobs[0], { verify: v })] }))
+    test.ok(has_error(bad({ every: "10m" }), "verify.every: must be at least 1h"), "too often")
+    test.ok(has_error(bad({ sample: -1 }), "verify.sample: must be an integer from 0 to 10000"), "sample")
+    test.ok(has_error(bad({ often: "1d" }), "verify.often: unknown key"), "unknown key")
+    test.ok(has_error(bad(true), "verify: must be an object, or false"), "true")
 })
 
 test.case("missing path is a warning, not an error", fn() {

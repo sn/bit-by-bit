@@ -17,7 +17,28 @@ export fn size_text(n) {
     if u == 0 { "{n} B" } else { fmt.fixed(v, 1) + " " + units[u] }
 }
 
-## One map per job: { job, status, started_at, finished_at, next_due, counts, error, problems }.
+## The last check of a job's backup, as the dashboard and status show it:
+## null when there has been none.
+export fn check_view(v) = if v == null { null } else {
+    {
+        status: v.status, at: v.started_at, checked: v.checked, sampled: v.sampled,
+        problems: v.problem_list, problem_count: v.problems, error: v.error,
+    }
+}
+
+## One line about the last check, or null when checking is off and there
+## has never been one.
+export fn check_text(check, on) {
+    if check == null { return if on { "not checked yet" } else { null } }
+    at = at_text(check.at)
+    match check.status {
+        "ok" => "checked {at}: all {check.checked} file(s) there, {check.sampled} downloaded and matching"
+        "failed" => "checked {at}: {check.problem_count} problem(s), see `bit-by-bit verify`"
+        _ => "checked {at}: couldn't finish: {check.error}"
+    }
+}
+
+## One map per job: { job, status, started_at, finished_at, next_due, counts, error, problems, check, check_on }.
 export fn collect(cfg, db, now) = map(cfg.jobs, fn(job) {
     runs = state.recent_runs(db, job.name, 10)
     last = first(runs)
@@ -35,6 +56,8 @@ export fn collect(cfg, db, now) = map(cfg.jobs, fn(job) {
         error: if last == null { null } else { last.error },
         problems: if last == null { [] } else { last.problem_list },
         problem_count: if last == null { 0 } else { last.problems },
+        check: check_view(state.last_verify(db, job.name)),
+        check_on: job.verify != null,
     }
 })
 
@@ -49,6 +72,8 @@ export fn render(rows, now) {
             out = push(out, "  uploaded {r.uploaded}, replaced {r.replaced}, deleted {r.deleted}, {size}")
         }
         if r.error != null { out = push(out, "  error: {r.error}") }
+        checked = check_text(get(r, "check"), get(r, "check_on") ?? false)
+        if checked != null { out = push(out, "  " + checked) }
         for p in take(r.problems, 5) { out = push(out, "  problem: {p}") }
         total = max([get(r, "problem_count") ?? 0, len(r.problems)])
         if total > 5 {

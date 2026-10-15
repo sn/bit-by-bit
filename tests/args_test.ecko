@@ -28,6 +28,13 @@ test.case("restore can be told not to set owners", fn() {
     test.ok(contains(args.USAGE, "--no-chown"), "listed in the usage")
 })
 
+test.case("verify takes jobs and a sample size", fn() {
+    a = args.parse(["verify", "home", "--sample", "0"])
+    test.eq([a.command, a.positional, args.flag(a, "sample", null)], ["verify", ["home"], "0"])
+    test.eq(args.parse(["verify"]).positional, [])
+    test.ok(contains(args.USAGE, "bit-by-bit verify"), "listed in the usage")
+})
+
 test.case("usage errors", fn() {
     test.err(fn() args.parse(["frobnicate"]), "unknown command")
     test.err(fn() args.parse(["run", "--bogus"]), "unknown option")
@@ -39,4 +46,17 @@ test.case("size_text", fn() {
     test.eq(status.size_text(0), "0 B")
     test.eq(status.size_text(1536), "1.5 KiB")
     test.eq(status.size_text(5 * 1048576), "5.0 MiB")
+})
+
+test.case("status says when the backup was last checked", fn() {
+    test.eq(status.check_text(null, true), "not checked yet")
+    test.eq(status.check_text(null, false), null)
+    ok = { status: "ok", at: 1791820438000, checked: 12, sampled: 3, problems: [], problem_count: 0, error: null }
+    test.ok(ends_with(status.check_text(ok, true), ": all 12 file(s) there, 3 downloaded and matching"), status.check_text(ok, true))
+    bad = merge(ok, { status: "failed", problem_count: 2 })
+    test.ok(ends_with(status.check_text(bad, true), ": 2 problem(s), see `bit-by-bit verify`"), status.check_text(bad, true))
+    test.ok(contains(status.render([{
+        job: "home", status: "ok", started_at: null, finished_at: null, next_due: 0, uploaded: 0, replaced: 0,
+        deleted: 0, bytes: 0, error: null, problems: [], problem_count: 0, check: ok, check_on: true,
+    }], 1), "  checked "), "in the status output")
 })

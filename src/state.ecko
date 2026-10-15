@@ -10,6 +10,9 @@ let SCHEMA = [
     "create index if not exists runs_job_started on runs (job, started_at)",
     "create table if not exists multipart (job text not null, key text not null, upload_id text not null, primary key (job, key, upload_id))",
     "create table if not exists targets (job text primary key, fingerprint text not null)",
+    "create table if not exists dirs (job text not null, path text not null, mode text, owner text, mtime integer, primary key (job, path))",
+    "create table if not exists verifies (id integer primary key autoincrement, job text not null, started_at integer not null, finished_at integer not null, status text not null, checked integer not null default 0, sampled integer not null default 0, extra integer not null default 0, problems integer not null default 0, problem_list text, error text)",
+    "create index if not exists verifies_job_started on verifies (job, started_at)",
 ]
 
 ## Open (creating if needed) the state database in `state_dir`.
@@ -61,6 +64,11 @@ export fn set_attrs(db, job, rows) = sql.transaction(db, fn(tx) {
 
 export fn remove_file(db, job, path) = sql.exec(db, "delete from files where job = ? and path = ?", [job, path])
 
+## Remove several files from the index in one transaction.
+export fn remove_files(db, job, paths) = sql.transaction(db, fn(tx) {
+    for p in paths { remove_file(tx, job, p) }
+})
+
 ## Record a new mtime, mode and owner for a file whose content did not change.
 export fn touch_file(db, job, path, mtime, mode = null, owner = null) =
     sql.exec(db, "update files set mtime = ?, mode = coalesce(?, mode), owner = coalesce(?, owner) where job = ? and path = ?", [mtime, mode, owner, job, path])
@@ -69,6 +77,18 @@ export fn touch_file(db, job, path, mtime, mode = null, owner = null) =
 export fn replace_index(db, job, rows) = sql.transaction(db, fn(tx) {
     sql.exec(tx, "delete from files where job = ?", [job])
     for r in rows { put_file(tx, job, r) }
+})
+
+# ---- folders --------------------------------------------------------------------
+
+## The folder list last uploaded for a job, sorted by path:
+## [{ path, mode, owner, mtime }].
+export fn dirs(db, job) = sql.query(db, "select path, mode, owner, mtime from dirs where job = ? order by path", [job])
+
+## Replace a job's folder list, once the bucket has the same list.
+export fn replace_dirs(db, job, rows) = sql.transaction(db, fn(tx) {
+    sql.exec(tx, "delete from dirs where job = ?", [job])
+    for r in rows { sql.exec(tx, "insert into dirs (job, path, mode, owner, mtime) values (?, ?, ?, ?, ?)", [job, r.path, r.mode, r.owner, r.mtime]) }
 })
 
 # ---- destination fingerprint ----------------------------------------------------
@@ -131,6 +151,24 @@ export fn mark_interrupted(db, now, busy = []) {
         n = n + sql.exec(db, "update runs set status = 'failed', finished_at = ?, error = 'interrupted: the process stopped before the run finished' where id = ?", [now, r.id])
     }
     n
+}
+
+# ---- verification ---------------------------------------------------------------
+
+## Record one verification. v: { started_at, finished_at, status: "ok" |
+## "failed" (found problems) | "error" (could not finish), checked, sampled,
+## extra, problems: [String], problem_count, error }.
+export fn add_verify(db, job, v) =
+    sql.exec(db, "insert into verifies (job, started_at, finished_at, status, checked, sampled, extra, problems, problem_list, error) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [job, v.started_at, v.finished_at, v.status, v.checked, v.sampled, v.extra, problem_total(v), json.encode(v.problems), v.error])
+
+## The most recent verification of a job (any status), or null.
+export fn last_verify(db, job) = decode_run(sql.query_one(db, "select * from verifies where job = ? order by started_at desc, id desc limit 1", [job]))
+
+## When the job's newest verification that finished (ok or failed) started, or null.
+export fn last_verified_at(db, job) {
+    row = sql.query_one(db, "select max(started_at) as at from verifies where job = ? and status in ('ok', 'failed')", [job])
+    if row == null { null } else { row.at }
 }
 
 # ---- multipart bookkeeping -------------------------------------------------------------

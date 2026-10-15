@@ -166,19 +166,63 @@ fn restore_link(l, to, overwrite) {
 
 fn guarded(path, f) = try { f() } catch (e) { { status: "failed", message: path + ": " + string(get(e, "message") ?? e) } }
 
+# Create one folder from the folder list, unless it is already there.
+fn make_folder(d, to) {
+    if unsafe(d.path) { return { status: "failed", message: "{d.path}: unsafe path, refusing to restore it" } }
+    link = linked_parent(to, d.path)
+    if link != null { return { status: "failed", message: "{d.path}: {link} is a symlink, refusing to restore through it" } }
+    target = to + d.path
+    if fs.is_symlink(target) { return { status: "failed", message: "{target}: is a symlink, refusing to restore through it" } }
+    if fs.exists(target) {
+        unless fs.is_dir(target) { return { status: "failed", message: "{target}: exists and is not a folder" } }
+    } else {
+        fs.mkdir(target)
+    }
+    { status: "restored" }
+}
+
+# Give a folder its backed-up owner, mode and modification time, in that
+# order: a chown clears setgid, and anything written inside a folder changes
+# its time.
+fn folder_attrs(d, to, chown) {
+    target = to + d.path
+    if chown and d.owner != null { set_owner(target, d.owner) }
+    if d.mode != null { fs.chmod(target, d.mode) }
+    if d.mtime != null { fs.set_modified(target, d.mtime) }
+    { status: "restored" }
+}
+
+# Folders come back after the files and links. Missing ones, empty folders
+# among them, are created shallowest first; then owners, modes and times are
+# set deepest first, so a folder made read-only never stops the one inside it
+# being set. Folders that were there before the restore are left as they
+# are, unless overwrite.
+fn restore_folders(folders, existed, to, overwrite, chown) {
+    mine = filter(folders, fn(d) overwrite or not has(existed, d.path))
+    made = map(mine, fn(d) [d, guarded(d.path, fn() make_folder(d, to))])
+    ready = map(filter(made, fn(m) m[1].status == "restored"), fn(m) m[0])
+    set_up = map(reverse(ready), fn(d) guarded(d.path, fn() folder_attrs(d, to, chown)))
+    filter(map(made, fn(m) m[1]), fn(r) r.status != "restored") + set_up
+}
+
 ## Restore files. opts: { path, at_ms, to, overwrite, oldest_ms, concurrency, chown }
 ## `oldest_ms` is how far back version history reaches (now - keep_versions_days).
 ## Files download `concurrency` at a time. Symlinks are created afterwards,
 ## one at a time, so no file is ever written through a link this restore made.
-## Files get their backed-up owners when `chown` is on, which it is by
-## default when running as root.
-## Returns { restored: Int, skipped: [String], failed: [String] }.
+## Then folders, from the folder list in force at `at_ms`: missing ones are
+## created and get their backed-up mode and time (see restore_folders).
+## Files and folders get their backed-up owners when `chown` is on, which it
+## is by default when running as root.
+## Returns { restored: Int (files and links), folders: Int, skipped: [String], failed: [String] }.
 export fn restore(c, job, opts) {
     at = get(opts, "at_ms")
     if at != null and at < opts.oldest_ms {
         error({ kind: "usage", message: "--at is older than this job's version history (keep_versions_days = {job.keep_versions_days})" })
     }
     items = select(c, job, opts)
+    folders = filter(sync.folders_at(c, job, at), fn(d) wanted(d.path, get(opts, "path")))
+    # Noted before anything is written: these are the folders to leave alone.
+    existed = util.index_by(filter(folders, fn(d) fs.exists(opts.to + d.path, follow: false)), fn(d) d.path)
     chown = get(opts, "chown") ?? as_root()
     first_pass = util.pool(items, concurrency(opts), fn(item) guarded(item.path, fn() restore_file(c, item, opts.to, opts.overwrite, chown)))
     links = map(filter(first_pass, fn(r) r.status == "link"), fn(l) guarded(l.item.path, fn() restore_link(l, opts.to, opts.overwrite)))
@@ -192,5 +236,7 @@ export fn restore(c, job, opts) {
             _ => { failed = push(failed, r.message) }
         }
     }
-    { restored: restored, skipped: skipped, failed: failed }
+    dirs = restore_folders(folders, existed, opts.to, opts.overwrite, chown)
+    failed = failed + map(filter(dirs, fn(r) r.status != "restored"), fn(r) r.message)
+    { restored: restored, folders: len(filter(dirs, fn(r) r.status == "restored")), skipped: skipped, failed: failed }
 }

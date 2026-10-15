@@ -171,3 +171,34 @@ test.case("each file's owner is recorded as uid:gid", fn() {
     single = scanner.scan(merge(job(root, {}), { paths: [fs.join(root, "f.txt")] })).entries
     test.eq(single[0].owner, "{o.uid}:{o.gid}")
 })
+
+test.case("every folder walked is recorded, empty ones included", fn() {
+    root = fs.join(fs.temp_dir(), "folders")
+    fs.mkdir(fs.join(root, "empty"))
+    fs.mkdir(fs.join(root, "private/deep"))
+    fs.mkdir(fs.join(root, "node_modules/x"))
+    fs.chmod(fs.join(root, "private"), "700")
+    fs.set_modified(fs.join(root, "empty"), 1700000000000)
+    r = scanner.scan(job(root, {}))
+    test.eq(map(r.dirs, fn(d) d.path[len(root)..]), ["", "/empty", "/private", "/private/deep"])
+    test.eq(r.dirs[2].mode, "700")
+    test.eq(r.dirs[1].mtime, 1700000000000)
+    test.eq(r.dirs[0].owner, scanner.owner_of(root))
+})
+
+test.case("a folder that can't be read is still recorded", fn() {
+    skip_as_root()
+    root = tree()
+    r = scanner.scan(job(root, {}))
+    fs.chmod(fs.join(root, "locked"), "755")
+    locked = filter(r.dirs, fn(d) d.path == fs.join(root, "locked"))
+    test.eq(map(locked, fn(d) d.mode), ["0"])
+})
+
+test.case("a wide tree records every folder once", fn() {
+    root = fs.join(fs.temp_dir(), "wide-dirs")
+    for i in 0..300 { fs.mkdir(fs.join(root, "d{i}/inner")) }
+    r = scanner.scan(job(root, {}))
+    test.eq(len(r.dirs), 1 + 300 * 2)
+    test.eq(len(unique(map(r.dirs, fn(d) d.path))), len(r.dirs))
+})

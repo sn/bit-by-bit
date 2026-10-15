@@ -29,3 +29,13 @@ test.case("scanning a 20k-file directory is fast", fn() {
     test.eq(len(r.entries), 20000)
     test.ok(ms < 20000, "took {ms} ms")
 })
+
+test.case("planning 100k folders is fast", fn() {
+    # Sorted by path, as the scanner and the state database give them.
+    dirs = sort_by(map(range(0, N), fn(i) { path: "/d/{i}", mode: "755", owner: "1:1", mtime: 1 }), fn(d) d.path)
+    t0 = time.monotonic()
+    p = planner.plan_dirs(dirs, dirs, ["/d/5"])
+    ms = time.monotonic() - t0
+    test.eq([len(p.dirs), p.changed], [N, false])
+    test.ok(ms < 10000, "took {ms} ms")
+})

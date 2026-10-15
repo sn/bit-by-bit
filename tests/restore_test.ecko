@@ -308,4 +308,106 @@ test.case("binary content restores byte-for-byte", fn() {
     test.eq(fs.read_bytes(o.to + env.root + "/blob.bin"), blob)
 })
 
+# Folders: root/empty (empty), root/private (700, a known time) holding k.txt.
+fn folder_tree(env) {
+    fs.mkdir(fs.join(env.root, "empty"))
+    fs.mkdir(fs.join(env.root, "private"))
+    fs.write(fs.join(env.root, "private/k.txt"), "k")
+    fs.chmod(fs.join(env.root, "private"), "700")
+    fs.set_modified(fs.join(env.root, "private"), T0 - HOUR)
+}
+
+fn out_dir(o, env, name) = o.to + env.root + "/" + name
+
+test.case("empty folders come back, and folders get their mode and time", fn() {
+    env = setup()
+    folder_tree(env)
+    run_at(env, T0)
+    o = opts({})
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, r.folders, r.failed], [1, 3, []])
+    test.ok(fs.is_dir(out_dir(o, env, "empty")), "empty folder restored")
+    test.eq(fs.mode(out_dir(o, env, "private")), "700")
+    # Set after the file inside was written, so the time sticks.
+    test.eq(fs.modified(out_dir(o, env, "private")), T0 - HOUR)
+})
+
+test.case("folders already there are left alone unless overwrite", fn() {
+    env = setup()
+    folder_tree(env)
+    run_at(env, T0)
+    o = opts({})
+    fs.mkdir(out_dir(o, env, "private"))
+    fs.chmod(out_dir(o, env, "private"), "755")
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq(fs.mode(out_dir(o, env, "private")), "755")
+    test.eq(r.failed, [])
+    restore.restore(CLIENT, env.job, merge(o, { overwrite: true }))
+    test.eq(fs.mode(out_dir(o, env, "private")), "700")
+})
+
+test.case("--at uses the folder list in force at that time", fn() {
+    env = setup()
+    folder_tree(env)
+    run_at(env, T0)
+    fs.chmod(fs.join(env.root, "private"), "750")
+    fs.remove(fs.join(env.root, "empty"))
+    run_at(env, T0 + HOUR)
+    then = opts({ at_ms: T0 + HOUR / 2, to: fs.join(fs.temp_dir(), "then") })
+    restore.restore(CLIENT, env.job, then)
+    test.eq(fs.mode(out_dir(then, env, "private")), "700")
+    test.ok(fs.is_dir(out_dir(then, env, "empty")), "empty folder as it was then")
+    now = opts({ to: fs.join(fs.temp_dir(), "now") })
+    restore.restore(CLIENT, env.job, now)
+    test.eq(fs.mode(out_dir(now, env, "private")), "750")
+    test.ok(not fs.exists(out_dir(now, env, "empty")), "gone now")
+})
+
+test.case("--path restores only the folders under it", fn() {
+    env = setup()
+    folder_tree(env)
+    run_at(env, T0)
+    o = opts({ path: env.root + "/private" })
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, r.folders], [1, 1])
+    test.ok(not fs.exists(out_dir(o, env, "empty")), "outside --path")
+})
+
+test.case("a tampered folder list can't make restore write outside --to", fn() {
+    env = setup()
+    folder_tree(env)
+    run_at(env, T0)
+    bad = [{ path: env.root + "/../../../escape", mode: "755", owner: null, mtime: null }]
+    fake_s3.put_raw(sync.folders_key(env.job, sync.run_ts_of(T0 + 1)), sync.encode_folders(env.job, bad), {})
+    o = opts({})
+    r = restore.restore(CLIENT, env.job, o)
+    test.ok(any(r.failed, fn(f) contains(f, "unsafe path")), string(r.failed))
+    test.ok(not fs.exists(fs.join(fs.temp_dir(), "escape")), "nothing written outside")
+})
+
+test.case("a job backed up before folder lists restores its files as before", fn() {
+    env = setup()
+    folder_tree(env)
+    run_at(env, T0)
+    for k in keys(fake_s3.objects_()) {
+        if contains(k, "/_folders/") { fake_s3.delete_raw(k) }
+    }
+    o = opts({})
+    r = restore.restore(CLIENT, env.job, o)
+    test.eq([r.restored, r.folders, r.failed], [1, 0, []])
+})
+
+# Runs for real only as root: see tests/root/run.sh.
+test.case("as root, folders get their backed-up owner", fn() {
+    unless restore.as_root() { test.skip("needs root: run tests/root/run.sh") }
+    env = setup()
+    folder_tree(env)
+    fs.chown(fs.join(env.root, "private"), 4321, 4322)
+    run_at(env, T0)
+    o = opts({})
+    restore.restore(CLIENT, env.job, o)
+    test.eq(fs.owner(out_dir(o, env, "private")), { uid: 4321, gid: 4322 })
+    test.eq(fs.mode(out_dir(o, env, "private")), "700")
+})
+
 fake_s3.stop()

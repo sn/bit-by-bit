@@ -128,3 +128,31 @@ test.case("a running run's progress is visible before it finishes", fn() {
     # When uploads began and when a file last finished: the dashboard's rate and stall check.
     test.eq([r.planned_at, r.progress_at], [150, 160])
 })
+
+test.case("folder lists are replaced whole, per job", fn() {
+    db = fresh()
+    rows = [{ path: "/a", mode: "755", owner: "1:1", mtime: 5 }, { path: "/a/b", mode: "700", owner: "1:1", mtime: 6 }]
+    state.replace_dirs(db, "j", rows)
+    state.replace_dirs(db, "k", [{ path: "/k", mode: "755", owner: "1:1", mtime: 1 }])
+    test.eq(state.dirs(db, "j"), rows)
+    state.replace_dirs(db, "j", [])
+    test.eq([state.dirs(db, "j"), len(state.dirs(db, "k"))], [[], 1])
+})
+
+test.case("checks are recorded, and only finished ones count as checked", fn() {
+    db = fresh()
+    test.eq([state.last_verify(db, "j"), state.last_verified_at(db, "j")], [null, null])
+    v = fn(at, status) { started_at: at, finished_at: at + 5, status: status, checked: 3, sampled: 1, extra: 0, problems: ["/a: missing from the bucket"], problem_count: 1, error: null }
+    state.add_verify(db, "j", v(100, "failed"))
+    state.add_verify(db, "j", v(200, "error"))
+    test.eq(state.last_verify(db, "j").status, "error")
+    test.eq(state.last_verify(db, "j").problem_list, ["/a: missing from the bucket"])
+    test.eq(state.last_verified_at(db, "j"), 100)
+})
+
+test.case("remove_files drops several index rows at once", fn() {
+    db = fresh()
+    for p in ["/a", "/b", "/c"] { state.put_file(db, "j", { path: p, size: 1, mtime: 1, sha256: "h", kind: "file" }) }
+    state.remove_files(db, "j", ["/a", "/c"])
+    test.eq(keys(state.index(db, "j")), ["/b"])
+})

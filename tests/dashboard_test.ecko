@@ -31,7 +31,15 @@ fn record(job, id, started, status, problems, err) {
     })
 }
 
-fn reset() = sql.exec(DB, "delete from runs")
+fn reset() {
+    sql.exec(DB, "delete from runs")
+    sql.exec(DB, "delete from verifies")
+}
+
+fn checked(job, at, status, problems) = state.add_verify(DB, job, {
+    started_at: at, finished_at: at + 1000, status: status, checked: 12345, sampled: 10, extra: 0,
+    problems: problems, problem_count: len(problems), error: if status == "error" { "net: connection refused" } else { null },
+})
 
 let STARTED = time.now()
 port = dashboard.start(cell(cfg()), STATE_DIR, STARTED)
@@ -304,6 +312,50 @@ test.case("health: a never-run job is not unhealthy", fn() {
     reset()
     s = dashboard.snapshot(cfg(), DB, time.now(), STARTED)
     test.eq(dashboard.health(s), { ok: true, reasons: [] })
+})
+
+test.case("the last check shows in each job's details", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    body = http.get(url("/")).body
+    test.ok(contains(body, "<dt>checked</dt><dd>not yet</dd>"), "not checked yet")
+    checked("home", time.now() - 3 * 24 * H, "ok", [])
+    body2 = http.get(url("/")).body
+    test.ok(contains(body2, "<dt>checked</dt><dd>3d ago · all 12,345 files there</dd>"), "ok check")
+    test.ok(http.get(url("/healthz")).status == 200, "healthy")
+})
+
+test.case("a check that found problems makes the job unhealthy and lists them", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    checked("home", time.now() - H, "failed", ["/tmp/a: missing from the bucket"])
+    body = http.get(url("/")).body
+    test.ok(contains(body, "the last check found 1 problem</strong>"), "callout")
+    test.ok(contains(body, "<li>/tmp/a: missing from the bucket</li>"), "the problem")
+    test.ok(contains(body, "sudo bit-by-bit verify home"), "what to run")
+    h = http.get(url("/healthz"))
+    test.eq(h.status, 503)
+    test.ok(contains(h.body, "home: the last check found 1 problem in the backup"), h.body)
+})
+
+test.case("a check that couldn't finish is shown but isn't unhealthy", fn() {
+    reset()
+    record("home", "r1", time.now() - H, "ok", [], null)
+    checked("home", time.now() - H, "error", [])
+    test.ok(contains(http.get(url("/")).body, " · couldn&#39;t finish</dd>"), "says so")
+    test.eq(http.get(url("/healthz")).status, 200)
+})
+
+test.case("a job with checking off says so", fn() {
+    c = config.validate({
+        state_dir: STATE_DIR,
+        destinations: { d: { provider: "gcs", bucket: "b", credentials_file: "/x" } },
+        jobs: [{ name: "home", destination: "d", prefix: "p1", paths: ["/tmp"], schedule: { every: "6h" }, verify: false }],
+    }).config
+    reset()
+    snap = dashboard.snapshot(c, DB, time.now(), STARTED)
+    test.eq([snap.jobs[0].check, snap.jobs[0].check_on], [null, false])
+    test.ok(contains(dashboard.render_html(snap), "<dt>checked</dt><dd>off</dd>"), "off")
 })
 
 http.stop()

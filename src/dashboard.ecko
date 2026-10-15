@@ -71,20 +71,26 @@ fn job_view(job, db, now) {
         error: if last == null { null } else { last.error },
         problems: if last == null { [] } else { last.problem_list },
         problem_count: if last == null { 0 } else { last.problems },
+        check: status.check_view(state.last_verify(db, job.name)),
+        check_on: job.verify != null,
         runs: map(runs, run_view),
     }
 }
 
 ## Why the backups are unhealthy: { ok: Bool, reasons: [String] }. A job is
 ## unhealthy when its last run failed, when it has not started a run for
-## more than twice its interval, or when its running backup has finished no
-## file for that long.
+## more than twice its interval, when its running backup has finished no
+## file for that long, or when the last check of its backup found problems.
 export fn health(snap) {
     mut reasons = []
     for j in snap.jobs {
         if j.status == "failed" { reasons = push(reasons, "{j.job}: last run failed") }
         if j.overdue { reasons = push(reasons, "{j.job}: overdue (no run for more than twice its interval)") }
         if j.stalled { reasons = push(reasons, "{j.job}: stalled (the running backup has finished no file for more than twice its interval)") }
+        if j.check != null and j.check.status == "failed" {
+            n = j.check.problem_count
+            reasons = push(reasons, "{j.job}: the last check found {n} " + (if n == 1 { "problem" } else { "problems" }) + " in the backup")
+        }
     }
     { ok: len(reasons) == 0, reasons: reasons }
 }
@@ -210,10 +216,33 @@ fn progress_html(j, now) {
 
 fn meta_item(label, value) = "<div><dt>" + label + "</dt><dd>" + esc(value) + "</dd></div>"
 
+# The last check of the backup, in a few words; the time is in its title.
+fn check_meta(j, now) {
+    c = j.check
+    if c == null { return meta_item("checked", if j.check_on { "not yet" } else { "off" }) }
+    what = match c.status {
+        "ok" => "all " + commas(c.checked) + " files there"
+        "failed" => commas(c.problem_count) + (if c.problem_count == 1 { " problem" } else { " problems" })
+        _ => "couldn't finish"
+    }
+    "<div title=\"" + esc(at_text(c.at)) + "\"><dt>checked</dt><dd>" + esc(ago_text(c.at, now) + " · " + what) + "</dd></div>"
+}
+
+# What the last check found, when it found something: the first few problems
+# and what happens next. The rest are in the log and `bit-by-bit verify`.
+fn check_callout(j) {
+    c = j.check
+    if c == null or c.status != "failed" { return "" }
+    n = max([c.problem_count, len(c.problems)])
+    "<div class=\"callout\"><strong>the last check found " + commas(n) + (if n == 1 { " problem" } else { " problems" }) + "</strong>" +
+        "<ul class=\"problems\">" + join(map(take(c.problems, SHOWN_PROBLEMS), li), "") + "</ul>" +
+        "<p>Files still on this machine go up again with the next run. After it, <code>sudo bit-by-bit verify " + esc(j.job) + "</code> checks again.</p></div>"
+}
+
 fn job_card(j, now) {
     overdue = if j.overdue { " <span class=\"badge bad\"><span aria-hidden=\"true\">!</span> overdue</span>" } else if j.stalled { " <span class=\"badge bad\"><span aria-hidden=\"true\">!</span> stalled</span>" } else { "" }
     meta = "<dl class=\"job-meta\">" + meta_item("from", join(j.paths, ", ")) + meta_item("to", j.destination + "/" + j.prefix) +
-        meta_item("runs", schedule_text(j.schedule)) + "</dl>"
+        meta_item("runs", schedule_text(j.schedule)) + check_meta(j, now) + "</dl>"
     took = if j.started_at == null { "" } else if j.finished_at == null { "running for " + span_text(now - j.started_at) } else { "took " + dur_text(j.finished_at - j.started_at) }
     kpis = "<dl class=\"kpis\">" +
         kpi_as("kpi lead", "last good backup", ago_text(j.last_good_at, now), if j.last_good_at == null { "no run has worked yet" } else { at_text(j.last_good_at) }) +
@@ -225,7 +254,7 @@ fn job_card(j, now) {
             stat("deleted", j.deleted) + stat("pruned", j.pruned) + stat("data", status.size_text(j.bytes)) + "</dl></section>"
     }
     live = if j.started_at != null and j.finished_at == null { progress_html(j, now) } else { "" }
-    err = if j.error == null { "" } else { "<div class=\"callout\"><strong>last run failed</strong><p>" + esc(j.error) + "</p></div>" }
+    err = (if j.error == null { "" } else { "<div class=\"callout\"><strong>last run failed</strong><p>" + esc(j.error) + "</p></div>" }) + check_callout(j)
     runs = if len(j.runs) == 0 {
         due = if j.next_due <= now { "as soon as the daemon is free" } else { at_text(j.next_due) }
         "<div class=\"empty\"><p><strong>No runs yet.</strong> The first run starts " + esc(due) + ". To start it now: <code>sudo bit-by-bit run " + esc(j.job) + "</code></p></div>"
@@ -343,6 +372,7 @@ let CSS = r"""
     .callout { border: 1px solid var(--bad-fg); border-inline-start-width: 4px; background: var(--bad-bg); padding: 0.75rem 1rem; }
     .callout strong { color: var(--bad-fg); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.875rem; }
     .callout p { margin-top: 0.25rem; overflow-wrap: anywhere; font-size: 0.875rem; }
+    .callout .problems { margin-block: 0.375rem 0.5rem; }
     .problems { padding-inline-start: 1.5rem; font-size: 0.8125rem; line-height: 1.6; overflow-wrap: anywhere; }
     .problems li::marker { content: "* "; color: var(--warn-fg); }
     details { margin-top: 0.25rem; }

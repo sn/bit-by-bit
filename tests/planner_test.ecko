@@ -77,3 +77,22 @@ test.case("an owner-only change is an attrs update, and an unknown old owner is 
     test.eq(ops(p), [["attrs", "/a"]])
     test.eq(p.remember, [{ path: "/c", mode: "644", owner: "1000:100" }])
 })
+
+fn dir(path, mode) = { path: path, mode: mode, owner: "1:1", mtime: 5 }
+
+test.case("the folder list is what the scan saw, and changed when it differs", fn() {
+    prev = [dir("/r", "755"), dir("/r/a", "755")]
+    same = planner.plan_dirs([dir("/r", "755"), dir("/r/a", "755")], prev, [])
+    test.eq([same.dirs, same.changed], [prev, false])
+    gone = planner.plan_dirs([dir("/r", "755")], prev, [])
+    test.eq([gone.dirs, gone.changed], [[dir("/r", "755")], true])
+    moded = planner.plan_dirs([dir("/r", "700"), dir("/r/a", "755")], prev, [])
+    test.eq(moded.changed, true)
+})
+
+test.case("folders under a protected path are kept from the last list", fn() {
+    prev = [dir("/r", "755"), dir("/r/lock", "755"), dir("/r/lock/in", "755"), dir("/r/old", "755")]
+    # /r/lock can't be read now: the scan sees it (mode 000) but nothing inside.
+    p = planner.plan_dirs([dir("/r", "755"), dir("/r/lock", "0")], prev, ["/r/lock"])
+    test.eq(p.dirs, [dir("/r", "755"), dir("/r/lock", "0"), dir("/r/lock/in", "755")])
+})

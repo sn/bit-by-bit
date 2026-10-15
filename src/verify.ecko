@@ -1,0 +1,104 @@
+import std.fs
+import std.io
+import std.random
+import "./s3.ecko"
+import "./state.ecko"
+import "./sync.ecko"
+import "./scanner.ecko"
+import "./digest.ecko"
+import "./util.ecko"
+
+# Files sampled for a download are at most this big. Larger files are checked
+# by size only: their parts were each checked by the provider on upload, and
+# downloading one every week would cost more than it tells.
+export let SAMPLE_MAX_BYTES = 268435456
+
+# Download one object and check it against its indexed fingerprint. Returns
+# a problem message, or null.
+fn check_content(c, job, row) {
+    tmp = fs.temp_file()
+    try {
+        got = s3.get_stream(c, sync.current_key(job, row.path))
+        out = fs.open(tmp, "w")
+        try { for piece in got.body { io.write(out, piece) } } finally { io.close(out) }
+        if digest.matches(tmp, row.sha256) { null } else { "{row.path}: the copy in the bucket doesn't match its fingerprint" }
+    } catch (e) {
+        unless get(e, "kind") == "s3_not_found" { error(e) }
+        "{row.path}: missing from the bucket"
+    } finally {
+        if fs.exists(tmp) { fs.remove(tmp) }
+    }
+}
+
+## Check a job's backup against its index, in one listing of the bucket:
+## every indexed file and link must be there at its indexed size, and the
+## newest folder list must match the last one uploaded. `sample` files, picked
+## at random, are also downloaded and checked against their fingerprints.
+## What is missing or wrong is removed from the index, so the next run
+## uploads it again (if it is still on this machine).
+## opts: { sample: Int, concurrency: Int, should_stop: fn() Bool }
+## Returns { status: "ok" | "failed", checked, sampled, extra, repaired,
+##           problems: [String] (the first MAX_PROBLEMS), problem_count }.
+## `extra` counts objects the index doesn't know, such as uploads a crash
+## kept from being recorded: the next run sorts those out, so they aren't
+## problems. Raises when the bucket can't be read, or when stopped.
+export fn verify(c, job, db, opts) {
+    index = state.index(db, job.name)
+    vprefix = job.prefix + "/_versions/"
+    fprefix = job.prefix + "/_folders/"
+    mut remote = {}
+    for o in s3.list_objects(c, job.prefix + "/") {
+        if starts_with(o.key, vprefix) or starts_with(o.key, fprefix) { continue }
+        path = o.key[len(job.prefix)..]
+        # Another job may share the prefix: keep to this job's own paths.
+        if scanner.under_any(path, job.paths) { remote = set(remote, path, o.size) }
+    }
+    mut found = []
+    mut bad = []
+    for path in sort(keys(index)) {
+        row = index[path]
+        size = get(remote, path)
+        if size == null {
+            found = push(found, "{path}: missing from the bucket")
+            bad = push(bad, path)
+        } else if size != row.size {
+            found = push(found, "{path}: {size} bytes in the bucket, {row.size} when it was backed up")
+            bad = push(bad, path)
+        }
+    }
+    extra = len(filter(keys(remote), fn(p) not has(index, p)))
+
+    fine = filter(values(index), fn(r) r.kind == "file" and r.size <= SAMPLE_MAX_BYTES and get(remote, r.path) == r.size)
+    picked = take(random.shuffle(fine), opts.sample)
+    checked = util.pool(picked, opts.concurrency, fn(r) if opts.should_stop() { { path: r.path, stopped: true } } else { { path: r.path, problem: check_content(c, job, r) } })
+    if any(checked, fn(x) get(x, "stopped") == true) { error({ kind: "stopped", message: "stopped before finishing (shutdown requested)" }) }
+    for x in checked {
+        if x.problem != null {
+            found = push(found, x.problem)
+            bad = push(bad, x.path)
+        }
+    }
+
+    # The folder list: an empty one in the index makes the next run upload it.
+    mut folders_bad = false
+    want = state.dirs(db, job.name)
+    if len(want) > 0 {
+        got = sync.folders_at(c, job, null)
+        if len(got) == 0 {
+            found = push(found, "the folder list is missing from the bucket")
+            folders_bad = true
+        } else if got != want {
+            found = push(found, "the folder list in the bucket differs from the last one uploaded")
+            folders_bad = true
+        }
+    }
+
+    if len(bad) > 0 { state.remove_files(db, job.name, bad) }
+    if folders_bad { state.replace_dirs(db, job.name, []) }
+    totals = sync.add_problems({ problems: [], problem_count: 0 }, found)
+    merge(totals, {
+        status: if totals.problem_count > 0 { "failed" } else { "ok" },
+        checked: len(index), sampled: len(picked), extra: extra,
+        repaired: len(bad) + (if folders_bad { 1 } else { 0 }),
+    })
+}

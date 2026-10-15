@@ -79,3 +79,14 @@ export fn plan(scan, index) {
     }
     { actions: actions, unchanged: unchanged, remember: remember }
 }
+
+## The folder list to keep for a run: every folder scanned, plus the
+## previous list's folders under a protected path (one that could not be
+## read, or a root that looks unmounted), since the scan could not see them.
+## Pure. Returns { dirs: [{ path, mode, owner, mtime }] sorted by path, changed: Bool }.
+export fn plan_dirs(scanned, previous, protected) {
+    kept = filter(previous, fn(d) scanner.under_any(d.path, protected))
+    by_path = merge(util.index_by(kept, fn(d) d.path), util.index_by(scanned, fn(d) d.path))
+    dirs = map(sort(keys(by_path)), fn(p) get(by_path, p))
+    { dirs: dirs, changed: dirs != previous }
+}

@@ -1,0 +1,142 @@
+import std.test
+import std.fs
+import std.os
+import std.time
+import "../src/config.ecko"
+import "../src/state.ecko"
+import "../src/runner.ecko"
+import "../testkit/fake_s3.ecko"
+
+port = fake_s3.start()
+
+# Credentials for the "fake" destination come from the environment.
+os.set_env("BBB_FAKE_ACCESS_KEY_ID", fake_s3.ACCESS_KEY)
+os.set_env("BBB_FAKE_SECRET_ACCESS_KEY", fake_s3.SECRET_KEY)
+
+let DAY = 86400000
+
+fn setup() {
+    fake_s3.reset()
+    root = fs.join(fs.temp_dir(), "src")
+    fs.mkdir(fs.join(root, "sub"))
+    fs.write(fs.join(root, "a.txt"), "alpha")
+    fs.write(fs.join(root, "sub/b.txt"), "bravo")
+    state_dir = fs.join(fs.temp_dir(), "state")
+    raw = {
+        state_dir: state_dir,
+        destinations: { fake: {
+            provider: "s3", endpoint: "http://127.0.0.1:{port}", region: "us-east-1",
+            bucket: fake_s3.BUCKET, path_style: true, allow_insecure: true, server_side_encryption: false,
+        } },
+        jobs: [{ name: "home", destination: "fake", prefix: "pc", paths: [root], schedule: { every: "1h" } }],
+        retry: { attempts: 2, base_delay: "1ms", max_delay: "5ms" },
+    }
+    r = config.validate(raw)
+    test.eq(r.errors, [])
+    cfg = r.config
+    { cfg: cfg, job: cfg.jobs[0], db: state.open(state_dir), root: root }
+}
+
+fn go(env) = runner.run_job(env.cfg, env.job, env.db, { dry_run: false, should_stop: fn() false })
+fn check(env, sample) = runner.verify_job(env.cfg, env.job, env.db, { sample: sample, should_stop: fn() false })
+fn key(env, rel) = "pc" + env.root + "/" + rel
+fn folder_list_keys() = filter(keys(fake_s3.objects_()), fn(k) contains(k, "/_folders/"))
+
+test.case("a fresh backup checks out, and the check is recorded", fn() {
+    env = setup()
+    go(env)
+    v = check(env, 10)
+    test.eq([v.status, v.checked, v.sampled, v.extra, v.problems, v.error], ["ok", 2, 2, 0, [], null])
+    last = state.last_verify(env.db, "home")
+    test.eq([last.status, last.checked, last.sampled], ["ok", 2, 2])
+    test.ok(not fs.exists(runner.job_lock_path(env.cfg, env.job)), "lock released")
+})
+
+test.case("a missing object is a problem, and the next run uploads it again", fn() {
+    env = setup()
+    go(env)
+    fake_s3.delete_raw(key(env, "a.txt"))
+    v = check(env, 0)
+    test.eq([v.status, v.problems, v.repaired], ["failed", [env.root + "/a.txt: missing from the bucket"], 1])
+    test.ok(not has(state.index(env.db, "home"), env.root + "/a.txt"), "out of the index")
+    test.eq(go(env).uploaded, 1)
+    test.eq(fake_s3.object(key(env, "a.txt")).body, bytes("alpha"))
+    test.eq(check(env, 10).status, "ok")
+})
+
+test.case("an object of the wrong size is a problem", fn() {
+    env = setup()
+    go(env)
+    o = fake_s3.object(key(env, "a.txt"))
+    fake_s3.put_raw(key(env, "a.txt"), bytes("alpha!"), o.meta)
+    v = check(env, 0)
+    test.eq(v.problems, [env.root + "/a.txt: 6 bytes in the bucket, 5 when it was backed up"])
+})
+
+test.case("a sampled file whose content changed in the bucket is a problem", fn() {
+    env = setup()
+    go(env)
+    o = fake_s3.object(key(env, "a.txt"))
+    fake_s3.put_raw(key(env, "a.txt"), bytes("ALPHA"), o.meta)
+    # Same size: only a download notices.
+    test.eq(check(env, 0).status, "ok")
+    v = check(env, 10)
+    test.eq(v.problems, [env.root + "/a.txt: the copy in the bucket doesn't match its fingerprint"])
+    go(env)
+    test.eq(fake_s3.object(key(env, "a.txt")).body, bytes("alpha"))
+})
+
+test.case("objects the index doesn't know are counted, not problems", fn() {
+    env = setup()
+    go(env)
+    fake_s3.put_raw(key(env, "stray.txt"), bytes("x"), {})
+    v = check(env, 0)
+    test.eq([v.status, v.extra], ["ok", 1])
+})
+
+test.case("a missing folder list is a problem, and the next run uploads it again", fn() {
+    env = setup()
+    go(env)
+    for k in folder_list_keys() { fake_s3.delete_raw(k) }
+    v = check(env, 0)
+    test.eq([v.status, v.problems], ["failed", ["the folder list is missing from the bucket"]])
+    go(env)
+    test.eq(len(folder_list_keys()), 1)
+    test.eq(check(env, 0).status, "ok")
+})
+
+test.case("a check that can't read the bucket is an error, and is due again", fn() {
+    env = setup()
+    go(env)
+    fake_s3.fail_next("GET", "", 403, "AccessDenied", 1)
+    v = check(env, 0)
+    test.eq(v.status, "error")
+    test.ok(v.error != null, "says why")
+    test.eq(state.last_verify(env.db, "home").status, "error")
+    test.ok(runner.verify_due(env.job, env.db, time.now()), "an error doesn't count as checked")
+})
+
+test.case("a check is due once verify.every has passed since the last one", fn() {
+    env = setup()
+    go(env)
+    test.ok(runner.verify_due(env.job, env.db, time.now()), "never checked")
+    check(env, 0)
+    now = state.last_verify(env.db, "home").started_at
+    test.ok(not runner.verify_due(env.job, env.db, now + 6 * DAY), "checked this week")
+    test.ok(runner.verify_due(env.job, env.db, now + 7 * DAY), "a week on")
+    test.ok(not runner.verify_due(set(env.job, "verify", null), env.db, now + 70 * DAY), "checking off")
+})
+
+test.case("a check waits for nobody: it is skipped while a run holds the lock", fn() {
+    env = setup()
+    go(env)
+    # Held by another live process: pid 1 is always running.
+    lp = runner.job_lock_path(env.cfg, env.job)
+    fs.write(lp, "1")
+    v = check(env, 0)
+    fs.remove(lp)
+    test.eq(v.status, "skipped")
+    test.eq(state.last_verify(env.db, "home"), null)
+})
+
+fake_s3.stop()

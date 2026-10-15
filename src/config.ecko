@@ -10,7 +10,10 @@ let DASHBOARD_KEYS = ["listen", "allow_remote"]
 let LOOPBACK = ["127.0.0.1", "localhost", "::1"]
 let LOG_KEYS = ["level", "file"]
 let DEST_KEYS = ["provider", "endpoint", "region", "bucket", "credentials_file", "server_side_encryption", "path_style", "allow_insecure"]
-let JOB_KEYS = ["name", "destination", "prefix", "paths", "exclude", "schedule", "keep_versions_days", "follow_symlinks"]
+let JOB_KEYS = ["name", "destination", "prefix", "paths", "exclude", "schedule", "keep_versions_days", "follow_symlinks", "verify"]
+let VERIFY_KEYS = ["every", "sample"]
+# Under a job's prefix, these hold version copies and folder lists.
+let RESERVED = ["/_versions", "/_folders"]
 let RETRY_KEYS = ["attempts", "base_delay", "max_delay"]
 let LEVELS = ["debug", "info", "warn", "error"]
 let FIVE_GIB = 5368709120
@@ -179,8 +182,10 @@ export fn validate(raw) {
                         err(pp, "must be an absolute path")
                         continue
                     }
-                    if path == "/_versions" or starts_with(path, "/_versions/") {
-                        err(pp, "paths under /_versions would collide with the version history prefix")
+                    for r in RESERVED {
+                        if path == r or starts_with(path, r + "/") {
+                            err(pp, "paths under {r} would collide with where bit-by-bit keeps its own objects")
+                        }
                     }
                     unless fs.exists(path) { warn(pp, "does not exist yet") }
                     clean = trim_end_slash(path)
@@ -215,6 +220,20 @@ export fn validate(raw) {
                     err("{p}.schedule", "use exactly one of every or daily_at")
                 }
             }
+            # Checking the backup: on by default, weekly, downloading 10 files.
+            # false turns it off.
+            verify_raw = opt(j, "verify", {})
+            mut verify = { every_ms: 7 * 86400000, sample: 10 }
+            if verify_raw == false {
+                verify = null
+            } else if is_map(verify_raw) {
+                unknown_keys(verify_raw, VERIFY_KEYS, "{p}.verify")
+                every = parsed("{p}.verify.every", fn() duration.parse_duration(opt(verify_raw, "every", "7d")), verify.every_ms)
+                if every < 3600000 { err("{p}.verify.every", "must be at least 1h") }
+                verify = { every_ms: every, sample: want_int(verify_raw, "sample", "{p}.verify", 10, 0, 10000) }
+            } else {
+                err("{p}.verify", "must be an object, or false to turn checking off")
+            }
             jobs = push(jobs, {
                 name: name,
                 destination: dest,
@@ -224,6 +243,7 @@ export fn validate(raw) {
                 schedule: schedule,
                 keep_versions_days: want_int(j, "keep_versions_days", p, 30, 0, 36500),
                 follow_symlinks: want_bool(j, "follow_symlinks", p, false),
+                verify: verify,
             })
         }
         # Jobs on one destination may share a prefix: every key is the prefix

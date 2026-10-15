@@ -11,6 +11,7 @@ import "./planner.ecko"
 import "./logging.ecko"
 import "./lock.ecko"
 import "./util.ecko"
+import "./verify.ecko"
 
 export fn job_lock_path(cfg, job) = fs.join(cfg.state_dir, "job-" + job.name + ".lock")
 
@@ -99,5 +100,55 @@ export fn rebuild_state(cfg, job, db) {
     })
     rows = filter(found, fn(r) r != null)
     state.replace_index(db, job.name, rows)
+    # The newest folder list is the one the bucket has: the next run uploads
+    # a new one only if the folders changed since.
+    state.replace_dirs(db, job.name, sync.folders_at(client, job, null))
     len(rows)
+}
+
+## Whether the daemon should check a job's backup now: checking is on, and
+## the last check that finished (ok or found problems) started `verify.every`
+## ago or more. A check that could not finish is tried again after the next run.
+export fn verify_due(job, db, now) {
+    if job.verify == null { return false }
+    at = state.last_verified_at(db, job.name)
+    at == null or now - at >= job.verify.every_ms
+}
+
+fn no_check(status, err) = { status: status, error: err, checked: 0, sampled: 0, extra: 0, repaired: 0, problems: [], problem_count: 0 }
+
+## Check a job's backup (see verify.verify) and record the result. Holds the
+## job lock, so it never overlaps a run of the job. Never raises.
+## opts: { sample: Int or null (the job's verify.sample), should_stop: fn() Bool }
+## Returns the recorded check: status "ok" | "failed" | "error", or "skipped"
+## (not recorded) when a run of the job holds the lock.
+export fn verify_job(cfg, job, db, opts) {
+    try {
+        lp = job_lock_path(cfg, job)
+        unless lock.acquire(lp) { return no_check("skipped", "a run of this job is in progress") }
+        try { verify_locked(cfg, job, db, opts) } finally { lock.release(lp) }
+    } catch (e) {
+        msg = string(get(e, "message") ?? e)
+        logging.emit("error", "check failed outside the run: " + msg, { job: job.name })
+        no_check("error", msg)
+    }
+}
+
+fn verify_locked(cfg, job, db, opts) {
+    started = time.now()
+    log_ = logging.for_run(job.name, uuid.v7())
+    sample = get(opts, "sample") ?? (if job.verify == null { 10 } else { job.verify.sample })
+    log_("info", "check started", { sample: sample })
+    found = try {
+        client = make_client(cfg, job)
+        set(verify.verify(client, job, db, { sample: sample, concurrency: cfg.concurrency, should_stop: opts.should_stop }), "error", null)
+    } catch (e) {
+        no_check("error", string(get(e, "message") ?? e))
+    }
+    v = merge(found, { started_at: started, finished_at: time.now() })
+    state.add_verify(db, job.name, v)
+    for p in v.problems { log_("warn", p, {}) }
+    level = match v.status { "ok" => "info" "failed" => "warn" _ => "error" }
+    log_(level, "check finished", { status: v.status, checked: v.checked, sampled: v.sampled, extra: v.extra, problems: v.problem_count, repaired: v.repaired, error: v.error })
+    v
 }
