@@ -31,8 +31,7 @@ export fn run(config_path) {
         return 1
     }
     # Whatever happens from here, the next daemon must be able to start.
-    # (`catch` rethrows: without one, Ecko 0.68's `finally` swallows the error.)
-    try { serve(cfg, config_path) } catch (e) { error(e) } finally { lock.release(lock_path) }
+    try { serve(cfg, config_path) } finally { lock.release(lock_path) }
 }
 
 # The daemon proper, once it holds the daemon lock. Returns the exit code.
@@ -86,7 +85,7 @@ fn serve(first_cfg, config_path) {
                         logging.emit("error", "can't open the state database: " + string(get(e, "message") ?? e), { job: job.name })
                         return null
                     }
-                    try { runner.run_job(run_cfg, job, job_db, { dry_run: false, should_stop: should_stop }) } catch (e) { error(e) } finally { state.close(job_db) }
+                    try { runner.run_job(run_cfg, job, job_db, { dry_run: false, should_stop: should_stop }) } finally { state.close(job_db) }
                 }))
             } else {
                 due_times = push(due_times, due)

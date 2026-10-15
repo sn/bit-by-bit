@@ -49,8 +49,7 @@ fn run_job_unguarded(cfg, job, db, opts) {
         return empty_outcome("skipped", "another run of this job is still in progress")
     }
     # The lock goes however the run ends, and only once it was taken.
-    # (`catch` rethrows: without one, Ecko 0.68's `finally` swallows the error.)
-    try { run_locked(cfg, job, db, opts, run_id, log_, now) } catch (e) { error(e) } finally { lock.release(lp) }
+    try { run_locked(cfg, job, db, opts, run_id, log_, now) } finally { lock.release(lp) }
 }
 
 fn run_locked(cfg, job, db, opts, run_id, log_, now) {

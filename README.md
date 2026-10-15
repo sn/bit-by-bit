@@ -55,7 +55,7 @@ sha256sum -c $f.sha256
 tar -xzf $f && cd ${f%.tar.gz}
 ```
 
-To build from source instead, install Ecko 0.68 or later and run this in the
+To build from source instead, install Ecko 0.69 or later and run this in the
 repo:
 
 ```bash

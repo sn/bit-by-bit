@@ -144,7 +144,7 @@ test.case("owners are set when chown is on, and left alone when it is off", fn()
 # Runs for real only as root (CI and normal test runs skip it): see
 # tests/root/run.sh, which runs it in a container.
 test.case("as root, files get their backed-up owner, and then their mode", fn() {
-    unless restore.as_root() { return null }
+    unless restore.as_root() { test.skip("needs root: run tests/root/run.sh") }
     env = setup()
     p = fs.join(env.root, "a.txt")
     fs.write(p, "v1")

@@ -299,7 +299,7 @@ test.case("progress is saved while the run is still going", fn() {
 # progress saves or the dashboard grow without bound.
 test.case("problems are counted in full but only the first 1,000 are kept", fn() {
     # Root reads a mode-000 directory anyway, so it makes no problems to count.
-    if fs.owner("/proc/self").uid == 0 { return null }
+    if fs.owner("/proc/self").uid == 0 { test.skip("root reads mode-000 folders, so there are no problems to count") }
     env = setup()
     for i in 0..1050 {
         d = fs.join(env.root, "locked/d{i}")
