@@ -19,7 +19,7 @@ permissions:
 env:
   # The Ecko release to build with. Raise it deliberately, after the tests
   # pass locally on the new version, and keep ci.yml in step.
-  ECKO_VERSION: v0.69.0
+  ECKO_VERSION: v0.71.0
   TAG: ${{ github.event.release.tag_name }}
 
 jobs:
